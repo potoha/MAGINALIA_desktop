@@ -19,6 +19,7 @@
   },
   "include": [
     "src/main.ts",
+    "src/collector-native-host.ts",
     "src/d5-smoke.ts",
     "src/shelf-smoke.ts",
     "src/preload.ts",
