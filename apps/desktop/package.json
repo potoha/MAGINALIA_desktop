@@ -23,6 +23,7 @@
     "build:renderer": "npm run build:brand-assets && vite build",
     "build:brand-assets": "node scripts/build-brand-assets.mjs",
     "test": "vitest run --config vitest.config.mts",
+    "test:collector-host": "npm run build:main && vitest run --config vitest.config.mts src/collector-native-host.test.ts && node --test test/collector-native-host.test.mjs",
     "smoke": "npm run build && node test/electron-smoke.mjs",
     "smoke:writing": "npm run build && node test/writing-smoke.mjs",
     "smoke:settings": "npm run build && node test/settings-smoke.mjs",
