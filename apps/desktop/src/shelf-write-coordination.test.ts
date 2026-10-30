@@ -128,7 +128,7 @@ describe("shelf write lease", () => {
     await second.release();
   });
 
-  test("a lease left by a dead process is evicted instead of blocking forever", async () => {
+  test("a lease left by a dead process is reaped and leaves no coordination debris", async () => {
     const fixture = await createFixture("stale");
     await mkdir(path.dirname(leasePath(fixture)), { recursive: true });
     await writeFile(leasePath(fixture), `${JSON.stringify({
@@ -145,29 +145,107 @@ describe("shelf write lease", () => {
       shelfId: fixture.shelfId,
       acquireTimeoutMs: 2_000
     });
+    const holder = JSON.parse(await readFile(leasePath(fixture), "utf8")) as Record<string, unknown>;
+    expect(holder.token).toBe(lease.token);
+    expect((await readdir(path.dirname(leasePath(fixture)))).sort()).toEqual(["writer.lock"]);
     await lease.release();
   });
 
-  test("a live PID with an expired heartbeat is treated as stale", async () => {
+  test("a live writer is never evicted merely because its heartbeat expired", async () => {
     const fixture = await createFixture("ttl");
     const fixedNow = 1_800_000_000_000;
     await mkdir(path.dirname(leasePath(fixture)), { recursive: true });
-    await writeFile(leasePath(fixture), `${JSON.stringify({
+    const stale = `${JSON.stringify({
       version: 1,
       shelfId: fixture.shelfId,
       token: randomUUID(),
       pid: process.pid,
-      processLabel: "reused-pid",
+      processLabel: "slow-but-alive",
       acquiredAt: new Date(fixedNow - 600_000).toISOString(),
       heartbeatAt: fixedNow - 600_000
-    })}\n`, "utf8");
-    const lease = await acquireShelfWriteLease({
-      coordinationRoot: fixture.coordinationRoot,
+    })}\n`;
+    await writeFile(leasePath(fixture), stale, "utf8");
+    await expectCoordinationError(
+      acquireShelfWriteLease({
+        coordinationRoot: fixture.coordinationRoot,
+        shelfId: fixture.shelfId,
+        now: () => fixedNow,
+        acquireTimeoutMs: 200,
+        pollIntervalMs: 20
+      }),
+      "shelf-write-lease-uncertain"
+    );
+    // The holder keeps its lease: the file is byte-identical and still present.
+    expect(await readFile(leasePath(fixture), "utf8")).toBe(stale);
+  });
+
+  test("a reap cannot take a lock that another writer acquired after the stale check", async () => {
+    const fixture = await createFixture("reap-race");
+    const directory = path.dirname(leasePath(fixture));
+    await mkdir(directory, { recursive: true });
+    await writeFile(leasePath(fixture), `${JSON.stringify({
+      version: 1,
       shelfId: fixture.shelfId,
-      now: () => fixedNow,
-      acquireTimeoutMs: 1_000
-    });
-    await lease.release();
+      token: randomUUID(),
+      pid: 2_147_483_647,
+      processLabel: "crashed",
+      acquiredAt: new Date().toISOString(),
+      heartbeatAt: Date.now()
+    })}\n`, "utf8");
+
+    // Deterministic interleaving: while the contender has already observed the dead
+    // holder's lock, a competitor reaps it and installs a fresh, live lease.
+    let winnerToken: string | undefined;
+    const winnerLeaseText = (): string => {
+      winnerToken = randomUUID();
+      return `${JSON.stringify({
+        version: 1,
+        shelfId: fixture.shelfId,
+        token: winnerToken,
+        pid: process.pid,
+        processLabel: "winner",
+        acquiredAt: new Date().toISOString(),
+        heartbeatAt: Date.now()
+      })}\n`;
+    };
+    let winnerText = "";
+    const onBeforeReapRename = async (): Promise<void> => {
+      await rm(leasePath(fixture), { force: true });
+      winnerText = winnerLeaseText();
+      await writeFile(leasePath(fixture), winnerText, "utf8");
+    };
+
+    await expectCoordinationError(
+      acquireShelfWriteLease({
+        coordinationRoot: fixture.coordinationRoot,
+        shelfId: fixture.shelfId,
+        processLabel: "contender",
+        acquireTimeoutMs: 250,
+        pollIntervalMs: 20,
+        onBeforeReapRename
+      }),
+      "shelf-write-busy"
+    );
+
+    // The winner's lease is untouched: same bytes, still held, no quarantine left.
+    expect(await readFile(leasePath(fixture), "utf8")).toBe(winnerText);
+    expect((JSON.parse(await readFile(leasePath(fixture), "utf8")) as Record<string, unknown>).token).toBe(winnerToken);
+    expect((await readdir(directory)).sort()).toEqual(["writer.lock"]);
+  });
+
+  test("a malformed lock file fails closed instead of being reclaimed", async () => {
+    const fixture = await createFixture("malformed-lock");
+    await mkdir(path.dirname(leasePath(fixture)), { recursive: true });
+    await writeFile(leasePath(fixture), "{\"version\": 1, \"shelfId\": \"", "utf8");
+    await expectCoordinationError(
+      acquireShelfWriteLease({
+        coordinationRoot: fixture.coordinationRoot,
+        shelfId: fixture.shelfId,
+        acquireTimeoutMs: 150,
+        pollIntervalMs: 20
+      }),
+      "shelf-write-lease-uncertain"
+    );
   });
 
   test("releasing with a superseded token does not remove the new holder's lease", async () => {
@@ -238,6 +316,36 @@ describe("shelf write layout", () => {
       }),
       "shelf-write-unsafe-path"
     );
+  });
+
+  test("an overlap rejection leaves the Shelf completely unmodified", async () => {
+    const fixture = await createFixture("overlap-side-effects");
+    // Remove the record directories so any premature `mkdir` would be visible, and
+    // so the test can also prove the layout never got as far as re-creating them.
+    await rm(fixture.booksDirectory, { recursive: true, force: true });
+    await rm(fixture.annotationsDirectory, { recursive: true, force: true });
+    const before = (await readdir(fixture.shelfRoot)).sort();
+
+    for (const coordinationRoot of [
+      path.join(fixture.shelfRoot, "coordination"),
+      path.join(fixture.booksDirectory, "coordination"),
+      fixture.shelfRoot
+    ]) {
+      await expectCoordinationError(
+        resolveShelfWriteLayout({
+          shelfRoot: fixture.shelfRoot,
+          expectedShelfId: fixture.shelfId,
+          coordinationRoot
+        }),
+        "shelf-write-unsafe-path"
+      );
+    }
+
+    expect((await readdir(fixture.shelfRoot)).sort()).toEqual(before);
+    expect(before).not.toContain("coordination");
+    expect(before).not.toContain("books");
+    expect(before).not.toContain("annotations");
+    await expect(readdir(path.join(fixture.shelfRoot, "coordination"))).rejects.toThrow();
   });
 });
 
@@ -364,6 +472,21 @@ describe("collector quote commit", () => {
     expect(await readRecords(fixture.annotationsDirectory)).toHaveLength(1);
   });
 
+  test("refuses a request ID resent with a different comment field", async () => {
+    const fixture = await createFixture("comment-field-mismatch");
+    const requestId = `req-${randomUUID()}`;
+    const first = await commitShelfQuote(request(fixture, { requestId, commentField: "comment" }));
+    await expectCoordinationError(
+      commitShelfQuote(request(fixture, { requestId, commentField: "privateMemo" })),
+      "shelf-write-request-mismatch"
+    );
+    const annotations = await readRecords(fixture.annotationsDirectory);
+    expect(annotations).toHaveLength(1);
+    expect(annotations[0]!.comment).toBe("利用者のコメント");
+    expect(annotations[0]!.privateMemo).toBeUndefined();
+    expect(annotations[0]!.id).toBe(first.annotationId);
+  });
+
   test("carries the comment in privateMemo when the caller selects that field", async () => {
     const fixture = await createFixture("private-memo");
     await commitShelfQuote(request(fixture, { commentField: "privateMemo" }));
@@ -415,5 +538,109 @@ describe("collector quote commit", () => {
     });
     expect(after[0]!.record.state).toBe("committed");
     expect(after[0]!.matchesDisk).toBe(true);
+  });
+});
+
+describe("shelf write journal validation", () => {
+  function journalDirectory(fixture: Fixture): string {
+    return path.join(fixture.coordinationRoot, "shelves", fixture.shelfId.toLowerCase(), "requests");
+  }
+
+  async function readJournal(fixture: Fixture, requestId: string): Promise<Record<string, unknown>> {
+    return JSON.parse(
+      await readFile(path.join(journalDirectory(fixture), `${requestId}.json`), "utf8")
+    ) as Record<string, unknown>;
+  }
+
+  async function writeJournal(fixture: Fixture, requestId: string, value: Record<string, unknown>): Promise<void> {
+    await writeFile(path.join(journalDirectory(fixture), `${requestId}.json`), `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  }
+
+  async function committedFixture(label: string): Promise<{ fixture: Fixture; requestId: string; journal: Record<string, unknown> }> {
+    const fixture = await createFixture(label);
+    const requestId = `req-${randomUUID()}`;
+    await commitShelfQuote(request(fixture, { requestId }));
+    return { fixture, requestId, journal: await readJournal(fixture, requestId) };
+  }
+
+  test("rejects a record that belongs to a different Shelf", async () => {
+    const { fixture, requestId, journal } = await committedFixture("journal-shelf");
+    await writeJournal(fixture, requestId, { ...journal, shelfId: randomUUID() });
+    await expectCoordinationError(commitShelfQuote(request(fixture, { requestId })), "shelf-write-journal-invalid");
+  });
+
+  test("rejects a record whose request ID does not match its file name", async () => {
+    const { fixture, requestId, journal } = await committedFixture("journal-name");
+    await writeJournal(fixture, requestId, { ...journal, requestId: `req-${randomUUID()}` });
+    await expectCoordinationError(commitShelfQuote(request(fixture, { requestId })), "shelf-write-journal-invalid");
+  });
+
+  test("rejects an Annotation ID that would escape the Annotation directory", async () => {
+    const { fixture, requestId, journal } = await committedFixture("journal-traversal");
+    await writeJournal(fixture, requestId, { ...journal, annotationId: "../../outside" });
+    await expectCoordinationError(commitShelfQuote(request(fixture, { requestId })), "shelf-write-journal-invalid");
+    // Nothing was read or written through the injected path.
+    await expect(readFile(path.join(fixture.base, "outside.json"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(fixture.shelfRoot, "outside.json"), "utf8")).rejects.toThrow();
+  });
+
+  test("rejects a malformed Book ID, digest, timestamp, or unknown field", async () => {
+    for (const patch of [
+      { bookId: "book:../../outside" },
+      { requestDigest: "sha256:not-hex" },
+      { annotationDigest: "0123" },
+      { stagedAt: "2026-10-30 12:00" },
+      { unexpected: true },
+      { writer: { pid: -1, process: "x" } }
+    ]) {
+      const { fixture, requestId, journal } = await committedFixture("journal-field");
+      await writeJournal(fixture, requestId, { ...journal, ...patch });
+      await expectCoordinationError(commitShelfQuote(request(fixture, { requestId })), "shelf-write-journal-invalid");
+    }
+  });
+
+  test("rejects an internally inconsistent state", async () => {
+    const { fixture, requestId, journal } = await committedFixture("journal-state");
+    const { committedAt: _committedAt, ...withoutCommitTime } = journal;
+    await writeJournal(fixture, requestId, withoutCommitTime);
+    await expectCoordinationError(commitShelfQuote(request(fixture, { requestId })), "shelf-write-journal-invalid");
+
+    const staged = await committedFixture("journal-state-staged");
+    await writeJournal(staged.fixture, staged.requestId, {
+      ...staged.journal,
+      state: "staged",
+      abortedReason: "not-applicable"
+    });
+    await expectCoordinationError(
+      commitShelfQuote(request(staged.fixture, { requestId: staged.requestId })),
+      "shelf-write-journal-invalid"
+    );
+  });
+
+  test("rejects a record that is not valid JSON instead of treating it as absent", async () => {
+    const { fixture, requestId } = await committedFixture("journal-json");
+    await writeFile(path.join(journalDirectory(fixture), `${requestId}.json`), "{ \"version\": 1, ", "utf8");
+    await expectCoordinationError(commitShelfQuote(request(fixture, { requestId })), "shelf-write-journal-invalid");
+    // The truncated record must never be reported as a saved or completed request.
+    await expectCoordinationError(
+      inspectShelfWriteJournal({
+        shelfRoot: fixture.shelfRoot,
+        expectedShelfId: fixture.shelfId,
+        coordinationRoot: fixture.coordinationRoot
+      }),
+      "shelf-write-journal-invalid"
+    );
+  });
+
+  test("a committed record whose Book is missing is not reported as already committed", async () => {
+    const { fixture, requestId, journal } = await committedFixture("journal-book-missing");
+    await rm(path.join(fixture.booksDirectory, `${String(journal.bookId).replace(":", "-")}.json`));
+    await expectCoordinationError(commitShelfQuote(request(fixture, { requestId })), "shelf-write-receipt-missing");
+  });
+
+  test("a committed record whose Annotation is missing is not reported as already committed", async () => {
+    const { fixture, requestId, journal } = await committedFixture("journal-annotation-missing");
+    await rm(path.join(fixture.annotationsDirectory, `${String(journal.annotationId).replace(":", "-")}.json`));
+    await expectCoordinationError(commitShelfQuote(request(fixture, { requestId })), "shelf-write-receipt-missing");
   });
 });

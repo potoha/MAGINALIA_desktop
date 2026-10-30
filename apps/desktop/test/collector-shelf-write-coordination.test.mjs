@@ -60,6 +60,68 @@ async function journalDirectory(fixture) {
   return path.join(fixture.coordinationRoot, "shelves", fixture.shelfId.toLowerCase(), "requests");
 }
 
+function leaseFilePath(fixture) {
+  return path.join(fixture.coordinationRoot, "shelves", fixture.shelfId.toLowerCase(), "writer.lock");
+}
+
+/**
+ * Spawn a worker and expose its stdout lines incrementally, so a test can act while
+ * the child is still running (for example while it holds the write lease).
+ */
+async function startWorker(command) {
+  const file = path.join(os.tmpdir(), `maginalia-cmd-${randomUUID()}.json`);
+  await writeFile(file, JSON.stringify(command), "utf8");
+  const child = spawn(process.execPath, [worker, file], { stdio: ["ignore", "pipe", "pipe"] });
+  const lines = [];
+  const waiters = [];
+  let buffer = "";
+  child.stdout.on("data", (chunk) => {
+    buffer += chunk.toString("utf8");
+    let index = buffer.indexOf("\n");
+    while (index >= 0) {
+      const text = buffer.slice(0, index).trim();
+      buffer = buffer.slice(index + 1);
+      index = buffer.indexOf("\n");
+      if (text.length === 0) continue;
+      lines.push(JSON.parse(text));
+      for (const waiter of [...waiters]) waiter();
+    }
+  });
+  const closed = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) => resolve(code));
+  });
+  return {
+    child,
+    lines,
+    closed,
+    waitForLine(predicate, timeoutMs = 15_000) {
+      return new Promise((resolve, reject) => {
+        const stopWaiting = () => {
+          clearTimeout(timer);
+          const index = waiters.indexOf(check);
+          if (index >= 0) waiters.splice(index, 1);
+        };
+        const check = () => {
+          const found = lines.find(predicate);
+          if (found === undefined) return;
+          stopWaiting();
+          resolve(found);
+        };
+        const timer = setTimeout(() => {
+          stopWaiting();
+          reject(new Error(`timed out waiting for worker output; saw ${JSON.stringify(lines)}`));
+        }, timeoutMs);
+        waiters.push(check);
+        check();
+      });
+    },
+    async cleanup() {
+      await rm(file, { force: true });
+    }
+  };
+}
+
 test("concurrent processes reuse one Book and append every Annotation without loss", async () => {
   const fixture = await createShelfFixture("concurrent");
   try {
@@ -179,7 +241,70 @@ test("reusing a request ID with different content is refused and writes nothing"
     const conflicting = await runWorker(baseCommand(fixture, { requestId, quote: "異なる本文" }));
     assert.equal(conflicting.code, 3);
     assert.equal(conflicting.result.code, "shelf-write-request-mismatch");
+    // A different comment field changes the persisted bytes, so it is different
+    // content under the same request ID, not a retry.
+    const commentFieldConflict = await runWorker(baseCommand(fixture, { requestId, commentField: "privateMemo" }));
+    assert.equal(commentFieldConflict.code, 3);
+    assert.equal(commentFieldConflict.result.code, "shelf-write-request-mismatch");
     assert.equal((await listJsonFiles(fixture.annotationsDirectory)).length, countBefore);
+  } finally {
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("a live holder keeps its lease even when its heartbeat looks stale", async () => {
+  const fixture = await createShelfFixture("live-holder");
+  const holder = await startWorker(baseCommand(fixture, {
+    holdLeaseMs: 3_000,
+    leaseTtlMs: 50,
+    acquireTimeoutMs: 5_000
+  }));
+  try {
+    const acquired = await holder.waitForLine((line) => line.acquired === true);
+    assert.equal(typeof acquired.pid, "number");
+    // Let the holder's acquisition-time heartbeat age past the contender's
+    // threshold. A TTL-only implementation would steal the lease here.
+    await new Promise((resolve) => { setTimeout(resolve, 250); });
+
+    const contender = await runWorker(baseCommand(fixture, { leaseTtlMs: 50, acquireTimeoutMs: 400 }));
+    assert.equal(contender.code, 3, `${JSON.stringify(contender.result)} ${contender.stderr}`);
+    assert.equal(contender.result.code, "shelf-write-lease-uncertain");
+
+    // The holder's lease file is byte-identical in identity: still the same PID.
+    const lock = JSON.parse(await readFile(leaseFilePath(fixture), "utf8"));
+    assert.equal(lock.pid, acquired.pid);
+
+    const finished = await holder.waitForLine((line) => line.assertedHeld !== undefined);
+    assert.equal(finished.assertedHeld, true, "the live holder never lost its lease");
+    assert.equal(await holder.closed, 0);
+    assert.equal((await listJsonFiles(fixture.annotationsDirectory)).length, 0, "no writer committed");
+
+    const after = await runWorker(baseCommand(fixture));
+    assert.equal(after.code, 0, `${JSON.stringify(after.result)} ${after.stderr}`);
+    assert.equal((await listJsonFiles(fixture.annotationsDirectory)).length, 1);
+  } finally {
+    holder.child.kill();
+    await holder.cleanup();
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("a corrupted journal is refused by a fresh process", async () => {
+  const fixture = await createShelfFixture("corrupt-journal");
+  try {
+    const requestId = `req-corrupt-${randomUUID()}`;
+    const first = await runWorker(baseCommand(fixture, { requestId }));
+    assert.equal(first.code, 0, `${JSON.stringify(first.result)} ${first.stderr}`);
+
+    const journalFile = path.join(await journalDirectory(fixture), `${requestId}.json`);
+    const record = JSON.parse(await readFile(journalFile, "utf8"));
+    await writeFile(journalFile, `${JSON.stringify({ ...record, annotationId: "../../escape" }, null, 2)}\n`, "utf8");
+
+    const retried = await runWorker(baseCommand(fixture, { requestId }));
+    assert.equal(retried.code, 3, `${JSON.stringify(retried.result)} ${retried.stderr}`);
+    assert.equal(retried.result.code, "shelf-write-journal-invalid");
+    assert.equal((await listJsonFiles(fixture.annotationsDirectory)).length, 1, "nothing new was written");
+    await assert.rejects(readFile(path.join(fixture.shelfRoot, "escape.json"), "utf8"));
   } finally {
     await rm(fixture.base, { recursive: true, force: true });
   }

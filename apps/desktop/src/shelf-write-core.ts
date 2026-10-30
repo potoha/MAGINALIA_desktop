@@ -115,10 +115,11 @@ export type ShelfDirectoryResolution =
 
 /**
  * Read `library.json` and resolve the record directories it configures.
- * No file in the Shelf is created by this step; directory creation is delegated
- * to `ensureShelfDirectory` so callers control the point of mutation.
+ *
+ * This is strictly read-only: no file or directory is created, so a caller can
+ * validate identity and path overlap before touching the filesystem.
  */
-export async function resolveShelfDirectories(root: string): Promise<ShelfDirectoryResolution> {
+export async function readShelfDirectoryConfig(root: string): Promise<ShelfDirectoryResolution> {
   let library: unknown;
   try {
     library = JSON.parse(await readFile(path.join(root, SHELF_LIBRARY_FILENAME), "utf8"));
@@ -130,10 +131,22 @@ export async function resolveShelfDirectories(root: string): Promise<ShelfDirect
   const booksDirectory = resolveConfiguredShelfDirectory(root, config.booksPath, SHELF_BOOKS_DIRECTORY);
   const annotationsDirectory = resolveConfiguredShelfDirectory(root, config.annotationsPath, SHELF_ANNOTATIONS_DIRECTORY);
   if (booksDirectory === null || annotationsDirectory === null) return { kind: "paths-invalid" };
+  return { kind: "ok", directories: Object.freeze({ booksDirectory, annotationsDirectory }) };
+}
+
+/**
+ * Resolve the record directories and make sure they exist.
+ * Callers that must not mutate the Shelf before validation use
+ * `readShelfDirectoryConfig` first and call this only afterwards.
+ */
+export async function resolveShelfDirectories(root: string): Promise<ShelfDirectoryResolution> {
+  const config = await readShelfDirectoryConfig(root);
+  if (config.kind !== "ok") return config;
+  const { booksDirectory, annotationsDirectory } = config.directories;
   if (!await ensureShelfDirectory(root, booksDirectory) || !await ensureShelfDirectory(root, annotationsDirectory)) {
     return { kind: "paths-unsafe" };
   }
-  return { kind: "ok", directories: Object.freeze({ booksDirectory, annotationsDirectory }) };
+  return config;
 }
 
 export function isMissingFileError(error: unknown): boolean {

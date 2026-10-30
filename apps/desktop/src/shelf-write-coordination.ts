@@ -24,7 +24,7 @@
  * `docs/collector-shelf-writer-coordination.md`, open decisions).
  */
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, open, readFile, readdir, realpath, rename, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, link, unlink } from "node:fs/promises";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type {
@@ -34,11 +34,12 @@ import type {
 import { inspectFolderMarkers } from "./folder-identity.js";
 import { assertSafeRoot } from "./repository-filesystem.js";
 import {
+  ensureShelfDirectory,
   isInsideDirectory,
   matchShelfBook,
   publishShelfFileNoReplace,
   readExistingShelfBooks,
-  resolveShelfDirectories,
+  readShelfDirectoryConfig,
   serializeShelfRecord,
   shelfBookFilename,
   shelfRecordFilename
@@ -53,7 +54,13 @@ function loadFormatCore(): Promise<FormatCore> {
 
 export const SHELF_WRITE_LEASE_VERSION = 1 as const;
 export const SHELF_WRITE_JOURNAL_VERSION = 1 as const;
-/** A lease older than this is treated as abandoned even if its PID is reused. */
+/**
+ * Heartbeat age after which a *live* holder's lease is considered uncertain.
+ *
+ * This is deliberately NOT a theft threshold: a live PID with an expired
+ * heartbeat fails closed with `shelf-write-lease-uncertain` instead of losing its
+ * lease. Only a provably dead PID justifies reclamation.
+ */
 export const SHELF_WRITE_LEASE_TTL_MS = 120_000;
 export const SHELF_WRITE_ACQUIRE_TIMEOUT_MS = 15_000;
 export const SHELF_WRITE_POLL_INTERVAL_MS = 40;
@@ -74,7 +81,9 @@ export type ShelfWriteCoordinationErrorCode =
   | "shelf-write-layout-invalid"
   | "shelf-write-busy"
   | "shelf-write-lease-lost"
+  | "shelf-write-lease-uncertain"
   | "shelf-write-journal-unavailable"
+  | "shelf-write-journal-invalid"
   | "shelf-write-request-mismatch"
   | "shelf-write-book-conflict"
   | "shelf-write-record-conflict"
@@ -178,6 +187,48 @@ export async function assertShelfWriteLayoutCurrent(layout: ShelfWriteLayout): P
   }
 }
 
+function foldPath(value: string): string {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+/** True when either path is the other or one contains the other (case-folded on Windows). */
+function pathsOverlap(left: string, right: string): boolean {
+  const a = foldPath(left);
+  const b = foldPath(right);
+  if (a === b) return true;
+  const isDescendant = (relative: string): boolean =>
+    relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+  return isDescendant(path.relative(a, b)) || isDescendant(path.relative(b, a));
+}
+
+function assertNoShelfOverlap(shelfRoot: string, candidate: string): void {
+  if (pathsOverlap(shelfRoot, candidate)) {
+    fail("shelf-write-unsafe-path", "The coordination root overlaps the Private Shelf.");
+  }
+}
+
+/**
+ * Canonicalize a path that may not exist yet by resolving the deepest existing
+ * ancestor, so junctions/symlinks in the parent chain are honoured before any
+ * directory is created.
+ */
+async function canonicalizeProspectivePath(target: string): Promise<string> {
+  let current = path.resolve(target);
+  const suffix: string[] = [];
+  for (;;) {
+    try {
+      const canonical = await realpath(current);
+      return suffix.length === 0 ? canonical : path.join(canonical, ...[...suffix].reverse());
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return path.resolve(target);
+      suffix.push(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
 export interface ResolveShelfWriteLayoutOptions {
   readonly shelfRoot: string;
   readonly expectedShelfId: string;
@@ -223,25 +274,38 @@ export async function resolveShelfWriteLayout(options: ResolveShelfWriteLayoutOp
     fail("shelf-write-identity-mismatch", "The Shelf identity does not match the configured identity.");
   }
 
-  const resolution = await resolveShelfDirectories(root);
+  const resolution = await readShelfDirectoryConfig(root);
   if (resolution.kind !== "ok") {
     fail("shelf-write-layout-invalid", `The Private Shelf layout is not writable (${resolution.kind}).`);
   }
 
+  // The overlap check runs BEFORE any directory is created, so a rejected
+  // configuration cannot leave a trace inside the user's Shelf. Paths that do not
+  // exist yet are canonicalized through their deepest existing ancestor, which
+  // still resolves junctions in the parent chain.
+  const prospectiveCoordinationRoot = await canonicalizeProspectivePath(options.coordinationRoot);
+  assertNoShelfOverlap(root, prospectiveCoordinationRoot);
+
   let coordinationDirectory: string;
+  let coordinationRootReal: string;
   try {
     await mkdir(options.coordinationRoot, { recursive: true });
-    const shelfCoordinationPath = path.join(options.coordinationRoot, "shelves", shelfId.toLowerCase());
+    coordinationRootReal = await realpath(options.coordinationRoot);
+    // Re-check after creation: the created directory may resolve through a
+    // junction that only becomes visible once it exists.
+    assertNoShelfOverlap(root, coordinationRootReal);
+    const shelfCoordinationPath = path.join(coordinationRootReal, "shelves", shelfId.toLowerCase());
     await mkdir(path.join(shelfCoordinationPath, "requests"), { recursive: true });
     coordinationDirectory = await realpath(shelfCoordinationPath);
-  } catch {
+  } catch (error: unknown) {
+    if (error instanceof ShelfWriteCoordinationError) throw error;
     fail("shelf-write-journal-unavailable", "The coordination directory is unavailable.");
   }
-  const coordinationRootReal = await realpath(options.coordinationRoot);
-  // Coordination state must never become Shelf user data, and the Shelf must not
-  // be nested inside the coordination root.
-  if (isInsideDirectory(root, coordinationRootReal) || isInsideDirectory(coordinationRootReal, root)) {
-    fail("shelf-write-unsafe-path", "The coordination root overlaps the Private Shelf.");
+  assertNoShelfOverlap(root, coordinationDirectory);
+
+  if (!await ensureShelfDirectory(root, resolution.directories.booksDirectory)
+    || !await ensureShelfDirectory(root, resolution.directories.annotationsDirectory)) {
+    fail("shelf-write-layout-invalid", "The Private Shelf record directories are unavailable or unsafe.");
   }
 
   const fingerprint: ShelfWriteLayoutFingerprint = Object.freeze({
@@ -278,11 +342,17 @@ export interface AcquireShelfWriteLeaseOptions {
   readonly coordinationRoot: string;
   readonly shelfId: string;
   readonly processLabel?: string;
+  /** Heartbeat age that marks a live holder as uncertain (never a theft window). */
   readonly leaseTtlMs?: number;
   readonly acquireTimeoutMs?: number;
   readonly pollIntervalMs?: number;
   /** Injectable clock; milliseconds since epoch. Required for staleness tests. */
   readonly now?: () => number;
+  /**
+   * Test seam: runs between the verified observation of a dead holder's lock and
+   * the atomic reap rename, so race behaviour can be reproduced deterministically.
+   */
+  readonly onBeforeReapRename?: () => void | Promise<void>;
 }
 
 export interface ShelfWriteLease {
@@ -303,21 +373,25 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-async function readLeaseMetadata(lockPath: string): Promise<ShelfWriteLeaseMetadata | undefined> {
+const SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
+const ISO_TIMESTAMP_PATTERN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z$/u;
+
+function parseLeaseMetadata(text: string): ShelfWriteLeaseMetadata | undefined {
   try {
-    const info = await lstat(lockPath);
-    if (!info.isFile() || info.isSymbolicLink() || info.size > 4096) return undefined;
-    const parsed: unknown = JSON.parse(await readFile(lockPath, "utf8"));
+    const parsed: unknown = JSON.parse(text);
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
     const value = parsed as Record<string, unknown>;
     if (value.version !== SHELF_WRITE_LEASE_VERSION
       || typeof value.shelfId !== "string"
+      || !UUID_PATTERN.test(value.shelfId)
       || typeof value.token !== "string"
       || value.token.length < 16
       || typeof value.pid !== "number"
+      || !Number.isInteger(value.pid)
       || typeof value.processLabel !== "string"
       || typeof value.acquiredAt !== "string"
-      || typeof value.heartbeatAt !== "number") return undefined;
+      || typeof value.heartbeatAt !== "number"
+      || !Number.isFinite(value.heartbeatAt)) return undefined;
     return Object.freeze({
       version: SHELF_WRITE_LEASE_VERSION,
       shelfId: value.shelfId,
@@ -332,18 +406,163 @@ async function readLeaseMetadata(lockPath: string): Promise<ShelfWriteLeaseMetad
   }
 }
 
-function leaseIsStale(metadata: ShelfWriteLeaseMetadata, now: number, ttlMs: number): boolean {
-  if (!processIsAlive(metadata.pid)) return true;
-  return now - metadata.heartbeatAt > ttlMs;
+async function readLeaseMetadata(lockPath: string): Promise<ShelfWriteLeaseMetadata | undefined> {
+  try {
+    const info = await lstat(lockPath);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 4096) return undefined;
+    return parseLeaseMetadata(await readFile(lockPath, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * An immutable observation of the lock file: exact bytes, parsed metadata, and the
+ * `{dev, ino}` pair that identifies the concrete file, not just the name.
+ */
+interface ObservedLease {
+  readonly metadata: ShelfWriteLeaseMetadata;
+  readonly text: string;
+  readonly dev: number;
+  readonly ino: number;
+}
+
+async function readObservedLease(lockPath: string): Promise<ObservedLease | undefined> {
+  try {
+    const info = await lstat(lockPath);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 4096) return undefined;
+    const text = await readFile(lockPath, "utf8");
+    const metadata = parseLeaseMetadata(text);
+    if (metadata === undefined) return undefined;
+    return Object.freeze({ metadata, text, dev: info.dev, ino: info.ino });
+  } catch {
+    return undefined;
+  }
+}
+
+async function leaseFileExists(lockPath: string): Promise<boolean> {
+  try {
+    await lstat(lockPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+type ReapOutcome = "reaped" | "changed" | "uncertain";
+
+/**
+ * Reclaim a lock whose owner is provably dead, without stealing a live writer's
+ * lease.
+ *
+ * The reap is a verified swap, never a bare delete:
+ *
+ * 1. the observable file is pinned with a hard link, and the pin's `{dev, ino}` is
+ *    compared with the observation, so a lock that was already replaced cannot be
+ *    touched;
+ * 2. only then is the lock atomically renamed into quarantine;
+ * 3. the quarantined file's bytes and `{dev, ino}` are compared with the
+ *    observation again; a mismatch means a competitor replaced the lock in the
+ *    window, so the quarantined file is restored atomically with `link()` and the
+ *    caller retries (`changed`);
+ * 4. if restoration is impossible (a third writer already created a lock, or the
+ *    filesystem cannot link) the outcome is `uncertain` and the caller fails
+ *    closed — no writer may proceed on an unproven lease state.
+ *
+ * The single residual window is between the final identity check and the rename
+ * syscall; a stolen lease is always detected by `assertHeld()` before any record
+ * is published, so a mis-taken lease cannot produce a duplicate write.
+ */
+async function reapObservedDeadLease(
+  lockPath: string,
+  observed: ObservedLease,
+  onBeforeReapRename?: () => void | Promise<void>
+): Promise<ReapOutcome> {
+  const pinPath = `${lockPath}.${randomUUID()}.pin`;
+  try {
+    await link(lockPath, pinPath);
+  } catch {
+    // Hard links are unavailable (some network filesystems) or the lock vanished.
+    return "uncertain";
+  }
+
+  let pinned: { readonly text: string; readonly dev: number; readonly ino: number } | undefined;
+  try {
+    const info = await lstat(pinPath);
+    const text = await readFile(pinPath, "utf8");
+    pinned = { text, dev: info.dev, ino: info.ino };
+  } catch {
+    pinned = undefined;
+  }
+  if (pinned === undefined || pinned.text !== observed.text
+    || pinned.dev !== observed.dev || pinned.ino !== observed.ino) {
+    // The name no longer points at the observed dead holder's lock. Nothing is
+    // removed: a newer holder owns the lease now.
+    try { await unlink(pinPath); } catch { /* Best effort. */ }
+    return "changed";
+  }
+
+  await onBeforeReapRename?.();
+
+  // Re-read the name immediately before the rename. The confirmed pin proves what
+  // the observation referred to; this second observation is what decides whether the
+  // name still refers to that same file. A lock created by another writer in the
+  // window is therefore never renamed away.
+  const current = await readObservedLease(lockPath);
+  if (current === undefined || current.text !== observed.text
+    || current.dev !== observed.dev || current.ino !== observed.ino) {
+    try { await unlink(pinPath); } catch { /* Best effort. */ }
+    return "changed";
+  }
+
+  const quarantine = `${lockPath}.${randomUUID()}.reap`;
+  try {
+    await rename(lockPath, quarantine);
+  } catch (error: unknown) {
+    try { await unlink(pinPath); } catch { /* Best effort. */ }
+    return isMissing(error) ? "changed" : "uncertain";
+  }
+  try { await unlink(pinPath); } catch { /* Best effort. */ }
+
+  let moved: { readonly text: string; readonly dev: number; readonly ino: number } | undefined;
+  try {
+    const info = await lstat(quarantine);
+    const text = await readFile(quarantine, "utf8");
+    moved = { text, dev: info.dev, ino: info.ino };
+  } catch {
+    moved = undefined;
+  }
+
+  if (moved !== undefined && moved.text === observed.text
+    && moved.dev === observed.dev && moved.ino === observed.ino) {
+    // The dead holder's own lock file was removed. Confirmed reclamation.
+    try { await unlink(quarantine); } catch { /* Best effort. */ }
+    return "reaped";
+  }
+
+  // A different file was moved. Put it back atomically; if that is impossible the
+  // lease state is unprovable and the caller must stop.
+  try {
+    await link(quarantine, lockPath);
+  } catch (error: unknown) {
+    if (isExists(error)) {
+      // Another writer holds a fresh lock; the quarantined file cannot be restored
+      // without overwriting it. Leave the quarantine in place as evidence.
+      return "uncertain";
+    }
+    return "uncertain";
+  }
+  try { await unlink(quarantine); } catch { /* Best effort. */ }
+  return "changed";
 }
 
 /**
  * Acquire the Shelf-scoped cross-process write lease.
  *
  * The lease is a `wx`-created file, so creation itself is the atomic
- * compare-and-set. A crashed holder is evicted by an atomic rename of the stale
- * lock to a quarantine name; only one contender wins that rename, and the loser
- * retries creation and still observes the winner's lock.
+ * compare-and-set. A crashed holder is evicted only when its PID is provably dead;
+ * an expired heartbeat alone never removes a lease, because a slow but healthy
+ * writer must not lose its exclusivity.
  */
 export async function acquireShelfWriteLease(options: AcquireShelfWriteLeaseOptions): Promise<ShelfWriteLease> {
   const shelfId = options.shelfId;
@@ -404,17 +623,45 @@ export async function acquireShelfWriteLease(options: AcquireShelfWriteLeaseOpti
       if (!isExists(error)) fail("shelf-write-journal-unavailable", "The Shelf write lease cannot be created.");
     }
 
-    const existing = await readLeaseMetadata(lockPath);
-    if (existing !== undefined && leaseIsStale(existing, now(), ttlMs)) {
-      const quarantine = `${lockPath}.${randomUUID()}.stale`;
-      try {
-        await rename(lockPath, quarantine);
-        try { await unlink(quarantine); } catch { /* Quarantine cleanup is best effort. */ }
-      } catch { /* Another contender evicted it first. */ }
-      continue;
+    const observed = await readObservedLease(lockPath);
+    const lockPresent = observed !== undefined || await leaseFileExists(lockPath);
+    if (observed !== undefined) {
+      const alive = processIsAlive(observed.metadata.pid);
+      if (!alive) {
+        const outcome = await reapObservedDeadLease(lockPath, observed, options.onBeforeReapRename);
+        if (outcome === "reaped") continue;
+        if (outcome === "changed") {
+          // Another writer is actively replacing the lock. Keep polling, but never
+          // spin past the acquire window without reporting a bounded outcome.
+          if (now() >= deadline) {
+            fail("shelf-write-busy", "Another process holds the Shelf write lease.");
+          }
+          await delay(backoff);
+          backoff = Math.min(backoff * 2, 250);
+          continue;
+        }
+        fail("shelf-write-lease-uncertain", "A stale Shelf write lease could not be reclaimed safely.");
+      }
+      // A live holder keeps its lease regardless of heartbeat age. An old heartbeat
+      // means we cannot prove the holder is healthy, so we must not take the lease.
+      if (now() - observed.metadata.heartbeatAt > ttlMs) {
+        fail(
+          "shelf-write-lease-uncertain",
+          "A live writer holds the Shelf write lease but its heartbeat is stale.",
+          observed.metadata.processLabel
+        );
+      }
     }
+
     if (now() >= deadline) {
-      fail("shelf-write-busy", "Another process holds the Shelf write lease.", existing?.processLabel);
+      // A lock that exists but cannot be parsed may be mid-write by a live creator,
+      // so it is given the full acquire window to become valid. If it is still
+      // unreadable after that, the lease state is unprovable: fail closed rather
+      // than guess.
+      if (lockPresent && observed === undefined) {
+        fail("shelf-write-lease-uncertain", "The Shelf write lease file is unreadable or malformed.");
+      }
+      fail("shelf-write-busy", "Another process holds the Shelf write lease.", observed?.metadata.processLabel);
     }
     await delay(backoff);
     backoff = Math.min(backoff * 2, 250);
@@ -466,61 +713,181 @@ async function writeJournalRecord(layout: ShelfWriteLayout, record: ShelfWriteJo
   }
 }
 
+const JOURNAL_REQUIRED_KEYS: readonly string[] = [
+  "version", "kind", "shelfId", "requestId", "requestDigest", "state",
+  "bookId", "annotationId", "bookReused", "annotationDigest",
+  "stagedAt", "updatedAt", "writer"
+];
+const JOURNAL_OPTIONAL_KEYS: readonly string[] = ["committedAt", "abortedReason"];
+const JOURNAL_WRITER_KEYS: readonly string[] = ["pid", "process"];
+const JOURNAL_MAX_BYTES = 8192;
+
+function invalidJournal(detail: string): never {
+  fail("shelf-write-journal-invalid", "The Shelf write journal record is invalid.", detail);
+}
+
+function journalString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0) invalidJournal(`${label} must be a non-empty string`);
+  return value;
+}
+
+/**
+ * Parse and strictly validate a journal record.
+ *
+ * A journal is *external input* on resume: it is read from disk after a crash, so
+ * it can be truncated, hand-edited, copied from another Shelf, or left over from a
+ * different request. Nothing about it is trusted:
+ *
+ * - the file name must be the record's own request ID, and every ID must match the
+ *   canonical Shelf pattern *before* it is used to build any filesystem path, so a
+ *   record can never point outside the journal, Book, or Annotation directory;
+ * - the record's Shelf identity must be the Shelf that is actually open;
+ * - unknown keys are rejected, so a future field cannot be smuggled in;
+ * - `state` must be internally consistent (`committed` needs its timestamp and a
+ *   fully formed digest, `aborted` needs a reason, `staged`/`committed` need a real
+ *   Annotation digest).
+ *
+ * Any deviation fails closed with `shelf-write-journal-invalid`; a malformed record
+ * can therefore never produce `committed`/`already-committed`.
+ */
+function parseJournalRecord(
+  raw: unknown,
+  options: { readonly requestId: string; readonly shelfId: string }
+): ShelfWriteJournalRecord {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    invalidJournal("the record is not an object");
+  }
+  const value = raw as Record<string, unknown>;
+  for (const key of Object.keys(value)) {
+    if (!JOURNAL_REQUIRED_KEYS.includes(key) && !JOURNAL_OPTIONAL_KEYS.includes(key)) {
+      invalidJournal(`unknown field "${key}"`);
+    }
+  }
+  for (const key of JOURNAL_REQUIRED_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) invalidJournal(`missing field "${key}"`);
+  }
+
+  if (value.version !== SHELF_WRITE_JOURNAL_VERSION) invalidJournal("unsupported record version");
+  if (value.kind !== "shelf-write-request") invalidJournal("unexpected record kind");
+
+  const shelfId = journalString(value.shelfId, "shelfId");
+  if (!UUID_PATTERN.test(shelfId)) invalidJournal("shelfId is not a Shelf identity");
+  if (shelfId.toLowerCase() !== options.shelfId.toLowerCase()) {
+    invalidJournal("the record belongs to a different Shelf");
+  }
+
+  const requestId = journalString(value.requestId, "requestId");
+  if (!REQUEST_ID_PATTERN.test(requestId)) invalidJournal("requestId is not a valid request ID");
+  if (requestId !== options.requestId) invalidJournal("the record does not match its file name");
+
+  const state = value.state;
+  if (state !== "staged" && state !== "committed" && state !== "aborted") {
+    invalidJournal("unknown record state");
+  }
+
+  const bookId = journalString(value.bookId, "bookId");
+  if (!BOOK_ID_PATTERN.test(bookId)) invalidJournal("bookId is not a Book identity");
+  const annotationId = journalString(value.annotationId, "annotationId");
+  if (!ANNOTATION_ID_PATTERN.test(annotationId)) invalidJournal("annotationId is not an Annotation identity");
+
+  if (typeof value.bookReused !== "boolean") invalidJournal("bookReused must be a boolean");
+
+  const requestDigest = journalString(value.requestDigest, "requestDigest");
+  if (!SHA256_DIGEST_PATTERN.test(requestDigest)) invalidJournal("requestDigest is not a SHA-256 digest");
+
+  const annotationDigestRaw = value.annotationDigest;
+  if (typeof annotationDigestRaw !== "string") invalidJournal("annotationDigest must be a string");
+  if (annotationDigestRaw !== "" && !SHA256_DIGEST_PATTERN.test(annotationDigestRaw)) {
+    invalidJournal("annotationDigest is not a SHA-256 digest");
+  }
+  if (state !== "aborted" && annotationDigestRaw === "") {
+    invalidJournal("a persisted request must record its Annotation digest");
+  }
+
+  const stagedAt = journalString(value.stagedAt, "stagedAt");
+  if (!ISO_TIMESTAMP_PATTERN.test(stagedAt)) invalidJournal("stagedAt is not an ISO timestamp");
+  const updatedAt = journalString(value.updatedAt, "updatedAt");
+  if (!ISO_TIMESTAMP_PATTERN.test(updatedAt)) invalidJournal("updatedAt is not an ISO timestamp");
+
+  const writer = value.writer;
+  if (writer === null || typeof writer !== "object" || Array.isArray(writer)) {
+    invalidJournal("writer must be an object");
+  }
+  const writerValue = writer as Record<string, unknown>;
+  for (const key of Object.keys(writerValue)) {
+    if (!JOURNAL_WRITER_KEYS.includes(key)) invalidJournal(`unknown writer field "${key}"`);
+  }
+  if (typeof writerValue.pid !== "number" || !Number.isInteger(writerValue.pid) || writerValue.pid < 0) {
+    invalidJournal("writer.pid must be a process ID");
+  }
+  if (typeof writerValue.process !== "string" || writerValue.process.length === 0) {
+    invalidJournal("writer.process must be a non-empty string");
+  }
+
+  let committedAt: string | undefined;
+  if (value.committedAt !== undefined) {
+    committedAt = journalString(value.committedAt, "committedAt");
+    if (!ISO_TIMESTAMP_PATTERN.test(committedAt)) invalidJournal("committedAt is not an ISO timestamp");
+    if (state !== "committed") invalidJournal("only a committed record carries a commit time");
+  }
+  let abortedReason: string | undefined;
+  if (value.abortedReason !== undefined) {
+    abortedReason = journalString(value.abortedReason, "abortedReason");
+    if (state !== "aborted") invalidJournal("only an aborted record carries an abort reason");
+  }
+  if (state === "committed" && committedAt === undefined) {
+    invalidJournal("a committed record must carry its commit time");
+  }
+  if (state === "aborted" && abortedReason === undefined) {
+    invalidJournal("an aborted record must carry its abort reason");
+  }
+
+  return Object.freeze({
+    version: SHELF_WRITE_JOURNAL_VERSION,
+    kind: "shelf-write-request",
+    shelfId,
+    requestId,
+    requestDigest,
+    state,
+    bookId: bookId as `book:${string}`,
+    annotationId: annotationId as `ann:${string}`,
+    bookReused: value.bookReused,
+    annotationDigest: annotationDigestRaw,
+    stagedAt,
+    updatedAt,
+    writer: Object.freeze({ pid: writerValue.pid, process: writerValue.process }),
+    ...(committedAt === undefined ? {} : { committedAt }),
+    ...(abortedReason === undefined ? {} : { abortedReason })
+  });
+}
+
 async function readJournalRecord(
   layout: ShelfWriteLayout,
   requestId: string
 ): Promise<ShelfWriteJournalRecord | undefined> {
+  if (!REQUEST_ID_PATTERN.test(requestId)) {
+    invalidJournal("the requested journal name is not a valid request ID");
+  }
   const target = path.join(layout.coordinationDirectory, "requests", `${requestId}.json`);
   let text: string;
   try {
+    const info = await lstat(target);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > JOURNAL_MAX_BYTES) {
+      invalidJournal("the journal record is not a regular, size-bounded file");
+    }
     text = await readFile(target, "utf8");
   } catch (error: unknown) {
+    if (error instanceof ShelfWriteCoordinationError) throw error;
     if (isMissing(error)) return undefined;
     fail("shelf-write-journal-unavailable", "The Shelf write journal record cannot be read.");
   }
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(text);
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid");
-    const value = parsed as Record<string, unknown>;
-    if (value.version !== SHELF_WRITE_JOURNAL_VERSION
-      || value.kind !== "shelf-write-request"
-      || typeof value.requestId !== "string"
-      || typeof value.shelfId !== "string"
-      || typeof value.requestDigest !== "string"
-      || (value.state !== "staged" && value.state !== "committed" && value.state !== "aborted")
-      || typeof value.bookId !== "string"
-      || typeof value.annotationId !== "string"
-      || typeof value.annotationDigest !== "string"
-      || typeof value.stagedAt !== "string"
-      || typeof value.updatedAt !== "string"
-      || typeof value.bookReused !== "boolean") throw new Error("invalid");
-    return Object.freeze({
-      version: SHELF_WRITE_JOURNAL_VERSION,
-      kind: "shelf-write-request",
-      shelfId: value.shelfId,
-      requestId: value.requestId,
-      requestDigest: value.requestDigest,
-      state: value.state,
-      bookId: value.bookId as `book:${string}`,
-      annotationId: value.annotationId as `ann:${string}`,
-      bookReused: value.bookReused,
-      annotationDigest: value.annotationDigest,
-      stagedAt: value.stagedAt,
-      updatedAt: value.updatedAt,
-      writer: typeof value.writer === "object" && value.writer !== null
-        ? Object.freeze({
-          pid: typeof (value.writer as Record<string, unknown>).pid === "number" ? (value.writer as Record<string, number>).pid : 0,
-          process: typeof (value.writer as Record<string, unknown>).process === "string"
-            ? (value.writer as Record<string, string>).process
-            : "unknown"
-        })
-        : Object.freeze({ pid: 0, process: "unknown" }),
-      ...(typeof value.committedAt === "string" ? { committedAt: value.committedAt } : {}),
-      ...(typeof value.abortedReason === "string" ? { abortedReason: value.abortedReason } : {})
-    });
+    parsed = JSON.parse(text);
   } catch {
-    fail("shelf-write-journal-unavailable", "The Shelf write journal record is corrupt.");
+    invalidJournal("the journal record is not valid JSON");
   }
+  return parseJournalRecord(parsed, { requestId, shelfId: layout.shelfId });
 }
 
 async function annotationDigestOnDisk(directory: string, annotationId: string): Promise<string | undefined> {
@@ -529,6 +896,15 @@ async function annotationDigestOnDisk(directory: string, annotationId: string): 
     return createHash("sha256").update(bytes).digest("hex");
   } catch {
     return undefined;
+  }
+}
+
+async function shelfRecordExists(directory: string, id: string): Promise<boolean> {
+  try {
+    const info = await lstat(path.join(directory, shelfRecordFilename(id)));
+    return info.isFile() && !info.isSymbolicLink();
+  } catch {
+    return false;
   }
 }
 
@@ -680,13 +1056,20 @@ function buildAnnotation(
 export async function commitShelfQuote(request: ShelfQuoteWriteRequest): Promise<ShelfQuoteWriteReceipt> {
   const content = validateQuoteRequest(request);
   const commentField = request.commentField ?? "comment";
+  if (commentField !== "comment" && commentField !== "privateMemo") {
+    fail("shelf-write-invalid-request", "The comment field selector is invalid.");
+  }
   const format = await loadFormatCore();
   const layout = await resolveShelfWriteLayout({
     shelfRoot: request.shelfRoot,
     expectedShelfId: request.expectedShelfId,
     coordinationRoot: request.coordinationRoot
   });
-  const requestDigest = digestShelfWriteContent(content);
+  // Every input that changes the persisted bytes is part of the digest. The comment
+  // field selector decides whether the text lands in `comment` or `privateMemo`, so
+  // a resend with the same request ID but a different field is a different request,
+  // not a retry.
+  const requestDigest = digestShelfWriteContent({ ...content, commentField });
   const nowIso = () => new Date(request.now?.() ?? Date.now()).toISOString();
 
   const lease = await acquireShelfWriteLease({
@@ -704,6 +1087,9 @@ export async function commitShelfQuote(request: ShelfQuoteWriteRequest): Promise
       fail("shelf-write-request-mismatch", "The request ID was already used with different content.");
     }
     if (journal !== undefined && journal.state === "committed") {
+      if (!await shelfRecordExists(layout.booksDirectory, journal.bookId)) {
+        fail("shelf-write-receipt-missing", "A committed receipt exists but its Book is missing.");
+      }
       const onDisk = await annotationDigestOnDisk(layout.annotationsDirectory, journal.annotationId);
       if (onDisk === undefined) {
         fail("shelf-write-receipt-missing", "A committed receipt exists but its Annotation is missing.");
@@ -894,7 +1280,13 @@ export async function inspectShelfWriteJournal(options: {
   const annotations = await readdir(layout.annotationsDirectory).catch(() => [] as string[]);
   const entries: ShelfWriteJournalEntry[] = [];
   for (const name of names.filter((value) => value.endsWith(".json")).sort()) {
-    const record = await readJournalRecord(layout, name.slice(0, -".json".length));
+    const requestId = name.slice(0, -".json".length);
+    // A file whose name cannot be a request ID is not a journal record. A
+    // well-named record with invalid content still throws
+    // `shelf-write-journal-invalid`, because silently skipping it would let a
+    // damaged journal look like a complete, clean journal.
+    if (!REQUEST_ID_PATTERN.test(requestId)) continue;
+    const record = await readJournalRecord(layout, requestId);
     if (record === undefined) continue;
     const annotationPresent = annotations.includes(shelfRecordFilename(record.annotationId));
     const bookPresent = books.includes(shelfRecordFilename(record.bookId));

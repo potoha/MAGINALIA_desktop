@@ -6,6 +6,12 @@
  * compiled coordination layer (`dist/main/shelf-write-coordination.js`) from an
  * ordinary OS process so that exclusion, idempotency, crash recovery and receipt
  * durability are proven between processes rather than between in-process stubs.
+ *
+ * Commands:
+ *   (default)          commit one Collector web quote
+ *   crashAfterBook     exit between the Book publish and the Annotation publish
+ *   swapAnnotationsTo  replace the Annotation directory with a junction mid-write
+ *   holdLeaseMs        acquire the write lease, hold it, then assert it was kept
  */
 import { createRequire } from "node:module";
 import { readFile, rename, symlink } from "node:fs/promises";
@@ -29,13 +35,50 @@ const coordination = require(path.join(
 
 const command = JSON.parse(await readFile(commandFile, "utf8"));
 
+function emit(value) {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+function reportFailure(error) {
+  const code = error && typeof error === "object" && typeof error.code === "string" ? error.code : "unknown";
+  emit({ ok: false, code, message: String(error && error.message ? error.message : error) });
+  process.exit(code.startsWith("shelf-write-") ? 3 : 1);
+}
+
+if (typeof command.holdLeaseMs === "number") {
+  // Lease-holding mode: proves that a live holder cannot be displaced, and reports
+  // whether its lease still belonged to it after the contender ran.
+  try {
+    const lease = await coordination.acquireShelfWriteLease({
+      coordinationRoot: command.coordinationRoot,
+      shelfId: command.expectedShelfId,
+      processLabel: command.processLabel ?? "poc-holder",
+      ...(command.leaseTtlMs === undefined ? {} : { leaseTtlMs: command.leaseTtlMs }),
+      ...(command.acquireTimeoutMs === undefined ? {} : { acquireTimeoutMs: command.acquireTimeoutMs })
+    });
+    emit({ ok: true, acquired: true, pid: process.pid });
+    await new Promise((resolve) => { setTimeout(resolve, command.holdLeaseMs); });
+    let assertedHeld = true;
+    try {
+      await lease.assertHeld();
+    } catch {
+      assertedHeld = false;
+    }
+    await lease.release();
+    emit({ ok: true, acquired: true, assertedHeld, released: true });
+    process.exit(assertedHeld ? 0 : 4);
+  } catch (error) {
+    reportFailure(error);
+  }
+}
+
 const faults = {};
 if (command.crashAfterBook === true) {
   // Simulates a power loss between the add-only Book publish and the Annotation
   // publish. process.exit skips finally blocks, so the lease file is left behind
   // exactly as a crashed process would leave it.
   faults.beforeAnnotationPublish = () => {
-    process.stdout.write(`${JSON.stringify({ ok: false, code: "simulated-crash" })}\n`);
+    emit({ ok: false, code: "simulated-crash" });
     process.exit(70);
   };
 }
@@ -60,13 +103,13 @@ try {
     ...(command.title === undefined ? {} : { title: command.title }),
     ...(command.authors === undefined ? {} : { authors: command.authors }),
     ...(command.comment === undefined ? {} : { comment: command.comment }),
+    ...(command.commentField === undefined ? {} : { commentField: command.commentField }),
     processLabel: command.processLabel ?? "poc-worker",
     ...(command.acquireTimeoutMs === undefined ? {} : { acquireTimeoutMs: command.acquireTimeoutMs }),
+    ...(command.leaseTtlMs === undefined ? {} : { leaseTtlMs: command.leaseTtlMs }),
     ...(Object.keys(faults).length === 0 ? {} : { faults })
   });
-  process.stdout.write(`${JSON.stringify({ ok: true, receipt })}\n`);
+  emit({ ok: true, receipt });
 } catch (error) {
-  const code = error && typeof error === "object" && typeof error.code === "string" ? error.code : "unknown";
-  process.stdout.write(`${JSON.stringify({ ok: false, code, message: String(error && error.message ? error.message : error) })}\n`);
-  process.exit(code.startsWith("shelf-write-") ? 3 : 1);
+  reportFailure(error);
 }

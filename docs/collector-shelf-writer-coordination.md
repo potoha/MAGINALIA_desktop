@@ -84,10 +84,26 @@ No second Shelf format, schema, ID scheme, or copy database is introduced. Reque
 - Acquisition is a `wx` create (atomic compare-and-set). Contenders back off with bounded jitter and
   fail with `shelf-write-busy` after `acquireTimeoutMs` (default 15 s) — a write is never silently
   skipped or duplicated.
-- A crashed holder is evicted by an atomic rename of the lock to a quarantine name; only one contender
-  wins the rename. Staleness = dead PID **or** heartbeat older than 120 s (PID reuse guard).
+- **Only a provably dead PID justifies reclamation.** A live holder keeps its lease no matter how old
+  its heartbeat is; an expired heartbeat means the holder's health cannot be proven, so the contender
+  fails closed with `shelf-write-lease-uncertain` instead of stealing. (The heartbeat is written at
+  acquisition time only — there is no renewal timer; see residual risk below.)
+- Reclamation of a dead holder's lock is a verified swap, never a bare delete or blind rename:
+  1. the lock is observed as an immutable record of its exact bytes, parsed metadata and `{dev, ino}`;
+  2. the file is pinned with a hard link and the pin's bytes and `{dev, ino}` must match the observation —
+     if not, a newer holder already replaced the lock and nothing is touched;
+  3. the name is re-read immediately before the swap; if it no longer refers to the observed file, the
+     reap is abandoned and retried without renaming anything;
+  4. only then is the lock atomically renamed into quarantine, and the quarantined file's bytes and
+     `{dev, ino}` must match the observation again;
+  5. a mismatch restores the quarantined file atomically with `link()`; if restoration is impossible
+     (a third writer already created a lock) the outcome is `shelf-write-lease-uncertain`.
+- A lock file that exists but cannot be parsed is given the full acquire window to become valid (it may
+  be a live creator mid-write) and then fails closed with `shelf-write-lease-uncertain`. It is never
+  deleted on a guess.
 - Release compares the holder token, so a writer that lost its lease cannot delete the new holder's
-  lock.
+  lock. `assertHeld()` runs immediately before the Book publish and again before the commit point, so a
+  writer whose lease was displaced cannot publish anything.
 
 ### 3.3 Commit order and the single commit point
 
@@ -108,16 +124,38 @@ roll back: an interruption leaves at worst a reusable Book, and the retry comple
 
 - Journal: `<coordinationRoot>/shelves/<uuid>/requests/<requestId>.json`, written temp → `fsync` → rename.
 - `requestDigest` = sha256 of the request **content without generated IDs**, so it is stable across
-  retries while IDs may differ per attempt.
+  retries while IDs may differ per attempt. Every input that changes the persisted bytes is part of it,
+  **including the `commentField` selector**: the same text stored in `comment` or in `privateMemo` is
+  different content, so it is detected as a mismatch rather than accepted as a retry.
 - Same request ID + same digest → `already-committed` receipt, no write, no rewrite (asserted by
   comparing file bytes across processes).
 - Same request ID + different digest → `shelf-write-request-mismatch` (writes nothing).
 - `staged` + Annotation already on disk with the recorded digest → receipt is completed without
   re-publishing.
-- `committed` receipt whose Annotation is missing or changed → `shelf-write-receipt-missing` (fail
-  closed rather than "re-saving" over user data).
+- `committed` receipt whose Book **or** Annotation is missing or changed → `shelf-write-receipt-missing`
+  (fail closed rather than "re-saving" over user data).
 - The journal stores IDs, digests, timestamps and writer PID only — **no quote text, URL, title or
   comment**, so it is not a second copy of user data.
+
+#### Journal records are untrusted input
+
+A journal is read back from disk after a crash, so it can be truncated, hand-edited, or copied from
+another Shelf. Reading is therefore a strict validation, not a parse:
+
+- the file must be a regular, non-symlink file under 8 KiB;
+- the record's `requestId` must equal its own file name, and `shelfId` must equal the Shelf that is
+  actually open (a record from another Shelf is refused);
+- every ID (`shelfId`, `requestId`, `bookId`, `annotationId`) must match its canonical pattern **before**
+  it is used to build any path, so a record can never point inside `requests/` at a traversal path or
+  outside the Book/Annotation directories;
+- `requestDigest` and `annotationDigest` must be `sha256:<64 hex>`; unknown top-level and `writer` keys
+  are rejected; timestamps must be ISO-8601 UTC;
+- `state` must be internally consistent: `committed` requires `committedAt` and a complete Annotation
+  digest, `aborted` requires `abortedReason`, and a non-aborted record may not carry an abort reason.
+
+Any deviation fails closed with `shelf-write-journal-invalid`. A malformed record can therefore never
+produce `committed` or `already-committed`, and journal inspection reports the error instead of silently
+skipping the record.
 
 ### 3.5 Windows path, junction and path-swap defence
 
@@ -132,7 +170,13 @@ changes `lstat` to a link; a moved/renamed directory changes the realpath; a re-
 changes `dev`/`ino`. Any difference is `shelf-write-unsafe-path` and nothing is written.
 
 The coordination root may not overlap the Shelf in either direction, so coordination state can never
-be committed as Shelf user data.
+be committed as Shelf user data. The overlap check runs **before any directory is created**: the
+`library.json` directories are resolved read-only, the not-yet-existing coordination root is
+canonicalized through its deepest existing ancestor (so a junction in the parent chain is still
+honoured), the overlap is rejected there, and only afterwards is the directory created and re-checked
+against its realpath. A rejected configuration leaves the Shelf byte-for-byte unchanged — proven by a
+test that removes `books/` and `annotations/` first and asserts they are still absent, and that
+`readdir(shelfRoot)` is identical, after each rejection.
 
 Residual risk (not hidden): the window between the last fingerprint check and `link()` is a TOCTOU
 window. It is narrowed to a single syscall but not eliminated; eliminating it needs a directory handle
@@ -146,6 +190,25 @@ the tests from the bytes on disk: `type`, `version: "0.4"`, `id` patterns
 Book, `get.date = YYYYMMDDHHMM`, non-empty `quote`, optional `comment`. No field outside the strict
 v0.4 schema is added.
 
+### 3.7 Error codes
+
+| Code | Meaning |
+| --- | --- |
+| `shelf-write-invalid-request` | Caller input is not a valid request (IDs, URL, get.date, comment) |
+| `shelf-write-unsafe-path` | Layout, record directory or coordination root is unsafe or changed |
+| `shelf-write-shelf-unavailable` | Configured Shelf root is unavailable |
+| `shelf-write-identity-unavailable` / `-conflict` / `-mismatch` | Marker missing, conflicting, or not the expected Shelf |
+| `shelf-write-layout-invalid` | `library.json` directories are not resolvable/writable |
+| `shelf-write-busy` | A live, healthy holder kept the lease for the whole acquire window |
+| `shelf-write-lease-lost` | This writer's token is no longer the lock's token |
+| `shelf-write-lease-uncertain` | A live-but-unproven holder, an unreadable lock, or an unprovable reap — fail closed |
+| `shelf-write-journal-unavailable` | Journal/lease filesystem operation failed |
+| `shelf-write-journal-invalid` | A journal record is malformed, foreign, or internally inconsistent |
+| `shelf-write-request-mismatch` | Same request ID, different content (digest, incl. comment field) |
+| `shelf-write-book-conflict` | The source URL matches incompatible Books |
+| `shelf-write-record-conflict` | A different record already occupies the planned filename |
+| `shelf-write-receipt-missing` | A committed receipt's Book or Annotation is missing/changed |
+
 ## 4. Verification
 
 All commands run in the worktree at the result commit. Fixtures are created in the OS temporary
@@ -156,10 +219,10 @@ MAGINALIA`, `shelf_location.yml`, IDE or Collector repository is touched.
 | --- | --- | --- | --- |
 | 1 | Main-process typecheck | `apps/desktop: npx tsc -p tsconfig.main.json --noEmit` | PASS |
 | 2 | Full Desktop typecheck | `apps/desktop: npx tsc -p tsconfig.json --noEmit` | PASS |
-| 3 | Lease/journal/refusal unit tests (18) | `npx vitest run --config vitest.config.mts src/shelf-write-coordination.test.ts` | PASS |
+| 3 | Lease/journal/refusal unit tests (30) | `npx vitest run --config vitest.config.mts src/shelf-write-coordination.test.ts` | PASS |
 | 4 | Reviewer writer regression (5+14) | `npx vitest run ... src/reviewer-shelf-materializer.test.ts src/reviewer-shelf-reconciliation.test.ts src/tutorial-seed.test.ts` | PASS |
-| 5 | Whole Desktop suite (`npm test`) | 886/887 pass; the single failure (`src/tutorial-sample.test.ts`, Unicode-normalization of the tutorial marker) reproduces on the unmodified base commit, so it is pre-existing and unrelated | PASS (no new failure) |
-| 6 | Real two-process evidence (9 tests) | `npm run build:main && node --test test/collector-shelf-write-coordination.test.mjs` | PASS |
+| 5 | Whole Desktop suite (`npm test`) | 898/899 pass; the single failure (`src/tutorial-sample.test.ts`, Unicode-normalization of the tutorial marker) reproduces on the unmodified base commit, so it is pre-existing and unrelated | PASS (no new failure) |
+| 6 | Real two-process evidence (11 tests) | `npm run build:main && node --test test/collector-shelf-write-coordination.test.mjs` | PASS |
 
 Real-process evidence (`test/collector-shelf-write-coordination.test.mjs`, each case spawns real child
 processes that write to an isolated fixture Shelf):
@@ -173,17 +236,32 @@ processes that write to an isolated fixture Shelf):
    Annotation ID, and commits.
 4. Fresh process replaying a committed request → `already-committed`, original `recordedAt`, and the
    Annotation file bytes are unchanged.
-5. Same request ID with different content → `shelf-write-request-mismatch`, no new files.
+5. Same request ID with different content → `shelf-write-request-mismatch`, no new files; the same check
+   with only the comment field changed (`privateMemo` instead of `comment`) is also refused.
 6. Wrong expected Shelf UUID → `shelf-write-identity-mismatch`, Shelf untouched.
 7. `annotations/` replaced by a junction before the write → `shelf-write-layout-invalid`, external
    directory stays empty.
 8. `annotations/` swapped for a junction mid-write (after the Book publish) → `shelf-write-unsafe-path`,
    nothing written through the junction.
 9. Coordination root inside the Shelf → `shelf-write-unsafe-path`.
+10. A live holder with a heartbeat older than the contender's threshold → the contender gets
+    `shelf-write-lease-uncertain` (never `committed`), the holder's lock is still the holder's PID, the
+    holder's `assertHeld()` after the contender ran still passes, and no record was written. Once the
+    holder releases, the next process commits normally.
+11. A journal tampered to point its `annotationId` at `../../escape` → a fresh process refuses with
+    `shelf-write-journal-invalid`; the existing Annotation is untouched and no file appears at the
+    traversed path.
 
-In-process unit evidence additionally covers: busy refusal while the lease is held, stale-PID eviction,
-heartbeat-expiry eviction, token-checked release, marker mismatch/missing/conflict, overlap refusal,
-comment-field routing, and the Desktop writer refusing while a Host-side lease is held.
+In-process unit evidence additionally covers: busy refusal while the lease is held, dead-PID reap with
+no quarantine/pin debris, refusal to evict a live holder on heartbeat expiry alone, a **deterministic
+reap race** (a competitor installs a live lease from inside the `onBeforeReapRename` seam; the contender
+must not move it, must fail `busy`, and the winner's lock bytes and token must be unchanged), fail-closed
+on a malformed lock, token-checked release, marker mismatch/missing/conflict, overlap refusal **with the
+Shelf proven unmodified** (`books/` and `annotations/` stay absent, `readdir` unchanged), comment-field
+routing, comment-field mismatch detection, strict journal validation (foreign Shelf, filename/request-ID
+mismatch, traversal Annotation ID, malformed Book ID, non-digest digests, bad timestamp, unknown field,
+inconsistent state, invalid JSON, committed-without-Book, committed-without-Annotation), and the Desktop
+writer refusing while a Host-side lease is held.
 
 ## 5. Not verified
 
@@ -198,6 +276,24 @@ comment-field routing, and the Desktop writer refusing while a Host-side lease i
   proven against process kill, not against abrupt power loss.
 - Orphan cleanup: an add-only Book left by a crashed request that is never retried stays on disk
   (harmless, reused by locator) and no sweeper exists.
+
+### Residual risks of the lease protocol
+
+- **No heartbeat renewal.** The heartbeat is written once at acquisition. A holder that is alive but
+  wedged past `leaseTtlMs` blocks other writers with `shelf-write-lease-uncertain` instead of being
+  evicted. This is deliberate (a healthy writer must not lose its lease) but means a stuck process, or
+  a lock file left unreadable by a crash mid-write, needs operator removal of
+  `<coordinationRoot>/shelves/<uuid>/writer.lock`. A renewal timer is the obvious follow-up, but it
+  changes the failure model and is not implemented here.
+- **Single-syscall reap window.** The name is re-read immediately before the atomic rename, so a lock
+  created in the observation window is not renamed. The gap between that final read and the rename
+  syscall cannot be closed with portable Node APIs. If it is ever crossed, the quarantined file is
+  restored with `link()`; if restoration is impossible the contender fails closed, and the displaced
+  holder still detects the loss through `assertHeld()` before any publish, so no duplicate record can
+  be produced.
+- **Hard-link dependency.** The verified reap and the restore path need `link()`. On a filesystem
+  without hard links (some network shares) reclamation fails closed with `shelf-write-lease-uncertain`
+  rather than falling back to an unverified delete.
 
 ## 6. Open decisions (must not be settled by this slice)
 
@@ -226,6 +322,11 @@ ADR 0019's open-items paragraph):
   Shelf UUID 単位のプロセス間lease、add-only公開 + Annotationを単一commit pointとする順序、
   request IDによる冪等journal/receipt、commit直前のrealpath/dev/ino再検証を実装・検証した。
 - 既存Reviewer Writerの公開処理は `shelf-write-core` に集約し、第2のWriter/Shelf形式は作っていない。
+- lease回収は死PID確認時のみ許可し、生存processのTTL超過はfail closed（`shelf-write-lease-uncertain`）と
+  した。回収は観測(内容+dev/ino)→pin検証→再観測→rename→再検証とし、新しいlockを奪わない。
+- requestDigestは永続化内容を変える全入力（commentFieldを含む）を対象とし、journalは
+  shelfId/requestId/bookId/annotationId/digest/状態を厳格検証する（`shelf-write-journal-invalid`）。
+- coordination rootとShelf rootの重複検査は副作用前に実施し、拒否時にShelfが変化しないことを検証した。
 - Hostからの実Shelf書込、本番identity binding、registration/packagingは未実装・未検証。
 - 未決定: coordination rootの本番位置、直接書込か委譲か、journal保持/GC、comment格納先、
   request IDの発行者と束縛、同一URLで異なる文書のBook同一性、Windowsでの耐久ack保証、優先順位。
