@@ -51,6 +51,8 @@
     "src/reviewer-resolution.ts",
     "src/repository-filesystem.ts",
     "src/repository-local-history.ts",
-    "src/repository-service.ts"
+    "src/repository-service.ts",
+    "src/shelf-write-coordination.ts",
+    "src/shelf-write-core.ts"
   ]
 }
