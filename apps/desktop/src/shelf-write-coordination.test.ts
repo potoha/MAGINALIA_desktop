@@ -15,6 +15,7 @@ import {
   acquireShelfWriteLease,
   commitShelfQuote,
   inspectShelfWriteJournal,
+  reclaimStaleShelfWriteLease,
   resolveShelfWriteLayout,
   ShelfWriteCoordinationError,
   type ShelfQuoteWriteRequest
@@ -128,10 +129,75 @@ describe("shelf write lease", () => {
     await second.release();
   });
 
-  test("a lease left by a dead process is reaped and leaves no coordination debris", async () => {
+  test("a lease left by a dead process is reported as stale and never taken over", async () => {
     const fixture = await createFixture("stale");
+    const token = randomUUID();
+    const stale = `${JSON.stringify({
+      version: 1,
+      shelfId: fixture.shelfId,
+      token,
+      pid: 2_147_483_647,
+      processLabel: "crashed",
+      acquiredAt: new Date().toISOString(),
+      heartbeatAt: Date.now()
+    })}\n`;
+    await mkdir(path.dirname(leasePath(fixture)), { recursive: true });
+    await writeFile(leasePath(fixture), stale, "utf8");
+
+    const error = await expectCoordinationError(
+      acquireShelfWriteLease({
+        coordinationRoot: fixture.coordinationRoot,
+        shelfId: fixture.shelfId,
+        acquireTimeoutMs: 2_000
+      }),
+      "shelf-write-lease-stale"
+    );
+    // The recovery context identifies exactly which lock is stuck.
+    expect(error.context?.["token"]).toBe(token);
+    expect(error.context?.["pid"]).toBe(2_147_483_647);
+    // Nothing was moved, rewritten or left behind.
+    expect(await readFile(leasePath(fixture), "utf8")).toBe(stale);
+    expect((await readdir(path.dirname(leasePath(fixture)))).sort()).toEqual(["writer.lock"]);
+  });
+
+  test("explicit recovery reclaims a dead holder's lease and the next writer proceeds", async () => {
+    const fixture = await createFixture("recover");
+    const token = randomUUID();
     await mkdir(path.dirname(leasePath(fixture)), { recursive: true });
     await writeFile(leasePath(fixture), `${JSON.stringify({
+      version: 1,
+      shelfId: fixture.shelfId,
+      token,
+      pid: 2_147_483_647,
+      processLabel: "crashed",
+      acquiredAt: new Date().toISOString(),
+      heartbeatAt: Date.now()
+    })}\n`, "utf8");
+
+    const result = await reclaimStaleShelfWriteLease({
+      coordinationRoot: fixture.coordinationRoot,
+      shelfId: fixture.shelfId,
+      expectedToken: token
+    });
+    expect(result.reclaimed).toBe(true);
+    expect(result.holder?.token).toBe(token);
+    expect(result.holder?.pid).toBe(2_147_483_647);
+    // No lock and no debris: the retire quarantine is cleaned up.
+    expect(await readdir(path.dirname(leasePath(fixture)))).toEqual([]);
+
+    const lease = await acquireShelfWriteLease({
+      coordinationRoot: fixture.coordinationRoot,
+      shelfId: fixture.shelfId,
+      acquireTimeoutMs: 1_000
+    });
+    await lease.release();
+    expect(await readdir(path.dirname(leasePath(fixture)))).toEqual([]);
+  });
+
+  test("explicit recovery refuses a lock the caller did not observe", async () => {
+    const fixture = await createFixture("recover-token");
+    await mkdir(path.dirname(leasePath(fixture)), { recursive: true });
+    const stale = `${JSON.stringify({
       version: 1,
       shelfId: fixture.shelfId,
       token: randomUUID(),
@@ -139,32 +205,37 @@ describe("shelf write lease", () => {
       processLabel: "crashed",
       acquiredAt: new Date().toISOString(),
       heartbeatAt: Date.now()
-    })}\n`, "utf8");
-    const lease = await acquireShelfWriteLease({
-      coordinationRoot: fixture.coordinationRoot,
-      shelfId: fixture.shelfId,
-      acquireTimeoutMs: 2_000
-    });
-    const holder = JSON.parse(await readFile(leasePath(fixture), "utf8")) as Record<string, unknown>;
-    expect(holder.token).toBe(lease.token);
-    expect((await readdir(path.dirname(leasePath(fixture)))).sort()).toEqual(["writer.lock"]);
-    await lease.release();
+    })}\n`;
+    await writeFile(leasePath(fixture), stale, "utf8");
+    await expectCoordinationError(
+      reclaimStaleShelfWriteLease({
+        coordinationRoot: fixture.coordinationRoot,
+        shelfId: fixture.shelfId,
+        expectedToken: randomUUID()
+      }),
+      "shelf-write-lease-uncertain"
+    );
+    expect(await readFile(leasePath(fixture), "utf8")).toBe(stale);
   });
 
-  test("a live writer is never evicted merely because its heartbeat expired", async () => {
-    const fixture = await createFixture("ttl");
+  test("explicit recovery never displaces a live holder", async () => {
+    const fixture = await createFixture("recover-live");
     const fixedNow = 1_800_000_000_000;
     await mkdir(path.dirname(leasePath(fixture)), { recursive: true });
-    const stale = `${JSON.stringify({
+    const token = randomUUID();
+    const live = `${JSON.stringify({
       version: 1,
       shelfId: fixture.shelfId,
-      token: randomUUID(),
+      token,
       pid: process.pid,
       processLabel: "slow-but-alive",
       acquiredAt: new Date(fixedNow - 600_000).toISOString(),
       heartbeatAt: fixedNow - 600_000
     })}\n`;
-    await writeFile(leasePath(fixture), stale, "utf8");
+    await writeFile(leasePath(fixture), live, "utf8");
+
+    // A live PID keeps its lease even with an expired heartbeat, both for normal
+    // acquisition and for explicit recovery.
     await expectCoordinationError(
       acquireShelfWriteLease({
         coordinationRoot: fixture.coordinationRoot,
@@ -175,14 +246,21 @@ describe("shelf write lease", () => {
       }),
       "shelf-write-lease-uncertain"
     );
+    await expectCoordinationError(
+      reclaimStaleShelfWriteLease({
+        coordinationRoot: fixture.coordinationRoot,
+        shelfId: fixture.shelfId,
+        expectedToken: token
+      }),
+      "shelf-write-lease-uncertain"
+    );
     // The holder keeps its lease: the file is byte-identical and still present.
-    expect(await readFile(leasePath(fixture), "utf8")).toBe(stale);
+    expect(await readFile(leasePath(fixture), "utf8")).toBe(live);
   });
 
-  test("a reap cannot take a lock that another writer acquired after the stale check", async () => {
-    const fixture = await createFixture("reap-race");
-    const directory = path.dirname(leasePath(fixture));
-    await mkdir(directory, { recursive: true });
+  test("a lease is never taken over automatically, even for a dead holder", async () => {
+    const fixture = await createFixture("no-auto-takeover");
+    await mkdir(path.dirname(leasePath(fixture)), { recursive: true });
     await writeFile(leasePath(fixture), `${JSON.stringify({
       version: 1,
       shelfId: fixture.shelfId,
@@ -192,13 +270,42 @@ describe("shelf write lease", () => {
       acquiredAt: new Date().toISOString(),
       heartbeatAt: Date.now()
     })}\n`, "utf8");
+    // The whole Collector write path fails closed before touching the Shelf.
+    await expectCoordinationError(
+      commitShelfQuote(request(fixture)),
+      "shelf-write-lease-stale"
+    );
+    expect(await readRecords(fixture.booksDirectory)).toHaveLength(0);
+    expect(await readRecords(fixture.annotationsDirectory)).toHaveLength(0);
+    // Repeated attempts stay fail-closed instead of escalating to a takeover.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await expectCoordinationError(commitShelfQuote(request(fixture)), "shelf-write-lease-stale");
+    }
+  });
 
-    // Deterministic interleaving: while the contender has already observed the dead
-    // holder's lock, a competitor reaps it and installs a fresh, live lease.
+  test("explicit recovery cannot remove a lock that another writer acquired after the check", async () => {
+    const fixture = await createFixture("recover-race");
+    const directory = path.dirname(leasePath(fixture));
+    await mkdir(directory, { recursive: true });
+    const deadToken = randomUUID();
+    await writeFile(leasePath(fixture), `${JSON.stringify({
+      version: 1,
+      shelfId: fixture.shelfId,
+      token: deadToken,
+      pid: 2_147_483_647,
+      processLabel: "crashed",
+      acquiredAt: new Date().toISOString(),
+      heartbeatAt: Date.now()
+    })}\n`, "utf8");
+
+    // Deterministic interleaving: after recovery validated the dead holder and the
+    // token, another writer reclaims the lock and takes a fresh, live lease.
     let winnerToken: string | undefined;
-    const winnerLeaseText = (): string => {
+    let winnerText = "";
+    const onBeforeRetireRename = async (): Promise<void> => {
+      await rm(leasePath(fixture), { force: true });
       winnerToken = randomUUID();
-      return `${JSON.stringify({
+      winnerText = `${JSON.stringify({
         version: 1,
         shelfId: fixture.shelfId,
         token: winnerToken,
@@ -207,36 +314,30 @@ describe("shelf write lease", () => {
         acquiredAt: new Date().toISOString(),
         heartbeatAt: Date.now()
       })}\n`;
-    };
-    let winnerText = "";
-    const onBeforeReapRename = async (): Promise<void> => {
-      await rm(leasePath(fixture), { force: true });
-      winnerText = winnerLeaseText();
       await writeFile(leasePath(fixture), winnerText, "utf8");
     };
 
     await expectCoordinationError(
-      acquireShelfWriteLease({
+      reclaimStaleShelfWriteLease({
         coordinationRoot: fixture.coordinationRoot,
         shelfId: fixture.shelfId,
-        processLabel: "contender",
-        acquireTimeoutMs: 250,
-        pollIntervalMs: 20,
-        onBeforeReapRename
+        expectedToken: deadToken,
+        onBeforeRetireRename
       }),
-      "shelf-write-busy"
+      "shelf-write-lease-uncertain"
     );
 
-    // The winner's lease is untouched: same bytes, still held, no quarantine left.
+    // The winner's lease is byte-identical and still valid for its holder.
     expect(await readFile(leasePath(fixture), "utf8")).toBe(winnerText);
     expect((JSON.parse(await readFile(leasePath(fixture), "utf8")) as Record<string, unknown>).token).toBe(winnerToken);
     expect((await readdir(directory)).sort()).toEqual(["writer.lock"]);
   });
 
-  test("a malformed lock file fails closed instead of being reclaimed", async () => {
+  test("a malformed lock file fails closed for acquisition and for recovery", async () => {
     const fixture = await createFixture("malformed-lock");
     await mkdir(path.dirname(leasePath(fixture)), { recursive: true });
-    await writeFile(leasePath(fixture), "{\"version\": 1, \"shelfId\": \"", "utf8");
+    const malformed = "{\"version\": 1, \"shelfId\": \"";
+    await writeFile(leasePath(fixture), malformed, "utf8");
     await expectCoordinationError(
       acquireShelfWriteLease({
         coordinationRoot: fixture.coordinationRoot,
@@ -246,19 +347,70 @@ describe("shelf write lease", () => {
       }),
       "shelf-write-lease-uncertain"
     );
+    await expectCoordinationError(
+      reclaimStaleShelfWriteLease({
+        coordinationRoot: fixture.coordinationRoot,
+        shelfId: fixture.shelfId,
+        expectedToken: randomUUID()
+      }),
+      "shelf-write-lease-uncertain"
+    );
+    expect(await readFile(leasePath(fixture), "utf8")).toBe(malformed);
   });
 
-  test("releasing with a superseded token does not remove the new holder's lease", async () => {
+  test("release removes its own lock and nothing else", async () => {
+    const fixture = await createFixture("release-own");
+    const lease = await acquireShelfWriteLease({
+      coordinationRoot: fixture.coordinationRoot,
+      shelfId: fixture.shelfId
+    });
+    await lease.release();
+    expect(await readdir(path.dirname(leasePath(fixture)))).toEqual([]);
+  });
+
+  test("release cannot delete a newer holder's lock", async () => {
+    const fixture = await createFixture("release-race");
+    // Simulate the replacement at the only instant it can appear without the first
+    // holder's cooperation: after this holder's file was moved to its private retire
+    // name and before that file's token is verified.
+    let replacementText = "";
+    const lease = await acquireShelfWriteLease({
+      coordinationRoot: fixture.coordinationRoot,
+      shelfId: fixture.shelfId,
+      releaseFaults: {
+        beforeRetireVerify: async () => {
+          replacementText = `${JSON.stringify({
+            version: 1,
+            shelfId: fixture.shelfId,
+            token: randomUUID(),
+            pid: process.pid,
+            processLabel: "replacement",
+            acquiredAt: new Date().toISOString(),
+            heartbeatAt: Date.now()
+          })}\n`;
+          await writeFile(leasePath(fixture), replacementText, "utf8");
+        }
+      }
+    });
+    await lease.release();
+    // The first holder retired only its own file; the replacement is untouched.
+    expect(await readFile(leasePath(fixture), "utf8")).toBe(replacementText);
+    expect((await readdir(path.dirname(leasePath(fixture)))).sort()).toEqual(["writer.lock"]);
+  });
+
+  test("releasing with a superseded token leaves the other holder's lock intact", async () => {
     const fixture = await createFixture("release");
     const first = await acquireShelfWriteLease({
       coordinationRoot: fixture.coordinationRoot,
       shelfId: fixture.shelfId
     });
-    const replacement = await readFile(leasePath(fixture), "utf8");
-    const parsed = JSON.parse(replacement) as Record<string, unknown>;
-    await writeFile(leasePath(fixture), `${JSON.stringify({ ...parsed, token: randomUUID() })}\n`, "utf8");
+    const parsed = JSON.parse(await readFile(leasePath(fixture), "utf8")) as Record<string, unknown>;
+    const replacement = `${JSON.stringify({ ...parsed, token: randomUUID() })}\n`;
+    await writeFile(leasePath(fixture), replacement, "utf8");
     await first.release();
-    expect(JSON.parse(await readFile(leasePath(fixture), "utf8")).token).not.toBe(first.token);
+    // Byte-identical: the foreign lock was restored, not rewritten.
+    expect(await readFile(leasePath(fixture), "utf8")).toBe(replacement);
+    expect((await readdir(path.dirname(leasePath(fixture)))).sort()).toEqual(["writer.lock"]);
   });
 });
 
@@ -386,6 +538,51 @@ describe("desktop writer under the shared lease", () => {
     } finally {
       await lease.release();
     }
+  });
+
+  test("the Desktop writer fails closed under a crashed holder's stale lease", async () => {
+    const fixture = await createFixture("desktop-stale");
+    const token = randomUUID();
+    await mkdir(path.dirname(leasePath(fixture)), { recursive: true });
+    await writeFile(leasePath(fixture), `${JSON.stringify({
+      version: 1,
+      shelfId: fixture.shelfId,
+      token,
+      pid: 2_147_483_647,
+      processLabel: "crashed-host",
+      acquiredAt: new Date().toISOString(),
+      heartbeatAt: Date.now()
+    })}\n`, "utf8");
+
+    // No automatic takeover, no partial write: the writer reports the stale lease
+    // and stops before touching Shelf content.
+    const error = await expectCoordinationError(
+      materializeReviewerRecords(fixture.shelfRoot, [approvedRecord()], async () => ({ status: "not-found" }), {
+        coordinationRoot: fixture.coordinationRoot,
+        shelfId: fixture.shelfId,
+        acquireTimeoutMs: 500
+      }),
+      "shelf-write-lease-stale"
+    );
+    expect(error.context?.["token"]).toBe(token);
+    expect(await readRecords(fixture.booksDirectory)).toHaveLength(0);
+    expect(await readRecords(fixture.annotationsDirectory)).toHaveLength(0);
+
+    // Explicit recovery is what unblocks the writer.
+    const reclaimed = await reclaimStaleShelfWriteLease({
+      coordinationRoot: fixture.coordinationRoot,
+      shelfId: fixture.shelfId,
+      expectedToken: String(error.context?.["token"])
+    });
+    expect(reclaimed.reclaimed).toBe(true);
+    const result = await materializeReviewerRecords(
+      fixture.shelfRoot,
+      [approvedRecord()],
+      async () => ({ status: "not-found" }),
+      { coordinationRoot: fixture.coordinationRoot, shelfId: fixture.shelfId, acquireTimeoutMs: 1_000 }
+    );
+    expect(result.materialized).toBe(1);
+    expect(await readRecords(fixture.annotationsDirectory)).toHaveLength(1);
   });
 
   test("the Desktop writer completes under the lease and releases it afterwards", async () => {

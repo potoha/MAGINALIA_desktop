@@ -180,7 +180,7 @@ test("the same request ID sent concurrently from four processes commits exactly 
   }
 });
 
-test("a process killed between Book and Annotation publish is recovered by the retry", async () => {
+test("a process killed between Book and Annotation publish is recovered by an explicit reclaim and retry", async () => {
   const fixture = await createShelfFixture("crash");
   try {
     const requestId = `req-crash-${randomUUID()}`;
@@ -195,11 +195,43 @@ test("a process killed between Book and Annotation publish is recovered by the r
     assert.equal(staged[0].state, "staged");
     assert.equal(staged[0].bookId, booksAfterCrash[0].id);
 
-    // The crashed process left its lease file behind; the retry must take it over.
-    const retried = await runWorker(baseCommand(fixture, { requestId }));
-    assert.equal(retried.code, 0, `${JSON.stringify(retried.result)} ${retried.stderr}`);
-    assert.equal(retried.result.receipt.state, "committed");
-    assert.equal(retried.result.receipt.bookId, booksAfterCrash[0].id, "the existing Book is reused, not duplicated");
+    // The crashed process left its lease file behind. It is not taken over.
+    const crashedLock = await readFile(leaseFilePath(fixture), "utf8");
+    const holder = JSON.parse(crashedLock);
+    assert.equal(holder.pid > 0, true);
+
+    // A retry fails closed, and so does a crowd of simultaneous retries: none of
+    // them may move, rewrite or delete the dead holder's lock.
+    const retried = await runWorker(baseCommand(fixture, { requestId, acquireTimeoutMs: 5_000 }));
+    assert.equal(retried.code, 3, `${JSON.stringify(retried.result)} ${retried.stderr}`);
+    assert.equal(retried.result.code, "shelf-write-lease-stale");
+    assert.equal(retried.result.context.token, holder.token, "the failure names the exact stuck lock");
+    assert.equal(retried.result.context.pid, holder.pid);
+
+    const crowd = await Promise.all(Array.from({ length: 4 }, () => runWorker(
+      baseCommand(fixture, { requestId: `req-crowd-${randomUUID()}`, acquireTimeoutMs: 5_000 })
+    )));
+    for (const contender of crowd) {
+      assert.equal(contender.code, 3, `${JSON.stringify(contender.result)} ${contender.stderr}`);
+      assert.equal(contender.result.code, "shelf-write-lease-stale");
+    }
+    assert.equal(await readFile(leaseFilePath(fixture), "utf8"), crashedLock, "the dead lease is byte-identical");
+    assert.deepEqual(
+      (await readdir(path.dirname(leaseFilePath(fixture)))).sort(),
+      ["requests", "writer.lock"]
+    );
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 0);
+
+    // Explicit recovery: the caller must name the token it observed.
+    const reclaimed = await runWorker(baseCommand(fixture, { reclaim: { expectedToken: holder.token } }));
+    assert.equal(reclaimed.code, 0, `${JSON.stringify(reclaimed.result)} ${reclaimed.stderr}`);
+    assert.equal(reclaimed.result.reclaimed, true);
+    assert.equal(reclaimed.result.holder.pid, holder.pid);
+
+    const committedRetry = await runWorker(baseCommand(fixture, { requestId }));
+    assert.equal(committedRetry.code, 0, `${JSON.stringify(committedRetry.result)} ${committedRetry.stderr}`);
+    assert.equal(committedRetry.result.receipt.state, "committed");
+    assert.equal(committedRetry.result.receipt.bookId, booksAfterCrash[0].id, "the existing Book is reused, not duplicated");
     assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
     const annotations = await readJsonFiles(fixture.annotationsDirectory);
     assert.equal(annotations.length, 1);
@@ -207,6 +239,122 @@ test("a process killed between Book and Annotation publish is recovered by the r
     const committed = await readJsonFiles(await journalDirectory(fixture));
     assert.equal(committed[0].state, "committed");
     assert.equal(committed[0].annotationId, annotations[0].id);
+  } finally {
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("a killed holder's lease blocks writers until it is explicitly reclaimed", async () => {
+  const fixture = await createShelfFixture("killed-holder");
+  const holder = await startWorker(baseCommand(fixture, { holdLeaseMs: 60_000, acquireTimeoutMs: 5_000 }));
+  try {
+    const acquired = await holder.waitForLine((line) => line.acquired === true);
+    assert.equal(typeof acquired.token, "string");
+
+    // Hard-kill the holder while it is running a normal (non-atomic) section: the
+    // lock file stays on disk exactly as an OS-level termination leaves it.
+    holder.child.kill();
+    await holder.closed;
+    assert.equal(
+      holder.lines.some((line) => line.released === true),
+      false,
+      "the holder never released its lease"
+    );
+
+    const blocked = await runWorker(baseCommand(fixture, { acquireTimeoutMs: 3_000 }));
+    assert.equal(blocked.code, 3, `${JSON.stringify(blocked.result)} ${blocked.stderr}`);
+    assert.equal(blocked.result.code, "shelf-write-lease-stale");
+    assert.equal(blocked.result.context.token, acquired.token);
+    assert.equal((await listJsonFiles(fixture.annotationsDirectory)).length, 0, "nothing was written");
+
+    const reclaimed = await runWorker(baseCommand(fixture, { reclaim: { expectedToken: acquired.token } }));
+    assert.equal(reclaimed.code, 0, `${JSON.stringify(reclaimed.result)} ${reclaimed.stderr}`);
+    assert.equal(reclaimed.result.reclaimed, true);
+
+    const committed = await runWorker(baseCommand(fixture));
+    assert.equal(committed.code, 0, `${JSON.stringify(committed.result)} ${committed.stderr}`);
+    assert.equal((await listJsonFiles(fixture.annotationsDirectory)).length, 1);
+  } finally {
+    holder.child.kill();
+    await holder.cleanup();
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("a lease naming a live PID that is not its creator is never reclaimed", async () => {
+  const fixture = await createShelfFixture("pid-reuse");
+  try {
+    // PID reuse: a stale lock field names a PID that is alive again, but that
+    // process never created this lease. Nothing may infer ownership from the PID.
+    const token = randomUUID();
+    const lockPath = leaseFilePath(fixture);
+    await mkdir(path.dirname(lockPath), { recursive: true });
+    const lock = `${JSON.stringify({
+      version: 1,
+      shelfId: fixture.shelfId,
+      token,
+      pid: process.pid,
+      processLabel: "reused-pid",
+      acquiredAt: new Date(Date.now() - 600_000).toISOString(),
+      heartbeatAt: Date.now() - 600_000
+    })}\n`;
+    await writeFile(lockPath, lock, "utf8");
+
+    const blocked = await runWorker(baseCommand(fixture, { acquireTimeoutMs: 3_000 }));
+    assert.equal(blocked.code, 3, `${JSON.stringify(blocked.result)} ${blocked.stderr}`);
+    assert.equal(blocked.result.code, "shelf-write-lease-uncertain");
+
+    const reclaim = await runWorker(baseCommand(fixture, { reclaim: { expectedToken: token } }));
+    assert.equal(reclaim.code, 3, `${JSON.stringify(reclaim.result)} ${reclaim.stderr}`);
+    assert.equal(reclaim.result.code, "shelf-write-lease-uncertain", "a live PID is never displaced");
+
+    assert.equal(await readFile(lockPath, "utf8"), lock, "the lease is byte-identical");
+    assert.equal((await listJsonFiles(fixture.annotationsDirectory)).length, 0);
+  } finally {
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("concurrent explicit reclaims of one dead lease produce exactly one reclaim", async () => {
+  const fixture = await createShelfFixture("reclaim-race");
+  try {
+    const requestId = `req-reclaim-race-${randomUUID()}`;
+    const crashed = await runWorker(baseCommand(fixture, { requestId, crashAfterBook: true }));
+    assert.equal(crashed.code, 70, JSON.stringify(crashed.result));
+    const holder = JSON.parse(await readFile(leaseFilePath(fixture), "utf8"));
+
+    // Several processes attempt the same recovery at once. At most one may remove
+    // the lock; the others must fail closed or observe that nothing is left to
+    // reclaim — never report a second removal of a lock they did not move.
+    const attempts = await Promise.all(Array.from({ length: 4 }, () => runWorker(
+      baseCommand(fixture, { reclaim: { expectedToken: holder.token } }))
+    ));
+    const outcomes = attempts.map((attempt) => attempt.result);
+    const reclaimed = outcomes.filter((outcome) => outcome.reclaimed === true);
+    assert.equal(reclaimed.length, 1, JSON.stringify(outcomes));
+    for (const attempt of attempts) {
+      if (attempt.result.reclaimed === true) {
+        assert.equal(attempt.code, 0);
+      } else if (attempt.result.reclaimed === false) {
+        // Lost the race and observed no lock left: nothing was removed.
+        assert.equal(attempt.code, 0);
+      } else {
+        assert.equal(attempt.code, 3, JSON.stringify(attempt.result));
+        assert.equal(attempt.result.code, "shelf-write-lease-uncertain");
+      }
+    }
+    await assert.rejects(readFile(leaseFilePath(fixture), "utf8"), "no lock survives the recovery");
+
+    // The Shelf is consistent afterwards: one Book, one Annotation, no debris.
+    const committed = await runWorker(baseCommand(fixture, { requestId }));
+    assert.equal(committed.code, 0, `${JSON.stringify(committed.result)} ${committed.stderr}`);
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 1);
+    assert.deepEqual(
+      (await readdir(path.dirname(leaseFilePath(fixture)))).sort(),
+      ["requests"],
+      "no lease or retire debris is left behind"
+    );
   } finally {
     await rm(fixture.base, { recursive: true, force: true });
   }
@@ -269,6 +417,11 @@ test("a live holder keeps its lease even when its heartbeat looks stale", async 
     const contender = await runWorker(baseCommand(fixture, { leaseTtlMs: 50, acquireTimeoutMs: 400 }));
     assert.equal(contender.code, 3, `${JSON.stringify(contender.result)} ${contender.stderr}`);
     assert.equal(contender.result.code, "shelf-write-lease-uncertain");
+
+    // Explicit recovery is equally powerless against a live holder.
+    const reclaim = await runWorker(baseCommand(fixture, { reclaim: { expectedToken: acquired.token } }));
+    assert.equal(reclaim.code, 3, `${JSON.stringify(reclaim.result)} ${reclaim.stderr}`);
+    assert.equal(reclaim.result.code, "shelf-write-lease-uncertain");
 
     // The holder's lease file is byte-identical in identity: still the same PID.
     const lock = JSON.parse(await readFile(leaseFilePath(fixture), "utf8"));
