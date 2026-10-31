@@ -24,7 +24,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,6 +35,32 @@ const addonBinary = fileURLToPath(
   new URL("../native/shelf-mutex/build/Release/shelf_mutex.node", import.meta.url)
 );
 const format = await import("@maginalia/format");
+
+/**
+ * File symlinks need Developer Mode or SeCreateSymbolicLinkPrivilege on Windows. Probe
+ * once so the sentinel test is reported as skipped rather than silently passing.
+ */
+const symlinkSupport = await (async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "maginalia-native-symlink-probe-"));
+  try {
+    const target = path.join(directory, "target.txt");
+    await writeFile(target, "probe", "utf8");
+    await symlink(target, path.join(directory, "link.txt"));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+})();
+if (!symlinkSupport) {
+  console.warn(
+    "NOT VERIFIED: this Windows account cannot create file symlinks (EPERM); " +
+      "the real-process symlink-marker test is skipped. The junction case still runs."
+  );
+}
+
+const symlinkTest = symlinkSupport ? test : test.skip;
 
 function childEnvironment() {
   return { ...process.env, MAGINALIA_SHELF_MUTEX_PATH: addonBinary };
@@ -479,6 +505,54 @@ test("a malformed journal is refused even though the mutex was newly created", a
     assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 0);
     assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 0);
     assert.equal((await readdir(coordinationDirectory(fixture))).includes("writer-recovery.json"), true);
+  } finally {
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("a junction planted at the recovery marker is refused and its target is untouched", async () => {
+  const fixture = await createShelfFixture("native-marker-junction");
+  const externalDirectory = path.join(fixture.base, "external-target");
+  const marker = path.join(coordinationDirectory(fixture), "writer-recovery.json");
+  try {
+    await mkdir(externalDirectory, { recursive: true });
+    const sentinel = path.join(externalDirectory, "sentinel.txt");
+    await writeFile(sentinel, "SENTINEL\n", "utf8");
+    await mkdir(coordinationDirectory(fixture), { recursive: true });
+    // A junction needs no special privilege, so this case is testable everywhere.
+    await symlink(externalDirectory, marker, "junction");
+
+    const result = await runWorker(baseCommand(fixture), 120_000);
+    assert.equal(result.code, 3, `${JSON.stringify(result.result)} ${result.stderr}`);
+    assert.equal(result.result.code, "shelf-write-recovery-state-unavailable");
+    const pre = result.lines.find((line) => line.stage === "starting");
+    assert.equal(pre.recoveryState.error, "shelf-write-recovery-state-unavailable");
+
+    // Nothing was written, nothing was deleted, and the junction target is intact.
+    assert.equal(await readFile(sentinel, "utf8"), "SENTINEL\n");
+    assert.equal((await readdir(fixture.annotationsDirectory)).length, 0);
+    assert.equal((await readdir(fixture.booksDirectory)).length, 0);
+  } finally {
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+symlinkTest("a symlink planted at the recovery marker is refused without touching its sentinel", async () => {
+  const fixture = await createShelfFixture("native-marker-symlink");
+  const sentinel = path.join(fixture.base, "external-sentinel.txt");
+  const marker = path.join(coordinationDirectory(fixture), "writer-recovery.json");
+  try {
+    await writeFile(sentinel, "SENTINEL-DO-NOT-TOUCH\n", "utf8");
+    await mkdir(coordinationDirectory(fixture), { recursive: true });
+    await symlink(sentinel, marker);
+
+    const result = await runWorker(baseCommand(fixture), 120_000);
+    assert.equal(result.code, 3, `${JSON.stringify(result.result)} ${result.stderr}`);
+    assert.equal(result.result.code, "shelf-write-recovery-state-unavailable");
+
+    assert.equal(await readFile(sentinel, "utf8"), "SENTINEL-DO-NOT-TOUCH\n");
+    assert.equal((await readdir(fixture.annotationsDirectory)).length, 0);
+    assert.equal((await readdir(fixture.booksDirectory)).length, 0);
   } finally {
     await rm(fixture.base, { recursive: true, force: true });
   }

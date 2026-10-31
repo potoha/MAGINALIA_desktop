@@ -11,7 +11,7 @@
  * path.
  */
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, link, lstat, readFile, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
@@ -38,6 +38,35 @@ import {
   inspectShelfWriteJournal,
   type ShelfQuoteWriteRequest
 } from "./shelf-write-coordination.js";
+
+/**
+ * Windows only allows file symlinks with Developer Mode or
+ * SeCreateSymbolicLinkPrivilege. Probe once so the symlink-marker test can be reported
+ * as skipped instead of silently passing.
+ */
+async function probeLinkSupport(kind: "symlink" | "hardlink"): Promise<boolean> {
+  const directory = await mkdtemp(path.join(os.tmpdir(), `maginalia-link-probe-${kind}-`));
+  try {
+    const target = path.join(directory, "target.txt");
+    await writeFile(target, "probe", "utf8");
+    if (kind === "symlink") await symlink(target, path.join(directory, "link.txt"));
+    else await link(target, path.join(directory, "link.txt"));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+const symlinkSupport = await probeLinkSupport("symlink");
+const hardlinkSupport = await probeLinkSupport("hardlink");
+if (!symlinkSupport) {
+  console.warn(
+    "NOT VERIFIED: this Windows account cannot create file symlinks (EPERM); " +
+      "the symlink-marker refusal test is skipped. Junction and directory cases still run."
+  );
+}
 
 const available = nativeShelfMutexAvailable();
 const mutexSuite = available ? describe : describe.skip;
@@ -394,7 +423,10 @@ mutexSuite("persistent recovery state", () => {
     expect(receipt.state).toBe("committed");
     const state = await inspectShelfWriterRecoveryState(coordinationDirectory(fixture));
     expect(state.pending).toBe(false);
-    expect(await readdir(coordinationDirectory(fixture))).not.toContain(SHELF_WRITER_RECOVERY_STATE_FILENAME);
+    const names = await readdir(coordinationDirectory(fixture));
+    expect(names).not.toContain(SHELF_WRITER_RECOVERY_STATE_FILENAME);
+    // Published atomically: no temp file survives a completed marker lifecycle.
+    expect(names.filter((name) => name.startsWith(`.${SHELF_WRITER_RECOVERY_STATE_FILENAME}.`))).toEqual([]);
   });
 
   test("a pending record makes the next writer verify before writing", async () => {
@@ -474,6 +506,122 @@ mutexSuite("persistent recovery state", () => {
       coordinationRoot: fixture.coordinationRoot
     });
     expect(entries.map((entry) => entry.record.requestId)).toEqual([requestId]);
+  });
+});
+
+mutexSuite("recovery marker file safety", () => {
+  const symlinkTest = symlinkSupport ? test : test.skip;
+  const hardlinkTest = hardlinkSupport ? test : test.skip;
+  const junctionTest = process.platform === "win32" ? test : test.skip;
+
+  function coordinationDirectory(fixture: Awaited<ReturnType<typeof createFixture>>): string {
+    return path.join(fixture.coordinationRoot, "shelves", fixture.shelfId.toLowerCase());
+  }
+
+  function markerPath(fixture: Awaited<ReturnType<typeof createFixture>>): string {
+    return path.join(coordinationDirectory(fixture), SHELF_WRITER_RECOVERY_STATE_FILENAME);
+  }
+
+  symlinkTest("a symlink marker is refused and its external sentinel is untouched", async () => {
+    const fixture = await createFixture("marker-symlink");
+    const directory = coordinationDirectory(fixture);
+    await mkdir(directory, { recursive: true });
+    const sentinel = path.join(fixture.base, "external-sentinel.txt");
+    await writeFile(sentinel, "SENTINEL-DO-NOT-TOUCH\n", "utf8");
+    await symlink(sentinel, markerPath(fixture));
+
+    await expect(
+      writeShelfWriterRecoveryState({ coordinationDirectory: directory, requestId: "req-symlink" })
+    ).rejects.toMatchObject({ code: "shelf-write-recovery-state-unavailable" });
+    await expect(inspectShelfWriterRecoveryState(directory)).rejects.toMatchObject({
+      code: "shelf-write-recovery-state-unavailable"
+    });
+    // The whole write is refused, not just the marker update.
+    await expect(
+      commitShelfQuoteWithNativeLock(request(fixture), { acquireTimeoutMs: 2_000 })
+    ).rejects.toMatchObject({ code: "shelf-write-recovery-state-unavailable" });
+
+    // Neither truncation nor deletion reached the link target.
+    expect(await readFile(sentinel, "utf8")).toBe("SENTINEL-DO-NOT-TOUCH\n");
+    expect((await lstat(markerPath(fixture))).isSymbolicLink()).toBe(true);
+    expect(await readdir(fixture.annotationsDirectory)).toEqual([]);
+    expect(await readdir(fixture.booksDirectory)).toEqual([]);
+  });
+
+  junctionTest("a junction at the marker path is refused and its target is untouched", async () => {
+    const fixture = await createFixture("marker-junction");
+    const externalDirectory = path.join(fixture.base, "external-target");
+    await mkdir(externalDirectory, { recursive: true });
+    const sentinel = path.join(externalDirectory, "sentinel.txt");
+    await writeFile(sentinel, "SENTINEL\n", "utf8");
+    await mkdir(coordinationDirectory(fixture), { recursive: true });
+    await symlink(externalDirectory, markerPath(fixture), "junction");
+
+    await expect(
+      writeShelfWriterRecoveryState({
+        coordinationDirectory: coordinationDirectory(fixture),
+        requestId: "req-junction"
+      })
+    ).rejects.toMatchObject({ code: "shelf-write-recovery-state-unavailable" });
+    await expect(inspectShelfWriterRecoveryState(coordinationDirectory(fixture))).rejects.toMatchObject({
+      code: "shelf-write-recovery-state-unavailable"
+    });
+
+    expect(await readFile(sentinel, "utf8")).toBe("SENTINEL\n");
+    expect((await lstat(markerPath(fixture))).isSymbolicLink()).toBe(true);
+  });
+
+  test("a directory at the marker path is refused", async () => {
+    const fixture = await createFixture("marker-directory");
+    await mkdir(markerPath(fixture), { recursive: true });
+
+    await expect(
+      writeShelfWriterRecoveryState({
+        coordinationDirectory: coordinationDirectory(fixture),
+        requestId: "req-directory"
+      })
+    ).rejects.toMatchObject({ code: "shelf-write-recovery-state-unavailable" });
+    expect((await lstat(markerPath(fixture))).isDirectory()).toBe(true);
+  });
+
+  hardlinkTest("an existing regular marker is replaced without modifying a hardlinked sentinel", async () => {
+    const fixture = await createFixture("marker-hardlink");
+    await mkdir(coordinationDirectory(fixture), { recursive: true });
+    const sentinel = path.join(fixture.base, "hardlink-sentinel.txt");
+    await writeFile(sentinel, "SENTINEL\n", "utf8");
+    // The marker is a second name for the sentinel's inode. Truncating it in place would
+    // destroy the sentinel; replacing the directory entry must not.
+    await link(sentinel, markerPath(fixture));
+
+    await writeShelfWriterRecoveryState({
+      coordinationDirectory: coordinationDirectory(fixture),
+      requestId: "req-hardlink"
+    });
+
+    expect(await readFile(sentinel, "utf8")).toBe("SENTINEL\n");
+    const written = JSON.parse(await readFile(markerPath(fixture), "utf8"));
+    expect(written.state).toBe("write-in-progress");
+    expect(written.requestId).toBe("req-hardlink");
+  });
+
+  test("a half-written marker temp file never replaces the pending state", async () => {
+    const fixture = await createFixture("marker-interrupted-update");
+    const directory = coordinationDirectory(fixture);
+    await mkdir(directory, { recursive: true });
+    await writeShelfWriterRecoveryState({ coordinationDirectory: directory, requestId: "req-original" });
+
+    // Shape of a crash during a marker update: complete new bytes in a temp file, the
+    // final path untouched. Recovery must still point at the original pending request.
+    const leftover = path.join(directory, `.${SHELF_WRITER_RECOVERY_STATE_FILENAME}.9999-${randomUUID()}.tmp`);
+    await writeFile(
+      leftover,
+      `${JSON.stringify({ version: 1, state: "write-in-progress", pid: 9999, requestId: "req-new", startedAt: new Date().toISOString() })}\n`,
+      "utf8"
+    );
+
+    const state = await inspectShelfWriterRecoveryState(directory);
+    expect(state.pending).toBe(true);
+    expect(state.record?.requestId).toBe("req-original");
   });
 });
 

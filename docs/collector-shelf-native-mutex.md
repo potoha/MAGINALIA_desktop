@@ -171,6 +171,25 @@ The record is opened, written and `sync`ed before the first journal write. A tru
 unreadable record still counts as "pending": only the file being absent is treated as
 clean. Its metadata (pid, request id, timestamp) is diagnostic, never authoritative.
 
+The marker is also handled as a security boundary rather than an ordinary file:
+
+- it is **never opened through its final path**. A private temp file is created in the
+  same directory with `O_CREAT | O_EXCL` and published with `rename`, so a symlink or
+  hardlink planted at the marker path is replaced as a directory entry and its target is
+  never written through;
+- an existing marker must be a regular file and not a reparse point. A symlink, junction,
+  directory or device at that path fails closed (`shelf-write-recovery-state-unavailable`)
+  instead of being followed, before anything is created;
+- deletion checks the same way and uses `unlink`, which removes the entry itself and can
+  neither follow a link nor remove a directory;
+- the check is repeated immediately before the atomic replace. A directory or junction
+  swapped in during the window makes the rename fail; a link swapped in can at worst be
+  replaced, never written through;
+- a crash during an update leaves either the previous complete marker or the new complete
+  marker. The temp file is never read as evidence, so an interrupted update cannot
+  downgrade a pending write to "clean". A crash before the marker is published happens
+  before the first journal write, so treating it as clean is correct.
+
 `assessShelfWriteRecoveryState` is read-only and fails closed:
 
 1. re-resolve the Shelf layout — marker UUID, `library.json`, realpath containment,
@@ -263,7 +282,7 @@ All commands run on Windows 10.0.26300, Node v24.14.0, Electron 44.3.0, MSVC 14.
 | 14 | Installer packaging feasibility | `npm run spike:native-package` → `electron-builder --win dir --x64` places `resources/shelf-mutex/{shelf_mutex.node,shelf-native-mutex.js}`; addon loads in `ELECTRON_RUN_AS_NODE` and in the packaged Electron main process; the packaged wrapper resolves exactly one trusted candidate | **PASS** (dir package; full NSIS installer **NOT VERIFIED**, see §6) |
 | 15 | No dev toolchain on user PCs | N-API binary, `/MT` static CRT; `dumpbin /dependents` → `KERNEL32.dll`, `ADVAPI32.dll`, delay-load `node.exe` only | **PASS** |
 | 16 | Thread ownership contract | worker-thread test: another thread cannot acquire or release the main thread's lock (`mutex-not-owned`) | **PASS** |
-| 17 | Whole Desktop unit suite | 922 passed, 1 failed (`src/tutorial-sample.test.ts`, pre-existing and unrelated) | **PASS (no new failures)** |
+| 17 | Whole Desktop unit suite | 926 passed, 1 failed (`src/tutorial-sample.test.ts`, pre-existing and unrelated), 1 skipped (file-symlink marker test, see 27) | **PASS (no new failures)** |
 | 18 | Cross-session / `Global\` | creation succeeded here; standard-user privilege behavior unproven | **NOT VERIFIED** |
 | 19 | Second Windows user denied | only provable through the DACL test above; no second account available | **NOT VERIFIED** |
 | 20 | Real Chrome-terminated Native Host | Host `save` is out of scope and remains unsupported | **NOT VERIFIED** |
@@ -272,6 +291,10 @@ All commands run on Windows 10.0.26300, Node v24.14.0, Electron 44.3.0, MSVC 14.
 | 23 | Failed assessment, clean release, retry | assessment fails → natural exit really releases the mutex (probe acquires with `abandoned: false`) → a later process still refuses to write because the record persists | **PASS** |
 | 24 | Addon load policy | unit: packaged mode offers exactly one candidate and ignores env/cwd; containment rejects sibling and outside paths; development keeps the env override | **PASS** |
 | 25 | C++ N-API buffer contract | `GetString`/`GetUtf8` allocate `length + 1` and pass the real capacity to N-API, so the terminator N-API writes stays in bounds | **PASS** |
+| 26 | Marker update never writes through a link | hardlink at the marker path + `SENTINEL` file: write succeeds by replacing the directory entry, the sentinel keeps its bytes; no temp file remains after a completed write | **PASS** |
+| 27 | Symlink marker refused, sentinel untouched | marker symlinked to an external `SENTINEL` file → `shelf-write-recovery-state-unavailable`, sentinel bytes unchanged; unit and real-child-process variants | **NOT VERIFIED** — the verification account cannot create file symlinks (`EPERM`); both variants skip with a diagnostic instead of passing silently |
+| 28 | Junction / directory marker refused | junction to an external directory and a plain directory at the marker path → `shelf-write-recovery-state-unavailable`, target contents unchanged, nothing written (unit + real child process) | **PASS** |
+| 29 | Interrupted marker update | a complete new marker left only as a temp file does not replace the pending state: recovery still reports the original interrupted request | **PASS** |
 
 Reproduce:
 
@@ -283,11 +306,15 @@ npm run spike:native-package            # electron-builder dir package + two loa
 
 Test files:
 
-- `src/shelf-native-mutex.test.ts` — 24 unit tests (name derivation, in-process guard,
-  thread ownership, DACL, native-lock commit, recovery-state record, loader policy).
+- `src/shelf-native-mutex.test.ts` — 29 unit tests, 28 executed and 1 skipped when the
+  account cannot create file symlinks (name derivation, in-process guard, thread
+  ownership, DACL, native-lock commit, recovery-state record, recovery marker file
+  safety, loader policy).
 - `test/collector-shelf-native-lock.test.mjs` + `test/collector-shelf-native-worker.mjs`
-  — 13 real-child-process tests, including Desktop-absent/Host-only exit, a brand-new
-  mutex over a malformed journal, and a failed assessment followed by a clean release.
+  — 15 real-child-process tests, 14 executed and 1 skipped for the same symlink reason,
+  including Desktop-absent/Host-only exit, a brand-new mutex over a malformed journal,
+  a failed assessment followed by a clean release, and junction/symlink markers planted
+  before the child starts.
 - `test/electron-native-lock-smoke.test.mjs` + `test/electron-native-lock-main.cjs`
   — real Electron main process.
 
@@ -368,6 +395,7 @@ an installer would ship; the full installer itself is **NOT VERIFIED**.
 | `process.exit` while owning the lock | Node skips environment teardown, so the addon finalizer does not run and the mutex stays abandoned (or is destroyed with the process) until the next acquire. Harmless: acquisition succeeds immediately and the recovery record, not the mutex state, decides whether the journal is verified. |
 | Recovery record deleted by hand | the audit trail for "a write was in flight" is a file like any other. If a user deletes the coordination directory, recovery falls back to request-ID idempotency: the interrupted request is still completed or refused by its own journal, never by a guess. |
 | Recovery record present but stale | the record is only removed after a committed receipt, and a later successful write overwrites it before its own critical section. A stale record costs one journal scan and never permits an unverified write. |
+| Marker file replaced by a link | the marker is published with a temp-file + `rename` and every create/update/delete is preceded by an `lstat` regular-file check, so a symlink, junction, hardlink or directory at that path fails closed instead of being written through. The file-symlink variant is **NOT VERIFIED** here: this Windows account cannot create file symlinks (`EPERM`), so that test skips with a diagnostic while the junction, directory and hardlink variants run. |
 | Addon supply chain | a prebuilt `.node` is native code; CI provenance and signing belong to the packaging decision, not to this spike. In packaged mode the loader trusts exactly one path inside `resources`, but the integrity of that file is the packaging pipeline's responsibility. |
 | Debugger/suspend | a suspended holder keeps the lock; the poll timeout reports `shelf-write-busy` rather than stealing it. |
 
@@ -441,6 +469,10 @@ Invariants:
   fails closed rather than resuming when the state is unprovable; a failed assessment
   leaves the record in place, keeps the mutex held, and never repairs or deletes a
   journal record, Book or Annotation;
+- the recovery record is a security boundary: it is published atomically from a private
+  temp file and never opened through its final path, and a symlink, junction, hardlink or
+  any other non-regular entry at that path fails the write closed instead of being
+  followed, so marker maintenance can never affect an external file;
 - packaged builds load the addon only from `<resources>/shelf-mutex/shelf_mutex.node`;
   environment variables, the working directory and `__dirname` are development/test
   inputs and must never select native code in an installed application;

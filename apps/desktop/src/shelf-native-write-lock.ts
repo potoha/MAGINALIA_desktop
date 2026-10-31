@@ -40,10 +40,25 @@
  * and makes the "restart required" state explicit. Files are never mutated, repaired,
  * or deleted by any of this.
  *
+ * The marker file is treated as a security boundary, not as an ordinary file:
+ *
+ * - the final path is never opened for writing. A private temp file is created in the
+ *   same directory with `O_CREAT | O_EXCL` and published with `rename`, so a symlink or
+ *   hardlink planted at the marker path is replaced as a *directory entry* and its
+ *   target is never written through;
+ * - an existing marker must be a regular file and not a reparse point. A symlink,
+ *   junction, directory or device at that path is refused instead of followed;
+ * - deletion uses `unlink` after the same check, so it never removes a link target;
+ * - a crash during a marker update can only leave the previous complete marker or the
+ *   new complete marker; the temp file is never mistaken for evidence. A crash before
+ *   the marker is published happens before the first journal write, so treating it as
+ *   clean is correct.
+ *
  * Nothing here is imported by the product write path or by the Native Messaging Host.
  * Journal and Shelf record formats are unchanged.
  */
-import { open, readFile, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { lstat, open, readFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import {
   ShelfWriteCoordinationError,
@@ -91,18 +106,59 @@ function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function recoveryStateUnavailable(message: string, detail: string): ShelfWriteCoordinationError {
+  return new ShelfWriteCoordinationError("shelf-write-recovery-state-unavailable", message, detail);
+}
+
+interface MarkerPathInspection {
+  readonly kind: "absent" | "regular";
+}
+
 /**
- * Read the persistent recovery state. Any failure other than "file does not exist"
- * counts as pending: an unreadable record must never be read as "last write was fine".
+ * Classify the marker path **without following it**.
+ *
+ * `lstat` reports the directory entry itself, so a symlink or junction is visible as
+ * such. Only a missing path or a regular file is acceptable; everything else is refused
+ * before any read, replace or delete can touch a link target.
+ */
+async function inspectMarkerPath(file: string): Promise<MarkerPathInspection> {
+  let info;
+  try {
+    info = await lstat(file);
+  } catch (error: unknown) {
+    if (isMissing(error)) return Object.freeze({ kind: "absent" as const });
+    throw recoveryStateUnavailable(
+      "The Shelf write recovery state path cannot be inspected.",
+      describe(error)
+    );
+  }
+  if (!info.isFile() || info.isSymbolicLink()) {
+    throw recoveryStateUnavailable(
+      "The Shelf write recovery state is not a regular file; refusing to read, replace or delete it.",
+      file
+    );
+  }
+  return Object.freeze({ kind: "regular" as const });
+}
+
+/**
+ * Read the persistent recovery state.
+ *
+ * Any failure other than "file does not exist" counts as pending: an unreadable record
+ * must never be read as "last write was fine". A non-regular entry at the marker path
+ * fails closed instead of being followed.
  */
 export async function inspectShelfWriterRecoveryState(
   coordinationDirectory: string
 ): Promise<InspectedShelfWriterRecoveryState> {
   const file = path.join(coordinationDirectory, SHELF_WRITER_RECOVERY_STATE_FILENAME);
+  const entry = await inspectMarkerPath(file);
+  if (entry.kind === "absent") return Object.freeze({ path: file, pending: false });
   let text: string;
   try {
     text = await readFile(file, "utf8");
   } catch (error: unknown) {
+    // Removed between the check and the read: still "no evidence", like the check.
     if (isMissing(error)) return Object.freeze({ path: file, pending: false });
     return Object.freeze({ path: file, pending: true });
   }
@@ -130,12 +186,19 @@ export async function inspectShelfWriterRecoveryState(
  *
  * The record is synced before the critical section begins, so a crash anywhere after
  * this point leaves evidence behind even when the mutex object itself is destroyed.
+ *
+ * The marker is never written through its final path. A private temp file is created
+ * with `O_EXCL` (so it cannot follow a pre-planted link) and published with `rename`,
+ * which replaces the directory entry only. A crash therefore leaves either the previous
+ * complete marker, the new complete marker, or — when the marker did not exist yet — no
+ * marker at all, which is correct because the journal write has not started.
  */
 export async function writeShelfWriterRecoveryState(options: {
   readonly coordinationDirectory: string;
   readonly requestId: string;
 }): Promise<string> {
-  const file = path.join(options.coordinationDirectory, SHELF_WRITER_RECOVERY_STATE_FILENAME);
+  const directory = options.coordinationDirectory;
+  const file = path.join(directory, SHELF_WRITER_RECOVERY_STATE_FILENAME);
   const record: ShelfWriterRecoveryState = Object.freeze({
     version: 1,
     state: "write-in-progress",
@@ -143,34 +206,54 @@ export async function writeShelfWriterRecoveryState(options: {
     requestId: options.requestId,
     startedAt: new Date().toISOString()
   });
-  let handle;
+  // Refuse a planted link, junction or directory before creating anything.
+  await inspectMarkerPath(file);
+
+  const temporary = path.join(
+    directory,
+    `.${SHELF_WRITER_RECOVERY_STATE_FILENAME}.${process.pid}.${randomUUID()}.tmp`
+  );
   try {
-    handle = await open(file, "w");
+    const handle = await open(temporary, "wx", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    // Re-check immediately before the atomic replace: an entry that appeared in the
+    // meantime must not be replaced silently.
+    await inspectMarkerPath(file);
+    await rename(temporary, file);
   } catch (error: unknown) {
-    throw new ShelfWriteCoordinationError(
-      "shelf-write-recovery-state-unavailable",
+    await unlink(temporary).catch(() => {});
+    if (error instanceof ShelfWriteCoordinationError) throw error;
+    throw recoveryStateUnavailable(
       "The Shelf write recovery state could not be recorded.",
       describe(error)
     );
-  }
-  try {
-    await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, "utf8");
-    await handle.sync();
-  } catch (error: unknown) {
-    throw new ShelfWriteCoordinationError(
-      "shelf-write-recovery-state-unavailable",
-      "The Shelf write recovery state could not be recorded.",
-      describe(error)
-    );
-  } finally {
-    await handle.close();
   }
   return file;
 }
 
-/** Remove the recovery record after a completed write, and only then. */
+/**
+ * Remove the recovery record after a completed write, and only then.
+ *
+ * `unlink` removes the directory entry itself; combined with the regular-file check it
+ * cannot delete a link target or a directory.
+ */
 export async function clearShelfWriterRecoveryState(file: string): Promise<void> {
-  await rm(file, { force: true });
+  const entry = await inspectMarkerPath(file);
+  if (entry.kind === "absent") return;
+  try {
+    await unlink(file);
+  } catch (error: unknown) {
+    if (isMissing(error)) return;
+    throw recoveryStateUnavailable(
+      "The Shelf write recovery state could not be removed.",
+      describe(error)
+    );
+  }
 }
 
 export interface ShelfWriteRecoveryAssessment {
