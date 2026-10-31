@@ -12,6 +12,7 @@
  *   crashAfterBook     exit between the Book publish and the Annotation publish
  *   swapAnnotationsTo  replace the Annotation directory with a junction mid-write
  *   holdLeaseMs        acquire the write lease, hold it, then assert it was kept
+ *   reclaim            explicit recovery of a lease left by a dead holder
  */
 import { createRequire } from "node:module";
 import { readFile, rename, symlink } from "node:fs/promises";
@@ -41,8 +42,31 @@ function emit(value) {
 
 function reportFailure(error) {
   const code = error && typeof error === "object" && typeof error.code === "string" ? error.code : "unknown";
-  emit({ ok: false, code, message: String(error && error.message ? error.message : error) });
+  emit({
+    ok: false,
+    code,
+    message: String(error && error.message ? error.message : error),
+    // Recovery context (lease token / holder) is coordination metadata, so a test
+    // or recovery UI can name the exact stuck lock without reading internal files.
+    ...(error && typeof error === "object" && error.context ? { context: error.context } : {})
+  });
   process.exit(code.startsWith("shelf-write-") ? 3 : 1);
+}
+
+if (command.reclaim !== undefined) {
+  // Explicit recovery only. Nothing in the commit path reclaims a lease, so this
+  // is the operator/procedure step that follows `shelf-write-lease-stale`.
+  try {
+    const result = await coordination.reclaimStaleShelfWriteLease({
+      coordinationRoot: command.coordinationRoot,
+      shelfId: command.expectedShelfId,
+      expectedToken: command.reclaim.expectedToken
+    });
+    emit({ ok: true, reclaimed: result.reclaimed, holder: result.holder });
+  } catch (error) {
+    reportFailure(error);
+  }
+  process.exit(0);
 }
 
 if (typeof command.holdLeaseMs === "number") {
@@ -56,7 +80,7 @@ if (typeof command.holdLeaseMs === "number") {
       ...(command.leaseTtlMs === undefined ? {} : { leaseTtlMs: command.leaseTtlMs }),
       ...(command.acquireTimeoutMs === undefined ? {} : { acquireTimeoutMs: command.acquireTimeoutMs })
     });
-    emit({ ok: true, acquired: true, pid: process.pid });
+    emit({ ok: true, acquired: true, pid: process.pid, token: lease.token });
     await new Promise((resolve) => { setTimeout(resolve, command.holdLeaseMs); });
     let assertedHeld = true;
     try {

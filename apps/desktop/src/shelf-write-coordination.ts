@@ -19,6 +19,27 @@
  *   rolled back;
  * - a durable per-request journal provides the idempotency key and the receipt.
  *
+ * Lease invariant (one model for acquire / hold / release / recover):
+ *
+ * - acquisition is a single `wx` create, so it is atomic and a lease is never
+ *   "upgraded" or overwritten;
+ * - **nothing on the write path removes or renames a lock file it did not create**.
+ *   A lock that is not ours is observed and reported, never touched. This makes
+ *   "a live holder is never displaced, not even briefly" a structural property of
+ *   the code rather than a timing argument;
+ * - a dead holder's lock is removed only by `reclaimStaleShelfWriteLease`, an
+ *   explicit recovery call that requires the caller to name the exact lock token,
+ *   re-proves the holder is dead, and restores byte-identically anything it moved
+ *   by mistake;
+ * - release retires the caller's own lock by moving it to a private name first, so
+ *   the delete decision is made on a file nobody else can have replaced.
+ *
+ * Node exposes no portable "delete/rename only if the file is still <this file>"
+ * primitive, so an automatic takeover would carry an unavoidable check-then-act
+ * window. Automatic reclamation is therefore deliberately absent; see
+ * `docs/collector-shelf-writer-coordination.md` for the comparison, the recovery
+ * procedure, and the decision the Product Owner still has to make.
+ *
  * Nothing here is imported by the Desktop write path or by the experimental host.
  * Enabling either is a separate owner decision (see
  * `docs/collector-shelf-writer-coordination.md`, open decisions).
@@ -55,15 +76,18 @@ function loadFormatCore(): Promise<FormatCore> {
 export const SHELF_WRITE_LEASE_VERSION = 1 as const;
 export const SHELF_WRITE_JOURNAL_VERSION = 1 as const;
 /**
- * Heartbeat age after which a *live* holder's lease is considered uncertain.
+ * Heartbeat age after which a *live* holder's lease is considered suspicious.
  *
- * This is deliberately NOT a theft threshold: a live PID with an expired
- * heartbeat fails closed with `shelf-write-lease-uncertain` instead of losing its
- * lease. Only a provably dead PID justifies reclamation.
+ * This is deliberately NOT a theft threshold. Nothing in this module removes a
+ * lease it did not create: a live holder keeps its lease regardless of heartbeat
+ * age, and a dead holder's lease is only removed by the explicit recovery call
+ * `reclaimStaleShelfWriteLease` (see the module header).
  */
 export const SHELF_WRITE_LEASE_TTL_MS = 120_000;
 export const SHELF_WRITE_ACQUIRE_TIMEOUT_MS = 15_000;
 export const SHELF_WRITE_POLL_INTERVAL_MS = 40;
+/** Minimum length of a lease token, for validating caller-supplied recovery input. */
+export const SHELF_WRITE_TOKEN_MIN_LENGTH = 16;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/u;
@@ -81,6 +105,7 @@ export type ShelfWriteCoordinationErrorCode =
   | "shelf-write-layout-invalid"
   | "shelf-write-busy"
   | "shelf-write-lease-lost"
+  | "shelf-write-lease-stale"
   | "shelf-write-lease-uncertain"
   | "shelf-write-journal-unavailable"
   | "shelf-write-journal-invalid"
@@ -93,15 +118,26 @@ export class ShelfWriteCoordinationError extends Error {
   public constructor(
     public readonly code: ShelfWriteCoordinationErrorCode,
     message: string,
-    public readonly detail?: string
+    public readonly detail?: string,
+    /**
+     * Machine-readable recovery context, currently the observed lease holder for
+     * `shelf-write-lease-stale` / `-uncertain`. Contains coordination metadata only
+     * (token, PID, label, timestamps), never user content.
+     */
+    public readonly context?: Readonly<Record<string, unknown>>
   ) {
     super(message);
     this.name = "ShelfWriteCoordinationError";
   }
 }
 
-function fail(code: ShelfWriteCoordinationErrorCode, message: string, detail?: string): never {
-  throw new ShelfWriteCoordinationError(code, message, detail);
+function fail(
+  code: ShelfWriteCoordinationErrorCode,
+  message: string,
+  detail?: string,
+  context?: Readonly<Record<string, unknown>>
+): never {
+  throw new ShelfWriteCoordinationError(code, message, detail, context);
 }
 
 function isExists(error: unknown): boolean {
@@ -349,10 +385,15 @@ export interface AcquireShelfWriteLeaseOptions {
   /** Injectable clock; milliseconds since epoch. Required for staleness tests. */
   readonly now?: () => number;
   /**
-   * Test seam: runs between the verified observation of a dead holder's lock and
-   * the atomic reap rename, so race behaviour can be reproduced deterministically.
+   * Test seam for the release path only: runs after the caller's lock has been
+   * moved to a private name and before its token is verified, so a concurrent
+   * replacement can be simulated deterministically.
    */
-  readonly onBeforeReapRename?: () => void | Promise<void>;
+  readonly releaseFaults?: ShelfWriteLeaseReleaseFaults;
+}
+
+export interface ShelfWriteLeaseReleaseFaults {
+  readonly beforeRetireVerify?: () => void | Promise<void>;
 }
 
 export interface ShelfWriteLease {
@@ -361,6 +402,15 @@ export interface ShelfWriteLease {
   readonly lockPath: string;
   release(): Promise<void>;
   assertHeld(): Promise<void>;
+}
+
+/** Public view of the process that holds (or held) a lease. */
+export interface ShelfWriteLeaseHolder {
+  readonly token: string;
+  readonly pid: number;
+  readonly processLabel: string;
+  readonly acquiredAt: string;
+  readonly heartbeatAt: number;
 }
 
 function processIsAlive(pid: number): boolean {
@@ -449,120 +499,176 @@ async function leaseFileExists(lockPath: string): Promise<boolean> {
   }
 }
 
-type ReapOutcome = "reaped" | "changed" | "uncertain";
+function leaseHolderContext(observed: ObservedLease): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    token: observed.metadata.token,
+    pid: observed.metadata.pid,
+    processLabel: observed.metadata.processLabel,
+    acquiredAt: observed.metadata.acquiredAt,
+    heartbeatAt: observed.metadata.heartbeatAt
+  });
+}
+
+type RetireOutcome = "retired" | "not-ours" | "uncertain";
 
 /**
- * Reclaim a lock whose owner is provably dead, without stealing a live writer's
- * lease.
+ * Remove a lock file that this caller owns, without a check-then-act window.
  *
- * The reap is a verified swap, never a bare delete:
+ * The file is renamed to a private name *first*; only then is it read and its
+ * token compared. The delete decision is therefore made on a file no other
+ * process can have replaced, and nothing is unlinked before ownership is proven.
  *
- * 1. the observable file is pinned with a hard link, and the pin's `{dev, ino}` is
- *    compared with the observation, so a lock that was already replaced cannot be
- *    touched;
- * 2. only then is the lock atomically renamed into quarantine;
- * 3. the quarantined file's bytes and `{dev, ino}` are compared with the
- *    observation again; a mismatch means a competitor replaced the lock in the
- *    window, so the quarantined file is restored atomically with `link()` and the
- *    caller retries (`changed`);
- * 4. if restoration is impossible (a third writer already created a lock, or the
- *    filesystem cannot link) the outcome is `uncertain` and the caller fails
- *    closed — no writer may proceed on an unproven lease state.
- *
- * The single residual window is between the final identity check and the rename
- * syscall; a stolen lease is always detected by `assertHeld()` before any record
- * is published, so a mis-taken lease cannot produce a duplicate write.
+ * If the moved file turns out to belong to someone else (only reachable when a
+ * lease was removed out of band), it is restored with a hard link so the actual
+ * holder keeps its lease with identical bytes and identity. If restoration is
+ * impossible, the outcome is `uncertain` and the caller fails closed.
  */
-async function reapObservedDeadLease(
+async function retireOwnLock(
   lockPath: string,
-  observed: ObservedLease,
-  onBeforeReapRename?: () => void | Promise<void>
-): Promise<ReapOutcome> {
-  const pinPath = `${lockPath}.${randomUUID()}.pin`;
+  expectedToken: string,
+  beforeVerify?: () => void | Promise<void>
+): Promise<RetireOutcome> {
+  const retiredPath = `${lockPath}.${randomUUID()}.retire`;
   try {
-    await link(lockPath, pinPath);
+    await rename(lockPath, retiredPath);
+  } catch (error: unknown) {
+    // Nothing to retire: already released, or a concurrent release won the rename.
+    return isMissing(error) ? "not-ours" : "uncertain";
+  }
+
+  await beforeVerify?.();
+
+  const moved = await readLeaseMetadata(retiredPath);
+  if (moved !== undefined && moved.token === expectedToken) {
+    try { await unlink(retiredPath); } catch { /* Leftover debris only. */ }
+    return "retired";
+  }
+
+  // We moved a file that is not ours. Put it back byte-identically.
+  try {
+    await link(retiredPath, lockPath);
   } catch {
-    // Hard links are unavailable (some network filesystems) or the lock vanished.
+    // A third writer already re-created a lock, or the filesystem cannot link:
+    // ownership can no longer be restored, so this is not provable.
     return "uncertain";
   }
+  try { await unlink(retiredPath); } catch { /* Best effort. */ }
+  return "not-ours";
+}
 
-  let pinned: { readonly text: string; readonly dev: number; readonly ino: number } | undefined;
+export interface ReclaimShelfWriteLeaseOptions {
+  readonly coordinationRoot: string;
+  readonly shelfId: string;
+  /**
+   * The exact lock token the caller observed. Recovery is refused when the lock
+   * on disk is a different one, so an operator cannot remove a newer holder.
+   */
+  readonly expectedToken: string;
+  /**
+   * Test seam: runs after the dead holder and token were verified and before the
+   * atomic retire rename, so a concurrent acquisition can be reproduced.
+   */
+  readonly onBeforeRetireRename?: () => void | Promise<void>;
+}
+
+export interface ReclaimShelfWriteLeaseResult {
+  readonly reclaimed: boolean;
+  readonly holder?: ShelfWriteLeaseHolder;
+}
+
+/**
+ * Explicit recovery for a lease whose holder crashed.
+ *
+ * This is the **only** place that removes a lock this process did not create, and
+ * it is never called from the write path or from a retry loop. It is safe to call
+ * while another writer is trying to acquire:
+ *
+ * - the lock must still be the token the caller observed, so a lock that was
+ *   already reclaimed and re-acquired is not removed;
+ * - the holder's PID must be provably dead — a live holder is never displaced;
+ * - the removal itself is `retireOwnLock`, which proves ownership after the move
+ *   and restores anything it moved by mistake;
+ * - every unprovable state fails closed with `shelf-write-lease-uncertain`.
+ *
+ * The residual window is the single `rename()` syscall after the checks; a lock
+ * moved by mistake in that window is restored in place, and the affected holder
+ * still detects any real loss through `assertHeld()` before publishing.
+ */
+export async function reclaimStaleShelfWriteLease(
+  options: ReclaimShelfWriteLeaseOptions
+): Promise<ReclaimShelfWriteLeaseResult> {
+  const shelfId = options.shelfId;
+  if (typeof shelfId !== "string" || !UUID_PATTERN.test(shelfId)) {
+    fail("shelf-write-invalid-request", "The Shelf identity is not a UUID.");
+  }
+  if (typeof options.expectedToken !== "string" || options.expectedToken.length < SHELF_WRITE_TOKEN_MIN_LENGTH) {
+    fail("shelf-write-invalid-request", "The expected lease token is required.");
+  }
+
+  let directory: string;
   try {
-    const info = await lstat(pinPath);
-    const text = await readFile(pinPath, "utf8");
-    pinned = { text, dev: info.dev, ino: info.ino };
+    directory = await realpath(path.join(options.coordinationRoot, "shelves", shelfId.toLowerCase()));
   } catch {
-    pinned = undefined;
+    // No coordination directory means no lease was ever taken.
+    return Object.freeze({ reclaimed: false });
   }
-  if (pinned === undefined || pinned.text !== observed.text
-    || pinned.dev !== observed.dev || pinned.ino !== observed.ino) {
-    // The name no longer points at the observed dead holder's lock. Nothing is
-    // removed: a newer holder owns the lease now.
-    try { await unlink(pinPath); } catch { /* Best effort. */ }
-    return "changed";
-  }
+  const lockPath = path.join(directory, "writer.lock");
 
-  await onBeforeReapRename?.();
-
-  // Re-read the name immediately before the rename. The confirmed pin proves what
-  // the observation referred to; this second observation is what decides whether the
-  // name still refers to that same file. A lock created by another writer in the
-  // window is therefore never renamed away.
-  const current = await readObservedLease(lockPath);
-  if (current === undefined || current.text !== observed.text
-    || current.dev !== observed.dev || current.ino !== observed.ino) {
-    try { await unlink(pinPath); } catch { /* Best effort. */ }
-    return "changed";
-  }
-
-  const quarantine = `${lockPath}.${randomUUID()}.reap`;
-  try {
-    await rename(lockPath, quarantine);
-  } catch (error: unknown) {
-    try { await unlink(pinPath); } catch { /* Best effort. */ }
-    return isMissing(error) ? "changed" : "uncertain";
-  }
-  try { await unlink(pinPath); } catch { /* Best effort. */ }
-
-  let moved: { readonly text: string; readonly dev: number; readonly ino: number } | undefined;
-  try {
-    const info = await lstat(quarantine);
-    const text = await readFile(quarantine, "utf8");
-    moved = { text, dev: info.dev, ino: info.ino };
-  } catch {
-    moved = undefined;
-  }
-
-  if (moved !== undefined && moved.text === observed.text
-    && moved.dev === observed.dev && moved.ino === observed.ino) {
-    // The dead holder's own lock file was removed. Confirmed reclamation.
-    try { await unlink(quarantine); } catch { /* Best effort. */ }
-    return "reaped";
-  }
-
-  // A different file was moved. Put it back atomically; if that is impossible the
-  // lease state is unprovable and the caller must stop.
-  try {
-    await link(quarantine, lockPath);
-  } catch (error: unknown) {
-    if (isExists(error)) {
-      // Another writer holds a fresh lock; the quarantined file cannot be restored
-      // without overwriting it. Leave the quarantine in place as evidence.
-      return "uncertain";
+  const observed = await readObservedLease(lockPath);
+  if (observed === undefined) {
+    if (await leaseFileExists(lockPath)) {
+      fail("shelf-write-lease-uncertain", "The Shelf write lease file is unreadable or malformed.");
     }
-    return "uncertain";
+    return Object.freeze({ reclaimed: false });
   }
-  try { await unlink(quarantine); } catch { /* Best effort. */ }
-  return "changed";
+  if (observed.metadata.token !== options.expectedToken) {
+    fail(
+      "shelf-write-lease-uncertain",
+      "The Shelf write lease is not the one that was observed for recovery.",
+      observed.metadata.processLabel,
+      leaseHolderContext(observed)
+    );
+  }
+  if (processIsAlive(observed.metadata.pid)) {
+    fail(
+      "shelf-write-lease-uncertain",
+      "The Shelf write lease holder is still alive; a live holder is never displaced.",
+      observed.metadata.processLabel,
+      leaseHolderContext(observed)
+    );
+  }
+
+  await options.onBeforeRetireRename?.();
+
+  const outcome = await retireOwnLock(lockPath, options.expectedToken);
+  if (outcome !== "retired") {
+    fail(
+      "shelf-write-lease-uncertain",
+      "The stale Shelf write lease changed while it was being reclaimed; nothing was removed.",
+      observed.metadata.processLabel,
+      leaseHolderContext(observed)
+    );
+  }
+  return Object.freeze({
+    reclaimed: true,
+    holder: Object.freeze({
+      token: observed.metadata.token,
+      pid: observed.metadata.pid,
+      processLabel: observed.metadata.processLabel,
+      acquiredAt: observed.metadata.acquiredAt,
+      heartbeatAt: observed.metadata.heartbeatAt
+    })
+  });
 }
 
 /**
  * Acquire the Shelf-scoped cross-process write lease.
  *
  * The lease is a `wx`-created file, so creation itself is the atomic
- * compare-and-set. A crashed holder is evicted only when its PID is provably dead;
- * an expired heartbeat alone never removes a lease, because a slow but healthy
- * writer must not lose its exclusivity.
+ * compare-and-set. Nothing in this function renames or deletes a lock it did not
+ * create: a live holder keeps its lease regardless of heartbeat age, and a dead
+ * holder's lease is reported as `shelf-write-lease-stale` for explicit recovery
+ * instead of being taken over. An unreadable lock is never deleted.
  */
 export async function acquireShelfWriteLease(options: AcquireShelfWriteLeaseOptions): Promise<ShelfWriteLease> {
   const shelfId = options.shelfId;
@@ -608,9 +714,7 @@ export async function acquireShelfWriteLease(options: AcquireShelfWriteLeaseOpti
         token,
         lockPath,
         async release(): Promise<void> {
-          const current = await readLeaseMetadata(lockPath);
-          if (current === undefined || current.token !== token) return;
-          try { await unlink(lockPath); } catch { /* A newer holder already replaced it. */ }
+          await retireOwnLock(lockPath, token, options.releaseFaults?.beforeRetireVerify);
         },
         async assertHeld(): Promise<void> {
           const current = await readLeaseMetadata(lockPath);
@@ -626,21 +730,16 @@ export async function acquireShelfWriteLease(options: AcquireShelfWriteLeaseOpti
     const observed = await readObservedLease(lockPath);
     const lockPresent = observed !== undefined || await leaseFileExists(lockPath);
     if (observed !== undefined) {
-      const alive = processIsAlive(observed.metadata.pid);
-      if (!alive) {
-        const outcome = await reapObservedDeadLease(lockPath, observed, options.onBeforeReapRename);
-        if (outcome === "reaped") continue;
-        if (outcome === "changed") {
-          // Another writer is actively replacing the lock. Keep polling, but never
-          // spin past the acquire window without reporting a bounded outcome.
-          if (now() >= deadline) {
-            fail("shelf-write-busy", "Another process holds the Shelf write lease.");
-          }
-          await delay(backoff);
-          backoff = Math.min(backoff * 2, 250);
-          continue;
-        }
-        fail("shelf-write-lease-uncertain", "A stale Shelf write lease could not be reclaimed safely.");
+      if (!processIsAlive(observed.metadata.pid)) {
+        // Provably crashed holder. Automatic takeover is deliberately not
+        // implemented (it cannot be made race-free with portable Node APIs), so the
+        // lease is reported as recoverable rather than stolen.
+        fail(
+          "shelf-write-lease-stale",
+          "A previous writer crashed while holding the Shelf write lease; explicit recovery is required.",
+          observed.metadata.processLabel,
+          leaseHolderContext(observed)
+        );
       }
       // A live holder keeps its lease regardless of heartbeat age. An old heartbeat
       // means we cannot prove the holder is healthy, so we must not take the lease.
@@ -648,7 +747,8 @@ export async function acquireShelfWriteLease(options: AcquireShelfWriteLeaseOpti
         fail(
           "shelf-write-lease-uncertain",
           "A live writer holds the Shelf write lease but its heartbeat is stale.",
-          observed.metadata.processLabel
+          observed.metadata.processLabel,
+          leaseHolderContext(observed)
         );
       }
     }
