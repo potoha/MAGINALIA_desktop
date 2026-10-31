@@ -87,7 +87,8 @@ export type ShelfWriteCoordinationErrorCode =
   | "shelf-write-request-mismatch"
   | "shelf-write-book-conflict"
   | "shelf-write-record-conflict"
-  | "shelf-write-receipt-missing";
+  | "shelf-write-receipt-missing"
+  | "shelf-write-recovery-state-unavailable";
 
 export class ShelfWriteCoordinationError extends Error {
   public constructor(

@@ -66,16 +66,18 @@ void ThrowWin32(napi_env env, const char* context, DWORD code) {
 bool GetString(napi_env env, napi_value value, std::wstring* out) {
   size_t length = 0;
   if (napi_get_value_string_utf16(env, value, nullptr, 0, &length) != napi_ok) return false;
+  // N-API writes the terminating NUL inside the buffer whose capacity it is given,
+  // so the capacity must be `length + 1` while the usable content stays `length`.
+  // Allocating exactly `length` here would let N-API write one element past the end.
+  std::u16string text(length + 1, u'\0');
+  size_t copied = 0;
+  if (napi_get_value_string_utf16(env, value, text.data(), text.size(), &copied) != napi_ok) {
+    return false;
+  }
+  // `copied` is the number of characters written without the terminator.
+  text.resize(copied);
   // N-API returns UTF-16 as char16_t; Windows APIs expect wchar_t. Both are 16-bit
   // on Windows, so a value copy is safe and keeps the code portable to the header.
-  std::u16string text(length, u'\0');
-  if (length != 0) {
-    size_t copied = 0;
-    if (napi_get_value_string_utf16(env, value, text.data(), length + 1, &copied) != napi_ok) {
-      return false;
-    }
-    text.resize(copied);
-  }
   out->assign(text.begin(), text.end());
   return true;
 }
@@ -83,10 +85,14 @@ bool GetString(napi_env env, napi_value value, std::wstring* out) {
 bool GetUtf8(napi_env env, napi_value value, std::string* out) {
   size_t length = 0;
   if (napi_get_value_string_utf8(env, value, nullptr, 0, &length) != napi_ok) return false;
-  out->resize(length);
-  if (length == 0) return true;
+  // Same rule as GetString: capacity `length + 1` for the terminator, content `length`.
+  out->assign(length + 1, '\0');
   size_t copied = 0;
-  return napi_get_value_string_utf8(env, value, out->data(), length + 1, &copied) == napi_ok;
+  if (napi_get_value_string_utf8(env, value, out->data(), out->size(), &copied) != napi_ok) {
+    return false;
+  }
+  out->resize(copied);
+  return true;
 }
 
 bool GetInt32(napi_env env, napi_value value, int32_t* out) {

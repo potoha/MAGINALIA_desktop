@@ -46,6 +46,7 @@ test("Electron loads the mutex addon and excludes a separate process", async () 
       env: electronEnvironment({
         MAGINALIA_SHELF_MUTEX_PATH: addonBinary,
         MAGINALIA_NATIVE_WORKER: workerScript,
+        MAGINALIA_NATIVE_NODE: process.execPath,
         MAGINALIA_NATIVE_SHELF_ID: randomUUID(),
         MAGINALIA_NATIVE_RESULT: resultFile
       })

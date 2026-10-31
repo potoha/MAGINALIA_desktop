@@ -31,6 +31,7 @@ const desktopRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const require = createRequire(path.join(desktopRoot, "package.json"));
 
 const addonBinary = path.join(desktopRoot, "native", "shelf-mutex", "build", "Release", "shelf_mutex.node");
+const wrapperModule = path.join(desktopRoot, "dist", "main", "shelf-native-mutex.js");
 const outputDirectory = path.join(desktopRoot, "release", "native-mutex-spike");
 const unpackedDirectory = path.join(outputDirectory, "win-unpacked");
 const configPath = path.join(desktopRoot, "packaging", "native-mutex-spike", "electron-builder.json");
@@ -64,7 +65,13 @@ async function main() {
     log(`NOT VERIFIED: ${addonBinary} is missing. Run "npm run build:native" first.`);
     process.exit(2);
   }
+  const wrapperStat = await readFile(wrapperModule).catch(() => undefined);
+  if (wrapperStat === undefined) {
+    log(`NOT VERIFIED: ${wrapperModule} is missing. Run "npm run build:main" first.`);
+    process.exit(2);
+  }
   log(`addon: ${addonBinary}`);
+  log(`wrapper: ${wrapperModule}`);
   log(`electron: ${electronVersion} (${electronDist})`);
 
   await rm(outputDirectory, { recursive: true, force: true });
@@ -101,6 +108,14 @@ async function main() {
     process.exit(1);
   }
   log(`PASS: extraResources placed the addon at ${packagedAddon} (${packagedAddonBytes.byteLength} bytes)`);
+
+  const packagedWrapper = path.join(unpackedDirectory, "resources", "shelf-mutex", "shelf-native-mutex.js");
+  const packagedWrapperText = await readFile(packagedWrapper, "utf8").catch(() => undefined);
+  if (packagedWrapperText === undefined) {
+    log(`FAIL: ${packagedWrapper} was not produced.`);
+    process.exit(1);
+  }
+  log(`PASS: extraResources placed the loader at ${packagedWrapper}`);
 
   const executable = path.join(unpackedDirectory, "MAGINALIA Native Mutex Spike.exe");
   const executableBytes = await readFile(executable).catch(() => undefined);
@@ -145,10 +160,18 @@ async function main() {
   }
   log("PASS: packaged Electron binary loaded and used <resources>/shelf-mutex/shelf_mutex.node as Node");
 
-  // Probe 2: real Electron main process reading the addon from process.resourcesPath.
+  // Probe 2: real Electron main process loading the addon through the packaged wrapper.
+  // The environment override points at a file that does not exist and the working
+  // directory is scratch: packaged mode must ignore both and use `<resources>` only.
   const resultFile = path.join(probeDirectory, "electron-result.json");
+  const bogusOverride = path.join(probeDirectory, "untrusted", "shelf_mutex.node");
   const electronProbe = await run(executable, [], {
-    env: { ...process.env, MAGINALIA_SPIKE_RESULT: resultFile }
+    cwd: probeDirectory,
+    env: {
+      ...process.env,
+      MAGINALIA_SPIKE_RESULT: resultFile,
+      MAGINALIA_SHELF_MUTEX_PATH: bogusOverride
+    }
   });
   const electronText = await readFile(resultFile, "utf8").catch(() => "");
   if (electronText === "") {
@@ -163,6 +186,26 @@ async function main() {
     log(electronProbe.stderr);
     process.exit(1);
   }
+  const expectedPackaged = path.resolve(unpackedDirectory, "resources", "shelf-mutex", "shelf_mutex.node");
+  const policy = electronResult.policy ?? {};
+  if (policy.mode !== "packaged") {
+    log(`FAIL: packaged loader reported mode "${policy.mode}" instead of "packaged": ${electronText}`);
+    process.exit(1);
+  }
+  if (!Array.isArray(policy.candidates) || policy.candidates.length !== 1) {
+    log(`FAIL: packaged loader offered ${JSON.stringify(policy.candidates)}; it must offer exactly one path.`);
+    process.exit(1);
+  }
+  if (path.resolve(policy.candidates[0]) !== expectedPackaged) {
+    log(`FAIL: packaged loader candidate ${policy.candidates[0]} is not ${expectedPackaged}`);
+    process.exit(1);
+  }
+  if (electronResult.envOverride !== bogusOverride) {
+    log(`FAIL: the bogus MAGINALIA_SHELF_MUTEX_PATH did not reach the probe (${electronResult.envOverride});`);
+    log("      the environment-ignored assertion would be vacuous.");
+    process.exit(1);
+  }
+  log(`PASS: packaged loader offered exactly one trusted candidate (${policy.candidates[0]})`);
   log(`PASS: real Electron ${electronResult.electron} main process loaded the packaged addon`);
 
   await rm(probeDirectory, { recursive: true, force: true });

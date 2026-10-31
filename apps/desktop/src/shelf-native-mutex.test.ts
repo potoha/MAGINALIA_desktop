@@ -19,12 +19,20 @@ import { afterEach, describe, expect, test } from "vitest";
 import {
   acquireShelfMutex,
   closeShelfMutexHandles,
+  isPathWithin,
   loadNativeShelfMutex,
   nativeShelfMutexAvailable,
+  resolveNativeAddonCandidates,
   resolveShelfMutexName,
   ShelfNativeMutexError
 } from "./shelf-native-mutex.js";
-import { assessShelfWriteStateAfterAbandon, commitShelfQuoteWithNativeLock } from "./shelf-native-write-lock.js";
+import {
+  SHELF_WRITER_RECOVERY_STATE_FILENAME,
+  assessShelfWriteRecoveryState,
+  commitShelfQuoteWithNativeLock,
+  inspectShelfWriterRecoveryState,
+  writeShelfWriterRecoveryState
+} from "./shelf-native-write-lock.js";
 import {
   commitShelfQuote,
   inspectShelfWriteJournal,
@@ -209,7 +217,7 @@ describe("abandoned-state journal reconciliation", () => {
   test("a fully committed journal is resumable and re-verified", async () => {
     const fixture = await createFixture("assess-committed");
     const { requestId } = await commitOnce(fixture);
-    const assessment = await assessShelfWriteStateAfterAbandon({
+    const assessment = await assessShelfWriteRecoveryState({
       shelfRoot: fixture.shelfRoot,
       expectedShelfId: fixture.shelfId,
       coordinationRoot: fixture.coordinationRoot
@@ -231,7 +239,7 @@ describe("abandoned-state journal reconciliation", () => {
       const { committedAt: _committedAt, ...rest } = record;
       return { ...rest, state: "staged" };
     });
-    const assessment = await assessShelfWriteStateAfterAbandon({
+    const assessment = await assessShelfWriteRecoveryState({
       shelfRoot: fixture.shelfRoot,
       expectedShelfId: fixture.shelfId,
       coordinationRoot: fixture.coordinationRoot
@@ -249,7 +257,7 @@ describe("abandoned-state journal reconciliation", () => {
     });
     // The Annotation is on disk with the recorded digest, so only the receipt is
     // missing. Retrying the same request ID completes it without a second record.
-    const assessment = await assessShelfWriteStateAfterAbandon({
+    const assessment = await assessShelfWriteRecoveryState({
       shelfRoot: fixture.shelfRoot,
       expectedShelfId: fixture.shelfId,
       coordinationRoot: fixture.coordinationRoot
@@ -271,7 +279,7 @@ describe("abandoned-state journal reconciliation", () => {
     const file = path.join(fixture.annotationsDirectory, `${annotationId.replace(":", "-")}.json`);
     const original = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
     await writeFile(file, `${JSON.stringify({ ...original, quote: "改変された引用" }, null, 2)}\n`, "utf8");
-    await expect(assessShelfWriteStateAfterAbandon({
+    await expect(assessShelfWriteRecoveryState({
       shelfRoot: fixture.shelfRoot,
       expectedShelfId: fixture.shelfId,
       coordinationRoot: fixture.coordinationRoot
@@ -283,7 +291,7 @@ describe("abandoned-state journal reconciliation", () => {
     const { receipt } = await commitOnce(fixture);
     const annotationId = (receipt as { annotationId: string }).annotationId;
     await unlink(path.join(fixture.annotationsDirectory, `${annotationId.replace(":", "-")}.json`));
-    await expect(assessShelfWriteStateAfterAbandon({
+    await expect(assessShelfWriteRecoveryState({
       shelfRoot: fixture.shelfRoot,
       expectedShelfId: fixture.shelfId,
       coordinationRoot: fixture.coordinationRoot
@@ -295,7 +303,7 @@ describe("abandoned-state journal reconciliation", () => {
     const requestId = `req-${randomUUID()}`;
     await mkdir(fixture.journalDirectory, { recursive: true });
     await writeFile(path.join(fixture.journalDirectory, `${requestId}.json`), "{\"version\": 1,", "utf8");
-    await expect(assessShelfWriteStateAfterAbandon({
+    await expect(assessShelfWriteRecoveryState({
       shelfRoot: fixture.shelfRoot,
       expectedShelfId: fixture.shelfId,
       coordinationRoot: fixture.coordinationRoot
@@ -306,7 +314,7 @@ describe("abandoned-state journal reconciliation", () => {
     const fixture = await createFixture("assess-identity");
     await commitOnce(fixture);
     await writeFile(path.join(fixture.shelfRoot, "shelf.magi"), `version = 1\ntype = shelf\nid = ${randomUUID()}\n`, "utf8");
-    await expect(assessShelfWriteStateAfterAbandon({
+    await expect(assessShelfWriteRecoveryState({
       shelfRoot: fixture.shelfRoot,
       expectedShelfId: fixture.shelfId,
       coordinationRoot: fixture.coordinationRoot
@@ -324,6 +332,148 @@ describe("abandoned-state journal reconciliation", () => {
     });
     expect(entries).toHaveLength(1);
     expect(await readFile(path.join(fixture.journalDirectory, `${requestId}.json`), "utf8")).toBe(before);
+  });
+});
+
+const windowsSuite = process.platform === "win32" ? describe : describe.skip;
+
+windowsSuite("addon loading policy", () => {
+  const resources = "C:\\Program Files\\MAGINALIA desktop\\resources";
+
+  test("packaged mode has exactly one candidate and ignores the environment and cwd", () => {
+    const resolution = resolveNativeAddonCandidates({
+      resourcesPath: resources,
+      defaultApp: false,
+      envOverride: "C:\\Users\\public\\Downloads\\evil.node",
+      cwd: "C:\\Users\\public\\Downloads",
+      moduleDirectory: "C:\\Users\\public\\Downloads\\dist\\main"
+    });
+    expect(resolution.mode).toBe("packaged");
+    expect(resolution.candidates).toEqual([path.join(resources, "shelf-mutex", "shelf_mutex.node")]);
+  });
+
+  test("dev Electron and plain Node keep the development candidates", () => {
+    // `electron main.js` sets process.defaultApp = true, so the env override stays
+    // available for development and tests.
+    const devElectron = resolveNativeAddonCandidates({
+      resourcesPath: "C:\\electron\\resources",
+      defaultApp: true,
+      envOverride: "C:\\work\\native\\shelf-mutex\\build\\Release\\shelf_mutex.node",
+      cwd: "C:\\work"
+    });
+    expect(devElectron.mode).toBe("development");
+    expect(devElectron.candidates[0]).toBe("C:\\work\\native\\shelf-mutex\\build\\Release\\shelf_mutex.node");
+
+    // Plain Node has no resourcesPath at all.
+    const plainNode = resolveNativeAddonCandidates({ cwd: "C:\\work" });
+    expect(plainNode.mode).toBe("development");
+    expect(plainNode.candidates[0]).toBe("C:\\work\\native\\shelf-mutex\\build\\Release\\shelf_mutex.node");
+    expect(plainNode.candidates).toHaveLength(2);
+  });
+
+  test("containment rejects a path outside the resources root", () => {
+    expect(isPathWithin(resources, path.join(resources, "shelf-mutex", "shelf_mutex.node"))).toBe(true);
+    expect(isPathWithin(resources, "C:\\Program Files\\MAGINALIA desktop\\resources-evil\\x.node")).toBe(false);
+    expect(isPathWithin(resources, "C:\\Windows\\System32\\evil.node")).toBe(false);
+    expect(isPathWithin("C:\\app", "C:\\app\\..\\app2\\x.node")).toBe(false);
+  });
+
+  test("the development loader resolves the built addon in this checkout", () => {
+    expect(loadNativeShelfMutex().apiVersion).toBe(1);
+  });
+});
+
+mutexSuite("persistent recovery state", () => {
+  function coordinationDirectory(fixture: Awaited<ReturnType<typeof createFixture>>): string {
+    return path.join(fixture.coordinationRoot, "shelves", fixture.shelfId.toLowerCase());
+  }
+
+  test("a completed native-lock write leaves no recovery record", async () => {
+    const fixture = await createFixture("recovery-clean");
+    const receipt = await commitShelfQuoteWithNativeLock(request(fixture), { acquireTimeoutMs: 2_000 });
+    expect(receipt.state).toBe("committed");
+    const state = await inspectShelfWriterRecoveryState(coordinationDirectory(fixture));
+    expect(state.pending).toBe(false);
+    expect(await readdir(coordinationDirectory(fixture))).not.toContain(SHELF_WRITER_RECOVERY_STATE_FILENAME);
+  });
+
+  test("a pending record makes the next writer verify before writing", async () => {
+    const fixture = await createFixture("recovery-pending");
+    await mkdir(coordinationDirectory(fixture), { recursive: true });
+    await writeShelfWriterRecoveryState({
+      coordinationDirectory: coordinationDirectory(fixture),
+      requestId: "req-interrupted"
+    });
+    expect((await inspectShelfWriterRecoveryState(coordinationDirectory(fixture))).pending).toBe(true);
+
+    const triggers: string[] = [];
+    const receipt = await commitShelfQuoteWithNativeLock(request(fixture), {
+      acquireTimeoutMs: 2_000,
+      onRecovery: (assessment, info) => {
+        triggers.push(info.trigger);
+        expect(assessment.resumable).toBe(true);
+      }
+    });
+    expect(receipt.state).toBe("committed");
+    // No abandonment is possible here (the mutex object was never lost in-process), so
+    // the record alone has to be what triggers the verification.
+    expect(triggers).toEqual(["pending-write"]);
+    expect((await inspectShelfWriterRecoveryState(coordinationDirectory(fixture))).pending).toBe(false);
+  });
+
+  test("a pending record with a damaged journal fails closed and keeps everything", async () => {
+    const fixture = await createFixture("recovery-corrupt");
+    await mkdir(fixture.journalDirectory, { recursive: true });
+    const damaged = path.join(fixture.journalDirectory, `req-${randomUUID()}.json`);
+    await writeFile(damaged, "{\"version\": 1,", "utf8");
+    await writeShelfWriterRecoveryState({
+      coordinationDirectory: coordinationDirectory(fixture),
+      requestId: "req-interrupted"
+    });
+
+    await expect(
+      commitShelfQuoteWithNativeLock(request(fixture), { acquireTimeoutMs: 2_000 })
+    ).rejects.toMatchObject({ code: "shelf-write-journal-invalid" });
+
+    // Nothing repaired, nothing deleted, nothing written.
+    expect(await readFile(damaged, "utf8")).toBe("{\"version\": 1,");
+    expect(await readdir(fixture.annotationsDirectory)).toEqual([]);
+    expect(await readdir(fixture.booksDirectory)).toEqual([]);
+    const state = await inspectShelfWriterRecoveryState(coordinationDirectory(fixture));
+    expect(state.pending).toBe(true);
+    expect(state.record?.requestId).toBe("req-interrupted");
+  });
+
+  test("a truncated recovery record still counts as pending", async () => {
+    const fixture = await createFixture("recovery-truncated");
+    await mkdir(coordinationDirectory(fixture), { recursive: true });
+    await writeFile(
+      path.join(coordinationDirectory(fixture), SHELF_WRITER_RECOVERY_STATE_FILENAME),
+      "{\"version\": 1,",
+      "utf8"
+    );
+    const state = await inspectShelfWriterRecoveryState(coordinationDirectory(fixture));
+    expect(state.pending).toBe(true);
+    expect(state.record).toBeUndefined();
+  });
+
+  test("the recovery record is not a journal record", async () => {
+    const fixture = await createFixture("recovery-not-journal");
+    const { requestId } = await (async () => {
+      const command = request(fixture);
+      await commitShelfQuote(command);
+      return { requestId: command.requestId };
+    })();
+    await writeShelfWriterRecoveryState({
+      coordinationDirectory: coordinationDirectory(fixture),
+      requestId: "req-interrupted"
+    });
+    const entries = await inspectShelfWriteJournal({
+      shelfRoot: fixture.shelfRoot,
+      expectedShelfId: fixture.shelfId,
+      coordinationRoot: fixture.coordinationRoot
+    });
+    expect(entries.map((entry) => entry.record.requestId)).toEqual([requestId]);
   });
 });
 

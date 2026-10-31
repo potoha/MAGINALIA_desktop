@@ -6,8 +6,8 @@
  *
  * Sequence:
  *   1. load the addon and acquire the Shelf mutex on the Electron main thread;
- *   2. spawn a second process (`ELECTRON_RUN_AS_NODE` worker) that tries the same
- *      lock, which must be refused while Electron owns it;
+ *   2. spawn a second process (plain Node, so it is not another Electron runtime)
+ *      that tries the same lock, which must be refused while Electron owns it;
  *   3. release, re-acquire to prove the mutex is still usable, release, close.
  *
  * The result is written to `MAGINALIA_NATIVE_RESULT` (and printed) because a GUI
@@ -23,6 +23,7 @@ const path = require("node:path");
 
 const addonPath = process.env.MAGINALIA_SHELF_MUTEX_PATH;
 const workerPath = process.env.MAGINALIA_NATIVE_WORKER;
+const nodeBinary = process.env.MAGINALIA_NATIVE_NODE;
 const shelfId = process.env.MAGINALIA_NATIVE_SHELF_ID;
 const resultPath = process.env.MAGINALIA_NATIVE_RESULT;
 
@@ -52,14 +53,14 @@ function runWorker(command) {
   return new Promise((resolve, reject) => {
     const commandFile = path.join(os.tmpdir(), `maginalia-electron-cmd-${randomUUID()}.json`);
     writeFileSync(commandFile, JSON.stringify(command), "utf8");
-    const child = spawn(process.execPath, [workerPath, commandFile], {
+    // A plain Node child: the loader policy treats a packaged Electron runtime as
+    // "packaged" and only trusts `<resources>/shelf-mutex/...`, which is not where the
+    // development addon lives. The contender only has to be a second OS process.
+    const environment = { ...process.env, MAGINALIA_SHELF_MUTEX_PATH: addonPath };
+    delete environment.ELECTRON_RUN_AS_NODE;
+    const child = spawn(nodeBinary ?? process.execPath, [workerPath, commandFile], {
       stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        // This Electron binary runs as plain Node for the child process.
-        ELECTRON_RUN_AS_NODE: "1",
-        MAGINALIA_SHELF_MUTEX_PATH: addonPath
-      }
+      env: environment
     });
     const lines = [];
     let buffer = "";

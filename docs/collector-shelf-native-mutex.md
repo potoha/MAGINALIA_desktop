@@ -9,7 +9,8 @@ Host.
 - Work branch: `codex/collector-windows-native-mutex-spike`
 - Product Owner decision: OD-10 selects the Windows OS-managed lock (option **b**);
   a named mutex is the first candidate; product integration only after acceptance.
-- Related: Issue #80, PR #79 (merged), PR #81 (open, **not merged and not reused**)
+- Related: Issue #80, PR #79 (merged), PR #81 (open, **not merged and not reused**),
+  PR #82 (this branch)
 - Canonical sources consulted: `MAGINALIA_IDE/docs/decisions/0019-collector-native-messaging-host.md`
   (Accepted, D070 — "the locking/coordinator design and atomicity mechanism are not
   selected"), Shelf v0.4 contract (`MAGINALIA_IDE/docs/shelf-json-contract.md`,
@@ -26,6 +27,18 @@ survive abnormal termination without leaving a lock that blocks every later writ
 The open design question in D070 is the mechanism. This spike evaluates the Windows
 OS-managed option: the exclusion authority is a kernel object, so ownership cannot
 outlive a dead process and no reclamation or TTL heuristic is needed.
+
+The review follow-up recorded here adds three requirements on top of the first
+mechanism proof:
+
+1. recovery must not depend on abandonment: when the last handle dies with the last
+   participant, the next process creates a brand-new mutex and must still verify the
+   journal (§3.5);
+2. a failed assessment followed by an ordinary process exit must not let a later
+   process skip verification and write (§3.5, evidence 23);
+3. a packaged build must load the addon only from the trusted `resources` directory,
+   with environment/CWD loading confined to development and tests (§3.7, evidence 14
+   and 24).
 
 Non-goals, deliberately unchanged:
 
@@ -55,6 +68,11 @@ Non-goals, deliberately unchanged:
 holder died while owning the lock, which is exactly the signal needed to demand a
 journal consistency check before writing again. `LockFileEx` cannot distinguish
 "previous writer was killed mid-write" from "nobody ever held the lock".
+
+It is necessary but not sufficient. A destroyed mutex object (the usual case when the
+Desktop is closed and the Host was the only process) reports nothing at all, so a
+persistent recovery record supplies the missing signal (§3.5). The mutex remains the
+exclusion authority; the record is only about "a write was in flight".
 
 The named mutex is machine-local by construction, so it is correct for a locally
 stored Private Shelf and wrong for a Shelf on a network share. That limitation is
@@ -94,11 +112,10 @@ Global\MAGINALIA.ShelfWrite.<shelf-uuid-lowercase>       (scope: "machine", cros
   handle closes, and a destroyed object cannot be abandoned. The handle cache exists
   for exactly this reason.
 - Consequence, documented honestly: if *every* process closes its handle, the object
-  disappears; a later writer then gets a fresh mutex and no abandonment signal. That
-  is safe — with no participant alive there is no competing writer, and an
-  interrupted request is still completed by the existing request-ID idempotency. It
-  does mean abandonment-based journal assessment only applies while a participant
-  (Desktop or Host) is running, which is the case in every realistic scenario.
+  disappears; a later writer then gets a fresh mutex and no abandonment signal. That is
+  exactly why recovery cannot rely on abandonment: the durable `writer-recovery.json`
+  record (§3.5) makes the next writer verify the journal even when the kernel has
+  nothing to report. Neither mechanism asks a user or a clock to decide anything.
 
 ### 3.3 Never blocking the Electron main thread
 
@@ -132,11 +149,29 @@ creating account itself is not granted access and a second create is refused).
 True cross-account verification (a second Windows user) is **NOT VERIFIED**: no
 second account was available on the verification machine.
 
-### 3.5 Abandonment protocol
+### 3.5 Recovery protocol (abandonment **and** a persistent record)
 
 `WAIT_ABANDONED` already means the lock is available. It does **not** mean the Shelf
-is sane. The writer therefore runs `assessShelfWriteStateAfterAbandon` before touching
-anything:
+is sane, and it is not even always available: when the last handle dies with the last
+process (Desktop closed, the Host alone and force-killed), the mutex object is
+destroyed and the next process creates a brand-new one that reports nothing at all.
+
+The mutex therefore cannot be the only recovery signal. Before the critical section the
+writer durably creates `writer-recovery.json` in the Shelf's coordination directory
+(`<coordination>/shelves/<uuid>/`, next to `requests/`, never inside it), and removes it
+only after the receipt is committed:
+
+| Trigger | Meaning |
+| --- | --- |
+| record absent, no abandonment | the previous native-lock write (if any) finished; no journal scan, so the normal path stays O(1) |
+| record present | a write was in flight and did not finish, **whatever the mutex says** |
+| `WAIT_ABANDONED` | verify even when the record is absent |
+
+The record is opened, written and `sync`ed before the first journal write. A truncated or
+unreadable record still counts as "pending": only the file being absent is treated as
+clean. Its metadata (pid, request id, timestamp) is diagnostic, never authoritative.
+
+`assessShelfWriteRecoveryState` is read-only and fails closed:
 
 1. re-resolve the Shelf layout — marker UUID, `library.json`, realpath containment,
    `dev`/`ino` fingerprints (a swapped or replaced Shelf fails closed);
@@ -146,19 +181,24 @@ anything:
    commit point) or present with the recorded digest (died after it);
 5. anything unprovable stops the write.
 
-On a failed assessment the mutex is **deliberately kept held** and the process is
-expected to exit. Releasing it would consume the abandonment signal, and the next
-writer would treat the mutex as healthy even though the Shelf state was never proven.
-The next process re-runs the assessment.
+On a failed assessment the mutex is **kept held** and the process is expected to exit.
+The recovery record is preserved exactly as it is — it is not rewritten, repaired or
+deleted — so the next process verifies even when the lock is released cleanly. That
+matters because `process.exit()` skips environment teardown: when a process simply
+exits after a failure the finalizer may or may not run, and the record is what makes the
+outcome identical either way. Neither journal records nor Annotation/Book files are ever
+repaired or deleted by recovery.
 
 | Observed state | Result |
 | --- | --- |
-| Mutex acquired normally | write as usual |
-| `WAIT_ABANDONED`, journal consistent | record interrupted/committed requests, then write (retry completes the interrupted request) |
-| `WAIT_ABANDONED`, damaged journal | `shelf-write-journal-invalid`, no write |
-| `WAIT_ABANDONED`, receipt without its records | `shelf-write-receipt-missing`, no write |
-| `WAIT_ABANDONED`, staged digest mismatch | `shelf-write-lease-uncertain`, no write |
-| `WAIT_ABANDONED`, marker/identity mismatch | `shelf-write-identity-mismatch`, no write |
+| Mutex acquired normally, no record | write as usual |
+| Record present (no abandonment), journal consistent | report `trigger: "pending-write"`, then write (retry completes the interrupted request) |
+| `WAIT_ABANDONED`, no record, journal consistent | report `trigger: "abandoned"`, then write |
+| Either trigger, damaged journal | `shelf-write-journal-invalid`, no write, record kept |
+| Either trigger, receipt without its records | `shelf-write-receipt-missing`, no write, record kept |
+| Either trigger, staged digest mismatch | `shelf-write-lease-uncertain`, no write, record kept |
+| Either trigger, marker/identity mismatch | `shelf-write-identity-mismatch`, no write, record kept |
+| Record cannot be created/read durably | `shelf-write-recovery-state-unavailable`, no write |
 
 ### 3.6 One writer implementation
 
@@ -170,10 +210,35 @@ readonly externalLock?: { assertHeld(): Promise<void> };
 
 When present, the file lease is not taken and the writer re-asserts the supplied lock
 before each publish. There is still exactly one Shelf writer, one journal, and one set
-of records. `src/shelf-native-write-lock.ts` only adds acquisition + abandonment
+of records. `src/shelf-native-write-lock.ts` only adds acquisition + recovery
 reconciliation around it. Leaving `externalLock` undefined preserves the previous
 behavior byte for byte, which is why the existing file-lease suite still passes
 unchanged.
+
+### 3.7 Addon loading policy
+
+`src/shelf-native-mutex.ts` has one resolver, `resolveNativeAddonCandidates`, with two
+modes:
+
+| Mode | Condition | Candidates |
+| --- | --- | --- |
+| packaged | `process.resourcesPath` is set and `process.defaultApp !== true` | exactly `<resources>/shelf-mutex/shelf_mutex.node` |
+| development | every other case (plain Node, `electron main.js`) | `MAGINALIA_SHELF_MUTEX_PATH`, then the `node-gyp` output under the cwd, then the compiled layout |
+
+Packaged mode is a security boundary, not a convenience order:
+
+- there is **no fallback list**: either the trusted file loads or the lock is
+  unavailable (`native-mutex-unavailable`);
+- the candidate must be inside `process.resourcesPath` after resolution
+  (`isPathWithin`) and must be a regular file rather than a symlink (`lstatSync`);
+- `MAGINALIA_SHELF_MUTEX_PATH`, the working directory and `__dirname` are ignored, so a
+  shortcut, launcher, or stray environment variable cannot redirect the process to an
+  arbitrary `.node` file.
+
+A packaged Electron binary started with `ELECTRON_RUN_AS_NODE=1` is still "packaged"
+(it has a `resources` directory), and is deliberately not treated as a development
+bypass. The development smoke test therefore drives its second process with a plain
+`node` binary.
 
 ## 4. Verification
 
@@ -190,18 +255,23 @@ All commands run on Windows 10.0.26300, Node v24.14.0, Electron 44.3.0, MSVC 14.
 | 6 | Live holder not displaceable | holder keeps the lock; contender times out with `shelf-write-busy` after really waiting; holder still owns it | **PASS** |
 | 7 | Force-kill → abandonment | `TerminateProcess` on the holder; next writer gets `WAIT_ABANDONED` (128) immediately | **PASS** |
 | 8 | Mid-write crash recovery | holder killed after Book publish → staged journal + abandonment → retry reconciles, commits once | **PASS** |
-| 9 | Orderly crash is not abandonment | `process.exit` mid-write → no abandonment (finalizers release), retry completes the staged request | **PASS** |
+| 9 | `process.exit` mid-write | `process.exit` skips environment teardown, so the mutex is usually left abandoned (or destroyed); the durable record was written before the critical section, the retry reconciles and commits once | **PASS** |
 | 10 | Fail closed on bad journal | DAMAGED journal + abandonment → `shelf-write-journal-invalid`, no Book, no Annotation, journal untouched | **PASS** |
 | 11 | Shelf-scoped separation | holding Shelf A does not block Shelf B | **PASS** |
 | 12 | DACL enforcement | SYSTEM-only descriptor → second create `mutex-access-denied` | **PASS** |
 | 13 | Electron compatibility | real Electron 44.3.0 main process loads the addon, acquires, blocks a separate Node process, releases and re-acquires | **PASS** |
-| 14 | Installer packaging feasibility | `npm run spike:native-package` → `electron-builder --win dir --x64` places `resources/shelf-mutex/shelf_mutex.node`; loads in `ELECTRON_RUN_AS_NODE` and in the packaged Electron main process | **PASS** (dir package; full NSIS installer **NOT VERIFIED**, see §6) |
+| 14 | Installer packaging feasibility | `npm run spike:native-package` → `electron-builder --win dir --x64` places `resources/shelf-mutex/{shelf_mutex.node,shelf-native-mutex.js}`; addon loads in `ELECTRON_RUN_AS_NODE` and in the packaged Electron main process; the packaged wrapper resolves exactly one trusted candidate | **PASS** (dir package; full NSIS installer **NOT VERIFIED**, see §6) |
 | 15 | No dev toolchain on user PCs | N-API binary, `/MT` static CRT; `dumpbin /dependents` → `KERNEL32.dll`, `ADVAPI32.dll`, delay-load `node.exe` only | **PASS** |
 | 16 | Thread ownership contract | worker-thread test: another thread cannot acquire or release the main thread's lock (`mutex-not-owned`) | **PASS** |
-| 17 | Whole Desktop unit suite | 913 passed, 1 failed (`src/tutorial-sample.test.ts`, pre-existing and unrelated) | **PASS (no new failures)** |
+| 17 | Whole Desktop unit suite | 922 passed, 1 failed (`src/tutorial-sample.test.ts`, pre-existing and unrelated) | **PASS (no new failures)** |
 | 18 | Cross-session / `Global\` | creation succeeded here; standard-user privilege behavior unproven | **NOT VERIFIED** |
 | 19 | Second Windows user denied | only provable through the DACL test above; no second account available | **NOT VERIFIED** |
 | 20 | Real Chrome-terminated Native Host | Host `save` is out of scope and remains unsupported | **NOT VERIFIED** |
+| 21 | Desktop absent, Host alone force-killed | no participant holds a handle, the mutex object is destroyed: the restart reports `createdFresh: true` / `abandoned: false`, the record reports `pending: true`, assessment runs, the staged request is completed | **PASS** |
+| 22 | Malformed journal with a brand-new mutex | damaged journal + record + freshly created mutex (no abandonment possible) → `shelf-write-journal-invalid`; journal, Books and Annotations untouched | **PASS** |
+| 23 | Failed assessment, clean release, retry | assessment fails → natural exit really releases the mutex (probe acquires with `abandoned: false`) → a later process still refuses to write because the record persists | **PASS** |
+| 24 | Addon load policy | unit: packaged mode offers exactly one candidate and ignores env/cwd; containment rejects sibling and outside paths; development keeps the env override | **PASS** |
+| 25 | C++ N-API buffer contract | `GetString`/`GetUtf8` allocate `length + 1` and pass the real capacity to N-API, so the terminator N-API writes stays in bounds | **PASS** |
 
 Reproduce:
 
@@ -213,10 +283,11 @@ npm run spike:native-package            # electron-builder dir package + two loa
 
 Test files:
 
-- `src/shelf-native-mutex.test.ts` — 15 unit tests (name derivation, in-process guard,
-  thread ownership, DACL, native-lock commit, abandonment assessment cases).
+- `src/shelf-native-mutex.test.ts` — 24 unit tests (name derivation, in-process guard,
+  thread ownership, DACL, native-lock commit, recovery-state record, loader policy).
 - `test/collector-shelf-native-lock.test.mjs` + `test/collector-shelf-native-worker.mjs`
-  — 10 real-child-process tests.
+  — 13 real-child-process tests, including Desktop-absent/Host-only exit, a brand-new
+  mutex over a malformed journal, and a failed assessment followed by a clean release.
 - `test/electron-native-lock-smoke.test.mjs` + `test/electron-native-lock-main.cjs`
   — real Electron main process.
 
@@ -234,7 +305,10 @@ Studio, Windows SDK, `node-gyp`, or VC++ redistributable:
   `VCRUNTIME140.dll` / `MSVCP140.dll` dependency exists, so no redistributable is
   installed or required;
 - it uses **N-API** (`NAPI_VERSION 8`), so one binary is ABI-compatible with both the
-  Node runtime and Electron and does not need rebuilding per Electron version.
+  Node runtime and Electron and does not need rebuilding per Electron version;
+- string arguments are decoded with an explicit `length + 1` buffer, so the NUL that
+  N-API writes on `napi_get_value_string_utf16`/`utf8` stays inside the allocation
+  (Unicode names and long paths are ordinary input, not a special case).
 
 ### 5.2 Where the binary goes
 
@@ -242,20 +316,22 @@ Studio, Windows SDK, `node-gyp`, or VC++ redistributable:
 // apps/desktop/packaging/electron-builder.json  (change to make after acceptance)
 "extraResources": [
   { "from": "native/shelf-mutex/prebuilt/win32-x64/shelf_mutex.node",
-    "to": "shelf-mutex/shelf_mutex.node" }
+    "to": "shelf-mutex/shelf_mutex.node" },
+  { "from": "dist/main/shelf-native-mutex.js",
+    "to": "shelf-mutex/shelf-native-mutex.js" }
 ]
 ```
 
-`extraResources` is used instead of `files` on purpose: the file stays **outside**
-`app.asar`, so it can be loaded with `require` without extraction or a temp copy.
+`extraResources` is used instead of `files` on purpose: the files stay **outside**
+`app.asar`, so the addon can be loaded with `require` without extraction or a temp copy,
+and the loader that decides what to load ships in the same trusted directory.
 
-Resolution order implemented in `src/shelf-native-mutex.ts`:
+Loading policy implemented in `src/shelf-native-mutex.ts` (§3.7):
 
-1. `MAGINALIA_SHELF_MUTEX_PATH` (tests / diagnostics only),
-2. `<process.resourcesPath>/shelf-mutex/shelf_mutex.node` (packaged),
-3. `<cwd>/native/shelf-mutex/build/Release/shelf_mutex.node` and
-   `<cwd>/apps/desktop/...` (development, `node-gyp` output),
-4. `<dist/main>/../../native/...` (compiled main-process layout).
+| Runtime | Candidates |
+| --- | --- |
+| packaged (`process.resourcesPath` set, `defaultApp !== true`) | **only** `<resources>/shelf-mutex/shelf_mutex.node`, containment-checked and `lstat`-checked; no env, cwd or `__dirname` input |
+| development / test | `MAGINALIA_SHELF_MUTEX_PATH`, `<cwd>/native/shelf-mutex/build/Release/shelf_mutex.node`, `<cwd>/apps/desktop/...`, `<dist/main>/../../native/...` |
 
 A missing or unloadable binary raises `native-mutex-unavailable` instead of crashing,
 so a checkout without a C++ toolchain can still run every JavaScript suite and report
@@ -289,22 +365,28 @@ an installer would ship; the full installer itself is **NOT VERIFIED**.
 | Cross-session Desktop/Host | `Local\` requires the same interactive session; a service/session-0 host would need `Global\` + privilege or a different design. |
 | Multi-user machine | DACL denies other users, which is intended, but the second-account behavior is unproven. |
 | Worker-thread hosting | ownership is thread-bound; moving the writer to a worker thread requires acquisition there too. |
-| Orphaned journal from a pre-mutex crash | not abandonment-visible; still completed by request-ID idempotency, not by assessment. |
+| `process.exit` while owning the lock | Node skips environment teardown, so the addon finalizer does not run and the mutex stays abandoned (or is destroyed with the process) until the next acquire. Harmless: acquisition succeeds immediately and the recovery record, not the mutex state, decides whether the journal is verified. |
+| Recovery record deleted by hand | the audit trail for "a write was in flight" is a file like any other. If a user deletes the coordination directory, recovery falls back to request-ID idempotency: the interrupted request is still completed or refused by its own journal, never by a guess. |
+| Recovery record present but stale | the record is only removed after a committed receipt, and a later successful write overwrites it before its own critical section. A stale record costs one journal scan and never permits an unverified write. |
+| Addon supply chain | a prebuilt `.node` is native code; CI provenance and signing belong to the packaging decision, not to this spike. In packaged mode the loader trusts exactly one path inside `resources`, but the integrity of that file is the packaging pipeline's responsibility. |
 | Debugger/suspend | a suspended holder keeps the lock; the poll timeout reports `shelf-write-busy` rather than stealing it. |
-| Addon supply chain | a prebuilt `.node` is native code; CI provenance and signing belong to the packaging decision, not to this spike. |
 
 Adoption conditions (proposed): keep the mutex machine-local and session-local,
 open a participant handle when a Shelf is opened, run acquisition off any blocking
-path, keep the abandonment assessment mandatory in the write path, and prove the
-installer path (including a real Host `save`) before switching the product writer.
+path, keep the recovery assessment mandatory whenever `WAIT_ABANDONED` or the persistent
+record is observed, ship the addon and its loader only under `resources` (never load a
+`.node` from cwd or an environment variable in packaged builds), and prove the installer
+path (including a real Host `save`) before switching the product writer.
 
 ## 7. Files
 
 Added:
 
 - `apps/desktop/native/shelf-mutex/binding.gyp`, `apps/desktop/native/shelf-mutex/src/shelf_mutex.cc`
-- `apps/desktop/src/shelf-native-mutex.ts` — name, handle cache, poll acquire, errors, participant handle
-- `apps/desktop/src/shelf-native-write-lock.ts` — abandonment assessment + native-lock commit
+- `apps/desktop/src/shelf-native-mutex.ts` — name, handle cache, poll acquire, errors,
+  participant handle, packaged/development loader policy
+- `apps/desktop/src/shelf-native-write-lock.ts` — persistent recovery record, read-only
+  recovery assessment, native-lock commit
 - `apps/desktop/src/shelf-native-mutex.test.ts`
 - `apps/desktop/test/collector-shelf-native-worker.mjs`, `apps/desktop/test/collector-shelf-native-lock.test.mjs`
 - `apps/desktop/test/electron-native-lock-main.cjs`, `apps/desktop/test/electron-native-lock-smoke.test.mjs`
@@ -312,11 +394,16 @@ Added:
 
 Changed:
 
-- `apps/desktop/src/shelf-write-coordination.ts` — optional `externalLock` seam (default behavior unchanged)
+- `apps/desktop/src/shelf-write-coordination.ts` — optional `externalLock` seam (default
+  behavior unchanged) and the `shelf-write-recovery-state-unavailable` error code
 - `apps/desktop/tsconfig.main.json` — include the two new main-process modules
 - `apps/desktop/package.json` — `build:native`, `test:collector-shelf-native`, `spike:native-package`, `node-gyp` devDependency
 - `.gitignore` — `apps/desktop/native/shelf-mutex/build/`
 - `package-lock.json` — one line for the declared `node-gyp`
+
+Runtime data added by a native-lock write (in the Shelf's coordination directory, not in
+a repository file): `<coordination>/shelves/<uuid>/writer-recovery.json`, present only
+while a write is in flight.
 
 Not changed: Native Host, product Shelf writer behavior, Shelf/journal formats,
 Reviewer sidecar, `docs/collector-shelf-writer-coordination.md` (owned by PR #81),
@@ -346,8 +433,17 @@ Invariants:
 - ownership is thread-scoped, and in-process exclusion remains a JS guard;
 - a participant keeps one handle open for its process lifetime so that
   WAIT_ABANDONED remains observable;
-- on WAIT_ABANDONED the writer re-validates the Shelf layout and the shared journal
-  and fails closed rather than resuming when the state is unprovable;
+- recovery never depends on abandonment alone: a durable `writer-recovery.json` record
+  is written before the critical section and removed only after the receipt commits, so
+  a destroyed mutex object, a recreated mutex, or a process exit cannot make the next
+  writer assume the previous write finished;
+- on either signal the writer re-validates the Shelf layout and the shared journal and
+  fails closed rather than resuming when the state is unprovable; a failed assessment
+  leaves the record in place, keeps the mutex held, and never repairs or deletes a
+  journal record, Book or Annotation;
+- packaged builds load the addon only from `<resources>/shelf-mutex/shelf_mutex.node`;
+  environment variables, the working directory and `__dirname` are development/test
+  inputs and must never select native code in an installed application;
 - the mutex DACL grants only the creating user, SYSTEM and Administrators;
 - a named mutex is machine-local: a Shelf on a network share is out of scope until a
   separate decision covers it.

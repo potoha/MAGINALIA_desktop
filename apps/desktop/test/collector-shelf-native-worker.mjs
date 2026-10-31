@@ -16,9 +16,11 @@
  *   crashAfterBookHold   publish the Book, keep the mutex, then wait to be killed
  *   (default)            commit one Collector web quote under the mutex
  *
- * `crashAfterBook` (an orderly `process.exit` between Book and Annotation) is also
- * supported; it releases the mutex through the addon finalizers, which is a
- * different failure mode from an external kill and is proven separately.
+ * `crashAfterBook` (a `process.exit` between Book and Annotation) is also supported.
+ * `process.exit` skips environment teardown, so the addon finalizers do not run and the
+ * mutex is usually left abandoned (or destroyed with the process); `exitNaturally: true`
+ * makes a failure path set `process.exitCode` instead, so the environment does tear down
+ * and the finalizer releases the lock cleanly. Both are exercised.
  */
 import { createRequire } from "node:module";
 import { readFile, writeFile } from "node:fs/promises";
@@ -35,6 +37,7 @@ if (typeof commandFile !== "string") {
 const mainDirectory = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "main");
 const mutex = require(path.join(mainDirectory, "shelf-native-mutex.js"));
 const nativeLock = require(path.join(mainDirectory, "shelf-native-write-lock.js"));
+const coordination = require(path.join(mainDirectory, "shelf-write-coordination.js"));
 
 const command = JSON.parse(await readFile(commandFile, "utf8"));
 
@@ -46,7 +49,16 @@ function reportFailure(error) {
   const code = error && typeof error === "object" && typeof error.code === "string" ? error.code : "unknown";
   emit({ ok: false, code, message: String(error && error.message ? error.message : error) });
   const expected = code.startsWith("shelf-write-") || code.startsWith("native-mutex-");
-  process.exit(expected ? 3 : 1);
+  const exitCode = expected ? 3 : 1;
+  if (command.exitNaturally === true) {
+    // Let the event loop drain and the environment tear down normally, which runs the
+    // addon finalizers: the process releases the mutex on its way out. `process.exit`
+    // skips that teardown, so this is the only way to test a *clean* release after a
+    // failed recovery assessment.
+    process.exitCode = exitCode;
+    return;
+  }
+  process.exit(exitCode);
 }
 
 /** Keep the process alive without holding a lock. */
@@ -153,9 +165,10 @@ if (command.mode === "participant") {
 } else if (command.mode === "crashAfterBookHold") {
   const faults = {
     // Hold the mutex and never publish the Annotation: the parent kills this
-    // process, leaving a `staged` journal record plus an abandoned mutex. The timer
-    // keeps the event loop non-empty so Node does not report an unsettled top-level
-    // await and exit on its own (which would release the mutex cleanly).
+    // process, leaving a `staged` journal record, a durable recovery record and an
+    // abandoned (or destroyed) mutex. The timer keeps the event loop non-empty so Node
+    // does not report an unsettled top-level await and exit on its own (which would
+    // release the mutex cleanly).
     beforeAnnotationPublish: () => {
       emit({ ok: true, stage: "book-published", pid: process.pid });
       stayAlive();
@@ -163,6 +176,7 @@ if (command.mode === "participant") {
     }
   };
   try {
+    emit({ ok: true, stage: "starting", pid: process.pid, ...(await recoverySnapshot()) });
     await nativeLock.commitShelfQuoteWithNativeLock(
       {
         ...requestFields(),
@@ -172,6 +186,13 @@ if (command.mode === "participant") {
     );
     emit({ ok: false, code: "unexpected-completion" });
     process.exit(9);
+  } catch (error) {
+    reportFailure(error);
+  }
+} else if (command.mode === "recoveryState") {
+  // Report the persistent recovery record without writing anything.
+  try {
+    emit({ ok: true, ...(await recoverySnapshot()), pid: process.pid });
   } catch (error) {
     reportFailure(error);
   }
@@ -240,20 +261,60 @@ function nativeOptions() {
     ...(command.scope === undefined ? {} : { scope: command.scope }),
     ...(command.acquireTimeoutMs === undefined ? {} : { acquireTimeoutMs: command.acquireTimeoutMs }),
     ...(command.pollIntervalMs === undefined ? {} : { pollIntervalMs: command.pollIntervalMs }),
-    onAbandoned: (assessment) => {
+    onRecovery: (assessment, info) => {
       emit({
         ok: true,
-        abandoned: true,
-        interruptedRequestIds: assessment.interruptedRequestIds,
-        committedRequestIds: assessment.committedRequestIds,
+        abandoned: info.trigger === "abandoned",
+        recovery: {
+          trigger: info.trigger,
+          interruptedRequestIds: assessment.interruptedRequestIds,
+          committedRequestIds: assessment.committedRequestIds
+        },
         pid: process.pid
       });
     }
   };
 }
 
+/**
+ * Mutex-object and recovery-record state, reported before a write.
+ *
+ * `mutex.createdFresh === true` is the key evidence for the "Desktop absent, Host
+ * killed, restart" case: the previous mutex object was destroyed with the last
+ * participant, so no abandonment can be reported and the recovery record is the only
+ * thing that can make the new process verify the journal.
+ */
+async function recoverySnapshot() {
+  const mutexInfo = mutex.inspectShelfMutex(command.expectedShelfId, command.scope ?? "session");
+  let recoveryState;
+  try {
+    const layout = await coordination.resolveShelfWriteLayout({
+      shelfRoot: command.shelfRoot,
+      expectedShelfId: command.expectedShelfId,
+      coordinationRoot: command.coordinationRoot
+    });
+    const state = await nativeLock.inspectShelfWriterRecoveryState(layout.coordinationDirectory);
+    recoveryState = {
+      pending: state.pending,
+      requestId: state.record === undefined ? null : state.record.requestId
+    };
+  } catch (error) {
+    recoveryState = { error: error && typeof error === "object" && error.code ? error.code : "unknown" };
+  }
+  return {
+    mutex: {
+      name: mutexInfo.name,
+      createdFresh: mutexInfo.createdFresh,
+      abandoned: mutexInfo.abandoned,
+      owned: mutexInfo.owned
+    },
+    recoveryState
+  };
+}
+
 async function commitWithFaults(faults) {
   try {
+    emit({ ok: true, stage: "starting", pid: process.pid, ...(await recoverySnapshot()) });
     const receipt = await nativeLock.commitShelfQuoteWithNativeLock(
       { ...requestFields(), ...(faults === undefined ? {} : { faults }) },
       nativeOptions()

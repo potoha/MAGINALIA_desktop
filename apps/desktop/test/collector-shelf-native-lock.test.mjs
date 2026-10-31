@@ -11,7 +11,8 @@
  *   - a force-killed holder leaves the lock abandoned, and the next writer refuses to
  *     write until the shared journal has been reconciled;
  *   - a crash between Book and Annotation is recovered by retrying the same request;
- *   - an orderly exit does not abandon the lock (only an external kill does);
+ *   - an exit while owning the lock (process.exit or an external kill) is recovered even
+ *     when the mutex object is destroyed and no abandonment can be reported;
  *   - a damaged journal fails closed and nothing is written;
  *   - lock names are Shelf-scoped;
  *   - the mutex DACL refuses an account it does not grant.
@@ -23,7 +24,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -317,8 +318,9 @@ test("a process killed after publishing the Book is recovered by retrying the sa
     // request it reconciled before writing.
     const abandoned = retry.lines.find((line) => line.abandoned === true);
     assert.ok(abandoned !== undefined, `no abandonment report; saw ${JSON.stringify(retry.lines)}`);
-    assert.deepEqual(abandoned.interruptedRequestIds, [requestId]);
-    assert.deepEqual(abandoned.committedRequestIds, []);
+    assert.equal(abandoned.recovery.trigger, "abandoned");
+    assert.deepEqual(abandoned.recovery.interruptedRequestIds, [requestId]);
+    assert.deepEqual(abandoned.recovery.committedRequestIds, []);
 
     assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 1, "the retry must not duplicate");
     assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
@@ -331,7 +333,7 @@ test("a process killed after publishing the Book is recovered by retrying the sa
   }
 });
 
-test("an orderly exit between Book and Annotation does not abandon the lock", async () => {
+test("a process.exit between Book and Annotation still leaves a recoverable journal", async () => {
   const fixture = await createShelfFixture("native-orderly-crash");
   const participant = await startParticipant(fixture);
   const requestId = `req-native-orderly-${randomUUID()}`;
@@ -340,11 +342,21 @@ test("an orderly exit between Book and Annotation does not abandon the lock", as
     assert.equal(crashed.code, 70, JSON.stringify(crashed.result));
     assert.equal(crashed.result.code, "simulated-crash");
 
-    // process.exit runs the addon finalizers, so the mutex is released cleanly. The
-    // only artifact is the staged journal, which the retry completes.
+    // `process.exit` skips environment teardown, so the addon finalizers do not run and
+    // the mutex is normally left abandoned; a natural exit would release it instead.
+    // Either way the durable recovery record was written before the critical section, so
+    // the retry has to verify the journal. The assertion below therefore accepts both
+    // triggers: what matters is that recovery happened and the staged request completed.
     const retry = await runWorker(baseCommand(fixture, { requestId }), 120_000);
     assert.equal(retry.code, 0, `${JSON.stringify(retry.result)} ${retry.stderr}`);
     assert.equal(retry.result.receipt.state, "committed");
+    const reported = retry.lines.find((line) => line.recovery?.trigger !== undefined);
+    assert.ok(reported !== undefined, `no recovery report; saw ${JSON.stringify(retry.lines)}`);
+    assert.ok(
+      reported.recovery.trigger === "abandoned" || reported.recovery.trigger === "pending-write",
+      `unexpected trigger ${JSON.stringify(reported)}`
+    );
+    assert.deepEqual(reported.recovery.interruptedRequestIds, [requestId]);
     assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 1);
   } finally {
     await stopParticipant(participant);
@@ -376,6 +388,148 @@ test("a damaged journal plus an abandoned lock fails closed and writes nothing",
       await readFile(path.join(journalDirectory(fixture), `${requestId}.json`), "utf8"),
       "{\"version\": 1,"
     );
+  } finally {
+    if (holder !== undefined) await forceKill(holder).catch(() => {});
+    await stopParticipant(participant);
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+function coordinationDirectory(fixture) {
+  return path.join(fixture.coordinationRoot, "shelves", fixture.shelfId.toLowerCase());
+}
+
+test("Desktop absent: the Host dies alone, and the restart still verifies the journal", async () => {
+  const fixture = await createShelfFixture("native-host-only");
+  const requestId = `req-native-host-only-${randomUUID()}`;
+  const command = baseCommand(fixture, { requestId });
+  let holder;
+  try {
+    // This process is the only participant: no Desktop, no second Host, no
+    // long-lived handle. It creates the mutex, publishes the Book, and is killed.
+    holder = await startWorker({ ...command, mode: "crashAfterBookHold" });
+    await holder.waitForLine((line) => line.stage === "book-published");
+    const crashed = holder.lines.find((line) => line.stage === "starting");
+    assert.equal(crashed.mutex.createdFresh, true);
+    assert.equal(crashed.recoveryState.pending, false, "the record is written after the pre-write snapshot");
+    await forceKill(holder);
+    holder = undefined;
+
+    // The last handle died with the process, so the mutex object is gone: the restart
+    // gets a brand-new mutex and cannot see WAIT_ABANDONED. The durable record is the
+    // only thing that can make it verify the journal, and it must.
+    const retry = await runWorker(command, 120_000);
+    assert.equal(retry.code, 0, `${JSON.stringify(retry.result)} ${retry.stderr}`);
+    const pre = retry.lines.find((line) => line.stage === "starting");
+    assert.equal(pre.mutex.createdFresh, true, "the mutex object did not survive the Host");
+    assert.equal(pre.mutex.abandoned, false, "a recreated mutex cannot report abandonment");
+    assert.equal(pre.recoveryState.pending, true, "the durable recovery record survived the Host");
+    const reported = retry.lines.find((line) => line.recovery?.trigger !== undefined);
+    assert.ok(reported !== undefined, `no recovery report; saw ${JSON.stringify(retry.lines)}`);
+    assert.equal(reported.abandoned, false);
+    assert.equal(reported.recovery.trigger, "pending-write");
+    assert.deepEqual(reported.recovery.interruptedRequestIds, [requestId]);
+
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 1);
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
+    const journal = JSON.parse(await readFile(path.join(journalDirectory(fixture), `${requestId}.json`), "utf8"));
+    assert.equal(journal.state, "committed");
+    // The record is only cleared after a completed write.
+    assert.equal((await readdir(coordinationDirectory(fixture))).includes("writer-recovery.json"), false);
+  } finally {
+    if (holder !== undefined) await forceKill(holder).catch(() => {});
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("a malformed journal is refused even though the mutex was newly created", async () => {
+  const fixture = await createShelfFixture("native-malformed-fresh");
+  const requestId = `req-native-malformed-${randomUUID()}`;
+  const command = baseCommand(fixture, { requestId });
+  try {
+    // State after a Host-only crash: a damaged journal, a durable recovery record, and
+    // no mutex object in existence at all.
+    await mkdir(journalDirectory(fixture), { recursive: true });
+    const damaged = path.join(journalDirectory(fixture), `${requestId}.json`);
+    await writeFile(damaged, "{\"version\": 1,", "utf8");
+    await mkdir(coordinationDirectory(fixture), { recursive: true });
+    await writeFile(
+      path.join(coordinationDirectory(fixture), "writer-recovery.json"),
+      `${JSON.stringify({
+        version: 1,
+        state: "write-in-progress",
+        pid: 4242,
+        requestId,
+        startedAt: new Date().toISOString()
+      })}\n`,
+      "utf8"
+    );
+
+    const result = await runWorker(command, 120_000);
+    assert.equal(result.code, 3, `${JSON.stringify(result.result)} ${result.stderr}`);
+    assert.equal(result.result.code, "shelf-write-journal-invalid");
+    const pre = result.lines.find((line) => line.stage === "starting");
+    assert.equal(pre.mutex.createdFresh, true);
+    assert.equal(pre.mutex.abandoned, false);
+    assert.equal(pre.recoveryState.pending, true);
+    // No recovery success report: the assessment refused to continue.
+    assert.equal(result.lines.some((line) => line.recovery?.trigger !== undefined), false);
+
+    assert.equal(await readFile(damaged, "utf8"), "{\"version\": 1,");
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 0);
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 0);
+    assert.equal((await readdir(coordinationDirectory(fixture))).includes("writer-recovery.json"), true);
+  } finally {
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("after a failed assessment and a normal exit, the next process still refuses to write", async () => {
+  const fixture = await createShelfFixture("native-failed-then-exit");
+  const participant = await startParticipant(fixture);
+  const requestId = `req-native-failed-${randomUUID()}`;
+  const command = baseCommand(fixture, { requestId });
+  const damaged = path.join(journalDirectory(fixture), `${requestId}.json`);
+  let holder;
+  try {
+    holder = await startWorker({ ...command, mode: "crashAfterBookHold" });
+    await holder.waitForLine((line) => line.stage === "book-published");
+    await forceKill(holder);
+    holder = undefined;
+
+    // Damage the staged record the crashed write left behind.
+    await writeFile(damaged, "{\"version\": 1,", "utf8");
+
+    // First retry: abandonment -> assessment fails -> the process exits *naturally*, so
+    // the environment tears down, the addon finalizer runs, and the mutex is released
+    // cleanly. That is the exact case this test exists for: the next process cannot rely
+    // on abandonment to know it must verify.
+    const first = await runWorker({ ...command, exitNaturally: true }, 120_000);
+    assert.equal(first.code, 3, `${JSON.stringify(first.result)} ${first.stderr}`);
+    assert.equal(first.result.code, "shelf-write-journal-invalid");
+
+    // Prove the premise: the lock is not abandoned, so only the durable record can make
+    // the next writer verify. The probe acquires and releases without writing.
+    const probe = await runWorker({ ...command, mode: "tryAcquire", acquireTimeoutMs: 5_000 }, 30_000);
+    assert.equal(probe.result.ok, true, `${JSON.stringify(probe.result)} ${probe.stderr}`);
+    assert.equal(probe.result.abandoned, false, "the natural exit must release the lock");
+
+    const state = await runWorker({ ...command, mode: "recoveryState" }, 30_000);
+    assert.equal(state.result.recoveryState.pending, true);
+
+    // Second process: no abandonment, but the record forces the same failed check.
+    const second = await runWorker(command, 120_000);
+    assert.equal(second.code, 3, `${JSON.stringify(second.result)} ${second.stderr}`);
+    assert.equal(second.result.code, "shelf-write-journal-invalid");
+    assert.equal(second.lines.some((line) => line.recovery?.trigger !== undefined), false, "no write was allowed");
+    const pre = second.lines.find((line) => line.stage === "starting");
+    assert.equal(pre.mutex.abandoned, false);
+    assert.equal(pre.recoveryState.pending, true);
+
+    // Nothing repaired, nothing deleted, nothing written.
+    assert.equal(await readFile(damaged, "utf8"), "{\"version\": 1,");
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 0);
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1, "the crashed Book is left as-is");
   } finally {
     if (holder !== undefined) await forceKill(holder).catch(() => {});
     await stopParticipant(participant);

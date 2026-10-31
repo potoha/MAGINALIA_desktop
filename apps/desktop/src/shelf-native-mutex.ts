@@ -31,6 +31,7 @@
  */
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
+import { lstatSync } from "node:fs";
 import path from "node:path";
 
 // Absolute paths are required, so the base only has to be a valid filename. This
@@ -97,42 +98,108 @@ type NativeMutexHandle = object;
 let nativeModule: NativeMutexModule | undefined;
 let nativeLoadError: Error | undefined;
 
+const ADDON_RESOURCE_PATH = path.join("shelf-mutex", "shelf_mutex.node");
+const ADDON_DEVELOPMENT_PATH = path.join("native", "shelf-mutex", "build", "Release", "shelf_mutex.node");
+
+export interface NativeAddonCandidateOptions {
+  /** Electron's `process.resourcesPath`, or undefined in plain Node. */
+  readonly resourcesPath?: string | undefined;
+  /** Electron's `process.defaultApp`; `true` means "dev Electron launched with a script". */
+  readonly defaultApp?: boolean | undefined;
+  readonly envOverride?: string | undefined;
+  readonly cwd: string;
+  /** `__dirname` of the compiled module, when available. */
+  readonly moduleDirectory?: string | undefined;
+}
+
+export interface NativeAddonResolution {
+  readonly mode: "packaged" | "development";
+  readonly candidates: readonly string[];
+}
+
+function nonEmpty(value: string | undefined): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
 /**
- * Resolve the addon binary.
+ * Decide where the addon may be loaded from.
  *
- * Packaged: `<resources>/shelf-mutex/shelf_mutex.node` (extraResources, outside
- * `app.asar`, so no extraction and no rebuild on the user's machine).
- * Development: the node-gyp output directory.
- * Tests: `MAGINALIA_SHELF_MUTEX_PATH` overrides both.
+ * Packaged: **exactly one** path, `<resources>/shelf-mutex/shelf_mutex.node`. The
+ * environment variable and the working directory are ignored, so installed code can
+ * never be redirected to an arbitrary `.node` file by a launcher, a shortcut, or a
+ * stray environment variable.
+ *
+ * Development (`node --test`, CI, `electron <script>` via `process.defaultApp`): the
+ * env override, then the `node-gyp` output next to the working directory, then the
+ * compiled-layout relative path. These are convenience paths for building and testing,
+ * never a production fallback.
  */
-function nativeModuleCandidates(): readonly string[] {
-  const candidates: string[] = [];
-  const override = process.env["MAGINALIA_SHELF_MUTEX_PATH"];
-  if (typeof override === "string" && override.length > 0) candidates.push(override);
-  const resources = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
-  if (typeof resources === "string" && resources.length > 0) {
-    candidates.push(path.join(resources, "shelf-mutex", "shelf_mutex.node"));
+export function resolveNativeAddonCandidates(options: NativeAddonCandidateOptions): NativeAddonResolution {
+  const { resourcesPath, defaultApp } = options;
+  if (nonEmpty(resourcesPath) && defaultApp !== true) {
+    return Object.freeze({
+      mode: "packaged",
+      candidates: Object.freeze([path.resolve(resourcesPath, ADDON_RESOURCE_PATH)])
+    });
   }
-  const relative = path.join("native", "shelf-mutex", "build", "Release", "shelf_mutex.node");
-  candidates.push(path.join(process.cwd(), relative));
-  candidates.push(path.join(process.cwd(), "apps", "desktop", relative));
-  // Compiled main-process code: dist/main -> apps/desktop.
-  if (typeof __dirname === "string") candidates.push(path.join(__dirname, "..", "..", relative));
-  return candidates;
+  const candidates: string[] = [];
+  if (nonEmpty(options.envOverride)) candidates.push(path.resolve(options.envOverride));
+  candidates.push(path.resolve(options.cwd, ADDON_DEVELOPMENT_PATH));
+  candidates.push(path.resolve(options.cwd, "apps", "desktop", ADDON_DEVELOPMENT_PATH));
+  if (nonEmpty(options.moduleDirectory)) {
+    candidates.push(path.resolve(options.moduleDirectory, "..", "..", ADDON_DEVELOPMENT_PATH));
+  }
+  return Object.freeze({ mode: "development", candidates: Object.freeze(candidates) });
+}
+
+/** True when `candidate` is `root` or lies inside it after resolution. */
+export function isPathWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/**
+ * A packaged addon may only come from the trusted resources directory, and it must be
+ * a real file rather than a link that could point outside it.
+ */
+function isTrustedPackagedAddon(resources: string, candidate: string): boolean {
+  if (!isPathWithin(resources, candidate)) return false;
+  try {
+    const info = lstatSync(candidate);
+    return info.isFile() && !info.isSymbolicLink();
+  } catch {
+    return false;
+  }
 }
 
 /**
  * Load the addon once. A missing binary is reported as `native-mutex-unavailable`
  * rather than crashing the caller, so a build without a C++ toolchain can still run
  * the JavaScript suites and report this mechanism as NOT VERIFIED.
+ *
+ * In packaged mode there is no fallback candidates list: either the trusted file loads
+ * or the native lock is unavailable. That is deliberate — the alternative would be
+ * loading a `.node` file from a user-writable location.
  */
 export function loadNativeShelfMutex(): NativeMutexModule {
   if (nativeModule !== undefined) return nativeModule;
   if (nativeLoadError !== undefined) {
     fail("native-mutex-unavailable", "The Shelf mutex addon could not be loaded.", nativeLoadError.message);
   }
+  const processLike = process as NodeJS.Process & { resourcesPath?: string; defaultApp?: boolean };
+  const resolution = resolveNativeAddonCandidates({
+    resourcesPath: processLike.resourcesPath,
+    defaultApp: processLike.defaultApp,
+    envOverride: process.env["MAGINALIA_SHELF_MUTEX_PATH"],
+    cwd: process.cwd(),
+    moduleDirectory: typeof __dirname === "string" ? __dirname : undefined
+  });
   const attempts: string[] = [];
-  for (const candidate of nativeModuleCandidates()) {
+  for (const candidate of resolution.candidates) {
+    if (resolution.mode === "packaged" && !isTrustedPackagedAddon(processLike.resourcesPath ?? "", candidate)) {
+      attempts.push(`${candidate}: not a trusted file inside the packaged resources directory`);
+      continue;
+    }
     try {
       const loaded = requireNative(candidate) as NativeMutexModule;
       if (loaded === null || typeof loaded !== "object" || typeof loaded.acquire !== "function") {

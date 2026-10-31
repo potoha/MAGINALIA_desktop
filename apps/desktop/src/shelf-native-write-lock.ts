@@ -1,28 +1,49 @@
 /**
  * Writing a Collector web quote while holding the Windows named mutex.
  *
- * `WAIT_ABANDONED` means the previous owner died inside the critical section. The
- * OS lock is already available at that point, so the only thing that stands between
- * a dead writer and a corrupted Shelf is the shared journal. This module therefore
- * treats abandonment as an instruction:
+ * A mutex protects the critical section; it says nothing about whether the bytes on
+ * disk are sane. A writer can die in two different ways, and both must be handled:
+ *
+ * 1. **Another participant is alive** (Desktop open, or a second Host). The mutex
+ *    object survives, so the next writer receives `WAIT_ABANDONED`.
+ * 2. **No participant is alive** (Desktop closed, the Host is the only process and is
+ *    killed). The last handle dies with it, the mutex object is destroyed, and the
+ *    next process creates a brand-new mutex — which reports neither abandonment nor
+ *    any other hint that a write was in flight.
+ *
+ * Case 2 is why the mutex alone is not enough. Before the critical section starts, the
+ * writer durably records `writer-recovery.json` in the Shelf's coordination directory
+ * and removes it only after the receipt is committed. That record is the persistent
+ * recovery state:
+ *
+ * - record absent  → the previous native-lock write (if any) finished; no journal scan
+ *   is needed, so the normal path stays O(1);
+ * - record present → a write was in flight and did not finish, **whatever the mutex
+ *   says**, so the journal is verified before anything is written;
+ * - `WAIT_ABANDONED` → verify the journal even when the record is absent.
+ *
+ * Verification on recovery (`assessShelfWriteRecoveryState`) is read-only and fails
+ * closed:
  *
  * 1. re-resolve the Shelf layout (marker identity, `library.json`, realpath and
  *    `dev`/`ino` fingerprints) — a swapped or mismatched Shelf fails closed;
- * 2. strictly validate every journal record — a damaged journal fails closed;
+ * 2. strictly validate every journal record — a damaged journal fails closed, and it
+ *    is never repaired or deleted;
  * 3. require every `committed` receipt to still match its Book and Annotation;
- * 4. allow a `staged` record only when the Annotation is either absent (the previous
- *    writer died before the commit point) or present with the recorded digest (it
- *    died after the commit point, so the retry only has to write the receipt);
- * 5. refuse to continue, and keep the mutex held, when any of that is unprovable.
+ * 4. allow a `staged` record only when the Annotation is absent (the previous writer
+ *    died before the commit point) or present with the recorded digest (it died after
+ *    the commit point, so the retry only has to write the receipt).
  *
- * Keeping the mutex held on a failed assessment is deliberate: the state needs human
- * repair, and releasing it would let the next writer treat the mutex as healthy
- * (abandonment is consumed by the first acquirer). The process is expected to exit
- * after reporting the failure, and the next process re-runs the assessment.
+ * A failed verification leaves the recovery record in place and keeps the mutex held.
+ * Releasing the mutex would be harmless on its own (the record is what makes the next
+ * process verify), but keeping it held prevents the failing process from writing again
+ * and makes the "restart required" state explicit. Files are never mutated, repaired,
+ * or deleted by any of this.
  *
- * Nothing here is imported by the product write path or by the Native Messaging
- * Host. Journal and Shelf record formats are unchanged.
+ * Nothing here is imported by the product write path or by the Native Messaging Host.
+ * Journal and Shelf record formats are unchanged.
  */
+import { open, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import {
   ShelfWriteCoordinationError,
@@ -30,7 +51,8 @@ import {
   inspectShelfWriteJournal,
   resolveShelfWriteLayout,
   type ShelfQuoteWriteReceipt,
-  type ShelfQuoteWriteRequest
+  type ShelfQuoteWriteRequest,
+  type ShelfWriteLayout
 } from "./shelf-write-coordination.js";
 import {
   acquireShelfMutex,
@@ -38,7 +60,120 @@ import {
   type ShelfMutexScope
 } from "./shelf-native-mutex.js";
 
-export interface AbandonedShelfStateAssessment {
+/**
+ * Name of the durable "a write is in progress" record inside the Shelf's
+ * coordination directory (`<coordination>/shelves/<uuid>/`).
+ *
+ * It lives next to `requests/`, never inside it, so journal enumeration is unchanged.
+ */
+export const SHELF_WRITER_RECOVERY_STATE_FILENAME = "writer-recovery.json";
+
+export interface ShelfWriterRecoveryState {
+  readonly version: 1;
+  readonly state: "write-in-progress";
+  readonly pid: number;
+  readonly requestId: string;
+  readonly startedAt: string;
+}
+
+export interface InspectedShelfWriterRecoveryState {
+  readonly path: string;
+  /** `true` when a write was started and not finished, or the record is unreadable. */
+  readonly pending: boolean;
+  readonly record?: ShelfWriterRecoveryState;
+}
+
+function isMissing(error: unknown): boolean {
+  return error !== null && typeof error === "object" && (error as { code?: unknown }).code === "ENOENT";
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Read the persistent recovery state. Any failure other than "file does not exist"
+ * counts as pending: an unreadable record must never be read as "last write was fine".
+ */
+export async function inspectShelfWriterRecoveryState(
+  coordinationDirectory: string
+): Promise<InspectedShelfWriterRecoveryState> {
+  const file = path.join(coordinationDirectory, SHELF_WRITER_RECOVERY_STATE_FILENAME);
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch (error: unknown) {
+    if (isMissing(error)) return Object.freeze({ path: file, pending: false });
+    return Object.freeze({ path: file, pending: true });
+  }
+  let record: ShelfWriterRecoveryState | undefined;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      (parsed as { version?: unknown }).version === 1 &&
+      (parsed as { state?: unknown }).state === "write-in-progress" &&
+      typeof (parsed as { requestId?: unknown }).requestId === "string"
+    ) {
+      record = Object.freeze(parsed as ShelfWriterRecoveryState);
+    }
+  } catch {
+    // A truncated record still means "a write was in progress". Only its metadata is
+    // lost, and the metadata is diagnostic, never authoritative.
+  }
+  return Object.freeze({ path: file, pending: true, ...(record === undefined ? {} : { record }) });
+}
+
+/**
+ * Durably record that a write is starting.
+ *
+ * The record is synced before the critical section begins, so a crash anywhere after
+ * this point leaves evidence behind even when the mutex object itself is destroyed.
+ */
+export async function writeShelfWriterRecoveryState(options: {
+  readonly coordinationDirectory: string;
+  readonly requestId: string;
+}): Promise<string> {
+  const file = path.join(options.coordinationDirectory, SHELF_WRITER_RECOVERY_STATE_FILENAME);
+  const record: ShelfWriterRecoveryState = Object.freeze({
+    version: 1,
+    state: "write-in-progress",
+    pid: process.pid,
+    requestId: options.requestId,
+    startedAt: new Date().toISOString()
+  });
+  let handle;
+  try {
+    handle = await open(file, "w");
+  } catch (error: unknown) {
+    throw new ShelfWriteCoordinationError(
+      "shelf-write-recovery-state-unavailable",
+      "The Shelf write recovery state could not be recorded.",
+      describe(error)
+    );
+  }
+  try {
+    await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+    await handle.sync();
+  } catch (error: unknown) {
+    throw new ShelfWriteCoordinationError(
+      "shelf-write-recovery-state-unavailable",
+      "The Shelf write recovery state could not be recorded.",
+      describe(error)
+    );
+  } finally {
+    await handle.close();
+  }
+  return file;
+}
+
+/** Remove the recovery record after a completed write, and only then. */
+export async function clearShelfWriterRecoveryState(file: string): Promise<void> {
+  await rm(file, { force: true });
+}
+
+export interface ShelfWriteRecoveryAssessment {
   readonly resumable: boolean;
   /** Requests that were interrupted and will be completed by their own retry. */
   readonly interruptedRequestIds: readonly string[];
@@ -47,20 +182,20 @@ export interface AbandonedShelfStateAssessment {
 }
 
 /**
- * Check whether the shared journal is consistent enough to continue after a writer
- * died. Throws instead of returning `resumable: false`: every outcome here is
+ * Check whether the shared journal is consistent enough to continue after an unclean
+ * write. Throws instead of returning `resumable: false`: every outcome here is
  * fail-closed, so there is nothing a caller could safely do with `false`.
  */
-export async function assessShelfWriteStateAfterAbandon(options: {
+export async function assessShelfWriteRecoveryState(options: {
   readonly shelfRoot: string;
   readonly expectedShelfId: string;
   readonly coordinationRoot: string;
-}): Promise<AbandonedShelfStateAssessment> {
+}): Promise<ShelfWriteRecoveryAssessment> {
   // Re-resolving validates the marker identity, the configured directories, the
   // realpath containment and the dev/ino fingerprints of a live Shelf.
   await resolveShelfWriteLayout(options);
   // Strict journal validation: a malformed, foreign or internally inconsistent
-  // record throws `shelf-write-journal-invalid` here.
+  // record throws `shelf-write-journal-invalid` here. Nothing is repaired.
   const entries = await inspectShelfWriteJournal(options);
 
   const interrupted: string[] = [];
@@ -115,13 +250,59 @@ export async function assessShelfWriteStateAfterAbandon(options: {
   });
 }
 
+export type ShelfWriteRecoveryTrigger = "abandoned" | "pending-write";
+
+export interface ShelfWriteRecoveryInfo {
+  /**
+   * `abandoned`: the mutex reported `WAIT_ABANDONED`.
+   * `pending-write`: no abandonment (the previous mutex object may have been destroyed
+   * with the last participant), but the durable recovery record says a write was in
+   * progress.
+   */
+  readonly trigger: ShelfWriteRecoveryTrigger;
+  readonly lease: ShelfMutexLease;
+}
+
 export interface NativeShelfWriteOptions {
   readonly scope?: ShelfMutexScope;
   readonly acquireTimeoutMs?: number;
   readonly pollIntervalMs?: number;
   readonly now?: () => number;
-  /** Observability hook for tests and diagnostics; runs only after abandonment. */
-  readonly onAbandoned?: (assessment: AbandonedShelfStateAssessment, lease: ShelfMutexLease) => void | Promise<void>;
+  /** Observability hook for tests and diagnostics; runs after a successful assessment. */
+  readonly onRecovery?: (
+    assessment: ShelfWriteRecoveryAssessment,
+    info: ShelfWriteRecoveryInfo
+  ) => void | Promise<void>;
+}
+
+/**
+ * Make sure a recovery record exists before this process gives up.
+ *
+ * An existing record is left exactly as it is: it already protects the next writer, and
+ * overwriting it would erase the only pointer to the interrupted request. Nothing here
+ * repairs or deletes journal records or annotation files.
+ */
+async function ensureRecoveryStateRecorded(
+  layout: ShelfWriteLayout,
+  requestId: string,
+  cause: unknown
+): Promise<never> {
+  const existing = await inspectShelfWriterRecoveryState(layout.coordinationDirectory);
+  if (!existing.pending) {
+    try {
+      await writeShelfWriterRecoveryState({
+        coordinationDirectory: layout.coordinationDirectory,
+        requestId
+      });
+    } catch (error: unknown) {
+      throw new ShelfWriteCoordinationError(
+        "shelf-write-recovery-state-unavailable",
+        "The Shelf needs recovery, and that state could not be recorded durably.",
+        `${describe(cause)}; ${describe(error)}`
+      );
+    }
+  }
+  throw cause;
 }
 
 /**
@@ -145,22 +326,50 @@ export async function commitShelfQuoteWithNativeLock(
 
   let keepHeld = false;
   try {
-    if (lease.abandoned) {
+    const layout = await resolveShelfWriteLayout({
+      shelfRoot: request.shelfRoot,
+      expectedShelfId: request.expectedShelfId,
+      coordinationRoot: request.coordinationRoot
+    });
+    const recovery = await inspectShelfWriterRecoveryState(layout.coordinationDirectory);
+
+    // The recovery record is checked independently of abandonment, because a destroyed
+    // mutex object cannot report that its owner died.
+    if (lease.abandoned || recovery.pending) {
       try {
-        const assessment = await assessShelfWriteStateAfterAbandon({
+        const assessment = await assessShelfWriteRecoveryState({
           shelfRoot: request.shelfRoot,
           expectedShelfId: request.expectedShelfId,
           coordinationRoot: request.coordinationRoot
         });
-        await options.onAbandoned?.(assessment, lease);
+        await options.onRecovery?.(assessment, {
+          trigger: lease.abandoned ? "abandoned" : "pending-write",
+          lease
+        });
       } catch (error: unknown) {
-        // Fail closed and stop the process from writing again. Do not release: the
-        // abandonment signal would be lost and a later writer would skip this check.
+        // Fail closed. The recovery record must outlive this process so the next
+        // writer verifies even when the OS releases the mutex on exit; this process
+        // additionally keeps the lock, so it cannot write again either.
         keepHeld = true;
-        throw error;
+        await ensureRecoveryStateRecorded(layout, request.requestId, error);
       }
     }
-    return await commitShelfQuote({ ...request, externalLock: lease });
+
+    // Record the critical section before the first journal write, so a crash from here
+    // on is visible to the next process even if the mutex object disappears.
+    const recoveryFile = await writeShelfWriterRecoveryState({
+      coordinationDirectory: layout.coordinationDirectory,
+      requestId: request.requestId
+    });
+    try {
+      const receipt = await commitShelfQuote({ ...request, externalLock: lease });
+      // The receipt is durable at this point; only then does the Shelf count as clean.
+      await clearShelfWriterRecoveryState(recoveryFile);
+      return receipt;
+    } catch (error: unknown) {
+      // The record is intentionally kept: the next writer must verify.
+      throw error;
+    }
   } finally {
     if (!keepHeld) lease.release();
   }

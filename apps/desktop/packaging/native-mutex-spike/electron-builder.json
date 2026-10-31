@@ -14,6 +14,10 @@
     {
       "from": "native/shelf-mutex/build/Release/shelf_mutex.node",
       "to": "shelf-mutex/shelf_mutex.node"
+    },
+    {
+      "from": "dist/main/shelf-native-mutex.js",
+      "to": "shelf-mutex/shelf-native-mutex.js"
     }
   ],
   "win": {
