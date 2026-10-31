@@ -1,0 +1,34 @@
+{
+  "appId": "org.maginalia.desktop.native-mutex-spike",
+  "productName": "MAGINALIA Native Mutex Spike",
+  "asar": true,
+  "directories": {
+    "app": "packaging/native-mutex-spike",
+    "output": "release/native-mutex-spike"
+  },
+  "files": [
+    "main.js",
+    "package.json"
+  ],
+  "extraResources": [
+    {
+      "from": "native/shelf-mutex/build/Release/shelf_mutex.node",
+      "to": "shelf-mutex/shelf_mutex.node"
+    }
+  ],
+  "win": {
+    "signAndEditExecutable": false,
+    "target": [
+      {
+        "target": "dir",
+        "arch": [
+          "x64"
+        ]
+      }
+    ]
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false
+  }
+}
