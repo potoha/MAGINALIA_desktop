@@ -53,6 +53,8 @@
     "src/repository-local-history.ts",
     "src/repository-service.ts",
     "src/shelf-write-coordination.ts",
-    "src/shelf-write-core.ts"
+    "src/shelf-write-core.ts",
+    "src/shelf-native-mutex.ts",
+    "src/shelf-native-write-lock.ts"
   ]
 }

@@ -25,6 +25,9 @@
     "test": "vitest run --config vitest.config.mts",
     "test:collector-host": "npm run build:main && vitest run --config vitest.config.mts src/collector-native-host.test.ts && node --test test/collector-native-host.test.mjs",
     "test:collector-shelf-write": "npm run build:main && vitest run --config vitest.config.mts src/shelf-write-coordination.test.ts && node --test test/collector-shelf-write-coordination.test.mjs",
+    "build:native": "node-gyp rebuild --directory=native/shelf-mutex",
+    "test:collector-shelf-native": "npm run build:main && npm run build:native && vitest run --config vitest.config.mts src/shelf-native-mutex.test.ts && node --test test/collector-shelf-native-lock.test.mjs && node --test test/electron-native-lock-smoke.test.mjs",
+    "spike:native-package": "node scripts/spike-native-mutex-package.mjs",
     "smoke": "npm run build && node test/electron-smoke.mjs",
     "smoke:writing": "npm run build && node test/writing-smoke.mjs",
     "smoke:settings": "npm run build && node test/settings-smoke.mjs",
@@ -54,6 +57,7 @@
     "@types/node": "22.20.2",
     "electron": "44.3.0",
     "electron-builder": "^26.15.3",
+    "node-gyp": "12.4.0",
     "typescript": "7.0.2",
     "vite": "8.3.0",
     "vitest": "5.0.0"

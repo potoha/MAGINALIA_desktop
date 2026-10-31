@@ -87,7 +87,8 @@ export type ShelfWriteCoordinationErrorCode =
   | "shelf-write-request-mismatch"
   | "shelf-write-book-conflict"
   | "shelf-write-record-conflict"
-  | "shelf-write-receipt-missing";
+  | "shelf-write-receipt-missing"
+  | "shelf-write-recovery-state-unavailable";
 
 export class ShelfWriteCoordinationError extends Error {
   public constructor(
@@ -939,6 +940,22 @@ export interface ShelfQuoteWriteRequest {
   readonly acquireTimeoutMs?: number;
   readonly now?: () => number;
   readonly faults?: ShelfWriteFaultHooks;
+  /**
+   * Technical-verification seam (Issue #80 / OD-10), not a product option.
+   *
+   * When present, the caller already holds an OS-level cross-process lock (the
+   * Windows named mutex spike) and the file lease is not taken. The writer then
+   * only re-asserts that the supplied lock is still held, so there is exactly one
+   * Shelf writer implementation and no second write path is introduced.
+   *
+   * Leaving this undefined preserves the original behavior byte for byte.
+   */
+  readonly externalLock?: ShelfWriteExternalLock;
+}
+
+/** Minimal view of an externally held cross-process lock. */
+export interface ShelfWriteExternalLock {
+  assertHeld(): Promise<void>;
 }
 
 export interface ShelfQuoteWriteReceipt {
@@ -1072,14 +1089,18 @@ export async function commitShelfQuote(request: ShelfQuoteWriteRequest): Promise
   const requestDigest = digestShelfWriteContent({ ...content, commentField });
   const nowIso = () => new Date(request.now?.() ?? Date.now()).toISOString();
 
-  const lease = await acquireShelfWriteLease({
-    coordinationRoot: request.coordinationRoot,
-    shelfId: layout.shelfId,
-    ...(request.processLabel === undefined ? {} : { processLabel: request.processLabel }),
-    ...(request.leaseTtlMs === undefined ? {} : { leaseTtlMs: request.leaseTtlMs }),
-    ...(request.acquireTimeoutMs === undefined ? {} : { acquireTimeoutMs: request.acquireTimeoutMs }),
-    ...(request.now === undefined ? {} : { now: request.now })
-  });
+  const lease = request.externalLock === undefined
+    ? await acquireShelfWriteLease({
+        coordinationRoot: request.coordinationRoot,
+        shelfId: layout.shelfId,
+        ...(request.processLabel === undefined ? {} : { processLabel: request.processLabel }),
+        ...(request.leaseTtlMs === undefined ? {} : { leaseTtlMs: request.leaseTtlMs }),
+        ...(request.acquireTimeoutMs === undefined ? {} : { acquireTimeoutMs: request.acquireTimeoutMs }),
+        ...(request.now === undefined ? {} : { now: request.now })
+      })
+    : undefined;
+  // The guard is the file lease, or the caller's external OS lock when one is held.
+  const guard: ShelfWriteExternalLock = request.externalLock ?? lease!;
 
   try {
     const journal = await readJournalRecord(layout, request.requestId);
@@ -1192,7 +1213,7 @@ export async function commitShelfQuote(request: ShelfQuoteWriteRequest): Promise
     }
 
     if (!bookReused) {
-      await lease.assertHeld();
+      await guard.assertHeld();
       await assertShelfWriteLayoutCurrent(layout);
       const state = await publishShelfFileNoReplace(
         path.join(layout.booksDirectory, shelfBookFilename(book)),
@@ -1203,7 +1224,7 @@ export async function commitShelfQuote(request: ShelfQuoteWriteRequest): Promise
 
     await request.faults?.beforeAnnotationPublish?.();
 
-    await lease.assertHeld();
+    await guard.assertHeld();
     await assertShelfWriteLayoutCurrent(layout);
     const published = await publishShelfFileNoReplace(
       path.join(layout.annotationsDirectory, shelfRecordFilename(annotationId)),
@@ -1242,7 +1263,7 @@ export async function commitShelfQuote(request: ShelfQuoteWriteRequest): Promise
     });
     return receipt;
   } finally {
-    await lease.release();
+    await lease?.release();
   }
 }
 
