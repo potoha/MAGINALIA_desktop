@@ -1,6 +1,11 @@
-/** Main-process-only, conflict-safe Reviewer -> Private Shelf v0.4 writer. */
-import { createHash, randomUUID } from "node:crypto";
-import { link, lstat, mkdir, readFile, readdir, realpath, unlink, writeFile } from "node:fs/promises";
+/**
+ * Main-process-only, conflict-safe Reviewer -> Private Shelf v0.4 writer.
+ *
+ * The publication primitives (path safety, no-replace writes, Book matching)
+ * are owned by `shelf-write-core`; this module only holds Reviewer policy.
+ */
+import { createHash } from "node:crypto";
+import { readFile, realpath } from "node:fs/promises";
 import * as path from "node:path";
 import type {
   ShelfAnnotation,
@@ -18,6 +23,19 @@ import {
   type ReviewerReconciliationCandidate,
   type ReviewerReconciliationPending
 } from "./reviewer-shelf-reconciliation";
+import {
+  ensureShelfDirectory,
+  isInsideDirectory,
+  listShelfRecordFiles,
+  matchShelfBook,
+  publishShelfFileNoReplace,
+  readExistingShelfBooks,
+  resolveShelfDirectories,
+  serializeShelfRecord,
+  shelfBookFilename,
+  shelfRecordFilename
+} from "./shelf-write-core.js";
+import { acquireShelfWriteLease } from "./shelf-write-coordination.js";
 
 type FormatCore = typeof import("@maginalia/format", { with: { "resolution-mode": "import" } });
 let formatCorePromise: Promise<FormatCore> | undefined;
@@ -45,93 +63,6 @@ interface AliasEntry {
   readonly version?: number;
 }
 
-function inside(root: string, candidate: string): boolean {
-  const relative = path.relative(root, candidate);
-  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
-}
-
-function safeConfiguredDirectory(root: string, value: unknown, fallback: string): string | null {
-  const part = typeof value === "string" ? value : fallback;
-  if (part.length === 0 || part.includes("\0") || path.isAbsolute(part)
-    || /^[A-Za-z]:/u.test(part) || /^(?:[\\/]{1,2})/u.test(part)
-    || /(?:^|[\\/])\.\.(?:[\\/]|$)/u.test(part)) return null;
-  const resolved = path.resolve(root, part);
-  return inside(root, resolved) ? resolved : null;
-}
-
-function isMissingFile(error: unknown): boolean {
-  return error !== null && typeof error === "object" && (error as { code?: unknown }).code === "ENOENT";
-}
-
-function isExists(error: unknown): boolean {
-  return error !== null && typeof error === "object" && (error as { code?: unknown }).code === "EEXIST";
-}
-
-function safeJson(value: unknown): string {
-  return `${JSON.stringify(value, null, 2)}\n`;
-}
-
-async function ensureDirectory(root: string, directory: string): Promise<boolean> {
-  if (!inside(root, directory)) return false;
-  const relative = path.relative(root, directory);
-  let current = root;
-  for (const segment of relative === "" ? [] : relative.split(path.sep)) {
-    current = path.join(current, segment);
-    try { await mkdir(current); } catch (error: unknown) { if (!isExists(error)) return false; }
-    try {
-      const info = await lstat(current);
-      if (!info.isDirectory() || info.isSymbolicLink()) return false;
-      const canonical = await realpath(current);
-      if (!inside(root, canonical)) return false;
-    } catch { return false; }
-  }
-  return true;
-}
-
-async function writeNoReplace(target: string, contents: Uint8Array): Promise<"written" | "same" | "conflict"> {
-  const temporary = `${target}.${randomUUID()}.tmp`;
-  try {
-    await writeFile(temporary, contents, { flag: "wx" });
-    try {
-      await link(temporary, target);
-      return "written";
-    } catch (error: unknown) {
-      if (!isExists(error)) throw error;
-      try {
-        const info = await lstat(target);
-        if (!info.isFile() || info.isSymbolicLink()) return "conflict";
-        const current = await readFile(target);
-        return Buffer.from(current).equals(Buffer.from(contents)) ? "same" : "conflict";
-      } catch { return "conflict"; }
-    }
-  } finally {
-    try { await unlink(temporary); } catch { /* The link is already removed or moved. */ }
-  }
-}
-
-async function listShelfFiles(root: string, directory: string): Promise<string[]> {
-  const output: string[] = [];
-  const pending = [directory];
-  while (pending.length > 0) {
-    const current = pending.pop()!;
-    let entries;
-    try { entries = await readdir(current, { withFileTypes: true }); } catch { continue; }
-    entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
-    for (const entry of entries) {
-      const candidate = path.join(current, entry.name);
-      try {
-        const info = await lstat(candidate);
-        if (info.isSymbolicLink()) continue;
-        const canonical = await realpath(candidate);
-        if (!inside(root, canonical)) continue;
-        if (info.isDirectory()) pending.push(candidate);
-        else if (info.isFile() && [".json", ".yaml", ".yml"].includes(path.extname(entry.name).toLowerCase())) output.push(candidate);
-      } catch { /* Malformed/unreadable Shelf entries remain untouched. */ }
-    }
-  }
-  return output;
-}
-
 function reviewerAlias(annotation: ShelfAnnotation): { readonly annotationId: string; readonly digest: string; readonly version?: number } | undefined {
   const metadata = annotation.deviceMetadata;
   if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) return undefined;
@@ -145,7 +76,7 @@ function reviewerAlias(annotation: ShelfAnnotation): { readonly annotationId: st
 
 async function existingAliases(directory: string, format: FormatCore): Promise<Map<string, AliasEntry[]>> {
   const aliases = new Map<string, AliasEntry[]>();
-  for (const filename of await listShelfFiles(directory, directory)) {
+  for (const filename of await listShelfRecordFiles(directory, directory)) {
     try {
       const validated = format.parseShelfEntity("annotation", await readFile(filename, "utf8"));
       if (!validated.valid) continue;
@@ -157,57 +88,6 @@ async function existingAliases(directory: string, format: FormatCore): Promise<M
     } catch { /* Invalid user data is never adopted or rewritten. */ }
   }
   return aliases;
-}
-
-async function existingBooks(directory: string, format: FormatCore): Promise<ShelfBookV04[]> {
-  const books: ShelfBookV04[] = [];
-  for (const filename of await listShelfFiles(directory, directory)) {
-    try {
-      const validated = format.parseShelfEntity("book", await readFile(filename, "utf8"));
-      if (validated.valid && validated.value.version === "0.4") books.push(validated.value);
-    } catch { /* Unknown or malformed files remain untouched. */ }
-  }
-  return books;
-}
-
-function fileDigests(book: ShelfBookV04): readonly string[] {
-  return Object.freeze((book.source.files ?? []).map((file) => `${file.mediaType}:${file.sha256}`).sort());
-}
-
-function hasLocatorOverlap(candidate: ReviewerReconciliationCandidate, book: ShelfBookV04): boolean {
-  if (candidate.isbn13 !== undefined && candidate.isbn13 === book.isbn13) return true;
-  if (candidate.url !== undefined && candidate.url === book.url) return true;
-  const existingHashes = new Set(fileDigests(book));
-  return candidate.sourceFiles.some((file) => existingHashes.has(`${file.mediaType}:${file.sha256}`));
-}
-
-function booksAreCompatible(candidate: ReviewerReconciliationCandidate, book: ShelfBookV04): boolean {
-  if (candidate.sourceKind !== book.source.kind) return false;
-  if (candidate.isbn13 !== undefined && book.isbn13 !== undefined && candidate.isbn13 !== book.isbn13) return false;
-  if (candidate.url !== undefined && book.url !== undefined && candidate.url !== book.url) return false;
-  const requested = candidate.sourceFiles.map((file) => `${file.mediaType}:${file.sha256}`).sort();
-  const existing = [...fileDigests(book)];
-  if (requested.length > 0 && existing.length > 0 && requested.join("\n") !== existing.join("\n")) return false;
-  if (requested.length > 0 && existing.length === 0) return false;
-  return true;
-}
-
-function matchingBook(
-  candidate: ReviewerReconciliationCandidate,
-  books: readonly ShelfBookV04[]
-): { readonly kind: "new" } | { readonly kind: "match"; readonly book: ShelfBookV04 } | { readonly kind: "conflict" } {
-  const matches: ShelfBookV04[] = [];
-  for (const book of books) {
-    if (!hasLocatorOverlap(candidate, book)) continue;
-    if (!booksAreCompatible(candidate, book)) return { kind: "conflict" };
-    matches.push(book);
-  }
-  if (matches.length > 1) return { kind: "conflict" };
-  return matches.length === 0 ? { kind: "new" } : { kind: "match", book: matches[0] };
-}
-
-function bookFilename(book: ShelfBookV04): string {
-  return `${book.id.replace(":", "-")}.json`;
 }
 
 function sourceFolderKey(candidate: ReviewerReconciliationCandidate): string {
@@ -264,10 +144,10 @@ async function prepareBookAndFiles(
         const relative = shelfRelativePath(existingFile.path);
         if (relative === null) return null;
         const target = path.resolve(root, relative);
-        if (!inside(root, target)) return null;
+        if (!isInsideDirectory(root, target)) return null;
         const directory = path.dirname(target);
-        if (!await ensureDirectory(root, directory)) return null;
-        const state = await writeNoReplace(target, asset.bytes);
+        if (!await ensureShelfDirectory(root, directory)) return null;
+        const state = await publishShelfFileNoReplace(target, asset.bytes);
         if (state === "conflict") return null;
       }
     }
@@ -280,8 +160,8 @@ async function prepareBookAndFiles(
     if (packagePath === null) return null;
     const relative = `sources/${sourceFolderKey(candidate)}/${packagePath}`;
     const target = path.resolve(root, ...relative.split("/"));
-    if (!inside(root, target) || !await ensureDirectory(root, path.dirname(target))) return null;
-    const state = await writeNoReplace(target, asset.bytes);
+    if (!isInsideDirectory(root, target) || !await ensureShelfDirectory(root, path.dirname(target))) return null;
+    const state = await publishShelfFileNoReplace(target, asset.bytes);
     if (state === "conflict") return null;
     shelfFiles.push(Object.freeze({
       path: relative,
@@ -321,23 +201,19 @@ async function materializeUnlocked(
   const format = await loadFormatCore();
   let root: string;
   try { root = await realpath(shelfRoot); } catch { throw new Error("The selected Private Shelf is unavailable."); }
-  let library: unknown;
-  try { library = JSON.parse(await readFile(path.join(root, "library.json"), "utf8")); } catch {
-    throw new Error("The selected Private Shelf has no readable library.json.");
+  const resolution = await resolveShelfDirectories(root);
+  if (resolution.kind !== "ok") {
+    switch (resolution.kind) {
+      case "library-unreadable": throw new Error("The selected Private Shelf has no readable library.json.");
+      case "library-invalid": throw new Error("The selected Private Shelf library is invalid.");
+      case "paths-invalid": throw new Error("The Private Shelf paths are invalid.");
+      case "paths-unsafe": throw new Error("The Private Shelf paths are unavailable or unsafe.");
+    }
   }
-  if (library === null || typeof library !== "object" || Array.isArray(library)) {
-    throw new Error("The selected Private Shelf library is invalid.");
-  }
-  const config = library as { booksPath?: unknown; annotationsPath?: unknown };
-  const booksDirectory = safeConfiguredDirectory(root, config.booksPath, "books");
-  const annotationsDirectory = safeConfiguredDirectory(root, config.annotationsPath, "annotations");
-  if (booksDirectory === null || annotationsDirectory === null) throw new Error("The Private Shelf paths are invalid.");
-  if (!await ensureDirectory(root, booksDirectory) || !await ensureDirectory(root, annotationsDirectory)) {
-    throw new Error("The Private Shelf paths are unavailable or unsafe.");
-  }
+  const { booksDirectory, annotationsDirectory } = resolution.directories;
 
   const aliases = await existingAliases(annotationsDirectory, format);
-  const books = await existingBooks(booksDirectory, format);
+  const books = await readExistingShelfBooks(booksDirectory, format);
   const pending: ReviewerReconciliationPending[] = [];
   let materialized = 0;
   let unchanged = 0;
@@ -374,14 +250,14 @@ async function materializeUnlocked(
       continue;
     }
 
-    const match = matchingBook(candidate, books);
+    const match = matchShelfBook(candidate, books);
     if (match.kind === "conflict") { conflicts += 1; continue; }
     const prepared = await prepareBookAndFiles(root, candidate, match.kind === "match" ? match.book : undefined, format);
     if (prepared === null) { conflicts += 1; continue; }
 
     if (match.kind === "new") {
-      const target = path.join(booksDirectory, bookFilename(prepared.book));
-      const state = await writeNoReplace(target, Buffer.from(safeJson(prepared.book), "utf8"));
+      const target = path.join(booksDirectory, shelfBookFilename(prepared.book));
+      const state = await publishShelfFileNoReplace(target, Buffer.from(serializeShelfRecord(prepared.book), "utf8"));
       if (state === "conflict") { conflicts += 1; continue; }
       books.push(prepared.book);
     }
@@ -392,8 +268,8 @@ async function materializeUnlocked(
       prepared.files
     );
     if (output.kind === "pending") { pending.push(output); continue; }
-    const annotationTarget = path.join(annotationsDirectory, `${output.annotation.id.replace(":", "-")}.json`);
-    const state = await writeNoReplace(annotationTarget, Buffer.from(safeJson(output.annotation), "utf8"));
+    const annotationTarget = path.join(annotationsDirectory, shelfRecordFilename(output.annotation.id));
+    const state = await publishShelfFileNoReplace(annotationTarget, Buffer.from(serializeShelfRecord(output.annotation), "utf8"));
     if (state === "conflict") { conflicts += 1; continue; }
     const entries = aliases.get(candidate.reviewerAnnotationId) ?? [];
     entries.push({ digest: candidate.digest });
@@ -408,12 +284,42 @@ async function materializeUnlocked(
 // retry and an approval-triggered retry cannot create duplicate aliases.
 let writeQueue: Promise<void> = Promise.resolve();
 
+/**
+ * Opt-in cross-process exclusion for the Desktop writer.
+ *
+ * The process-local queue above only protects this process. A Collector Native
+ * Messaging Host writing to the same configured Shelf needs the Shelf-scoped
+ * lease from the shared coordination layer. Passing this option is what makes the
+ * Desktop writer and the Host mutually exclusive; omitting it preserves today's
+ * behavior exactly. Enablement is an owner decision, not implied by this type.
+ */
+export interface ReviewerShelfWriteCoordination {
+  readonly coordinationRoot: string;
+  /** Stable Shelf UUID from the folder marker (D068). */
+  readonly shelfId: string;
+  readonly acquireTimeoutMs?: number;
+}
+
 export function materializeReviewerRecords(
   shelfRoot: string,
   records: readonly ApprovedReviewerRecord[],
-  lookupMetadata: ReviewerShelfMetadataLookup
+  lookupMetadata: ReviewerShelfMetadataLookup,
+  coordination?: ReviewerShelfWriteCoordination
 ): Promise<MaterializationResult> {
-  const result = writeQueue.then(() => materializeUnlocked(shelfRoot, records, lookupMetadata));
+  const result = writeQueue.then(async () => {
+    if (coordination === undefined) return materializeUnlocked(shelfRoot, records, lookupMetadata);
+    const lease = await acquireShelfWriteLease({
+      coordinationRoot: coordination.coordinationRoot,
+      shelfId: coordination.shelfId,
+      processLabel: "desktop-main",
+      ...(coordination.acquireTimeoutMs === undefined ? {} : { acquireTimeoutMs: coordination.acquireTimeoutMs })
+    });
+    try {
+      return await materializeUnlocked(shelfRoot, records, lookupMetadata);
+    } finally {
+      await lease.release();
+    }
+  });
   writeQueue = result.then(() => undefined, () => undefined);
   return result;
 }
