@@ -17,7 +17,7 @@
 const { app } = require("electron");
 const { spawn } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
-const { writeFileSync } = require("node:fs");
+const { mkdirSync, writeFileSync } = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
@@ -26,6 +26,12 @@ const workerPath = process.env.MAGINALIA_NATIVE_WORKER;
 const nodeBinary = process.env.MAGINALIA_NATIVE_NODE;
 const shelfId = process.env.MAGINALIA_NATIVE_SHELF_ID;
 const resultPath = process.env.MAGINALIA_NATIVE_RESULT;
+const userDataPath = process.env.MAGINALIA_NATIVE_USER_DATA;
+if (!userDataPath || !path.isAbsolute(userDataPath)) {
+  throw new Error("An isolated absolute Electron userData path is required for this smoke test.");
+}
+mkdirSync(userDataPath, { recursive: true });
+app.setPath("userData", userDataPath);
 
 const result = {
   electron: process.versions.electron,
@@ -82,6 +88,9 @@ function runWorker(command) {
 async function main() {
   const addon = require(addonPath);
   result.apiVersion = addon.apiVersion;
+  result.localAppDataPathType = typeof addon.getLocalAppDataPath();
+  // Test-only fixture helpers must never be exported by the product build.
+  result.testFixtureExports = Object.getOwnPropertyNames(addon).filter((name) => /Fixture|Test/u.test(name));
   const name = `Local\\MAGINALIA.ShelfWrite.${shelfId}`;
   const handle = addon.createMutex(name);
 

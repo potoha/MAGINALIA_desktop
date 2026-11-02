@@ -48,7 +48,8 @@ test("Electron loads the mutex addon and excludes a separate process", async () 
         MAGINALIA_NATIVE_WORKER: workerScript,
         MAGINALIA_NATIVE_NODE: process.execPath,
         MAGINALIA_NATIVE_SHELF_ID: randomUUID(),
-        MAGINALIA_NATIVE_RESULT: resultFile
+        MAGINALIA_NATIVE_RESULT: resultFile,
+        MAGINALIA_NATIVE_USER_DATA: path.join(directory, "electron-user-data")
       })
     });
     const stderr = [];
@@ -63,6 +64,8 @@ test("Electron loads the mutex addon and excludes a separate process", async () 
     assert.equal(result.ok, true, text);
     assert.match(result.electron, /^4[0-9]\./u, "a real Electron runtime must report its version");
     assert.equal(result.apiVersion, 1);
+    assert.equal(result.localAppDataPathType, "string");
+    assert.deepEqual(result.testFixtureExports, []);
     assert.equal(result.firstAcquire.acquired, true);
     assert.equal(result.firstAcquire.abandoned, false);
     // A second process cannot take the lock while Electron holds it.

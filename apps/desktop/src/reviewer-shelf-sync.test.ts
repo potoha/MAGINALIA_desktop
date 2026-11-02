@@ -125,6 +125,58 @@ describe("Reviewer to Private Shelf sync adapter", () => {
     expect(materialize).toHaveBeenCalledTimes(1);
   });
 
+  it("passes the trusted stable binding into the shared Reviewer materializer", async () => {
+    const root = await createShelf();
+    const coordination = {
+      expectedShelfId: "11111111-2222-4333-8444-555555555555",
+      coordinationRoot: "C:\\Users\\Researcher\\AppData\\Local\\MAGINALIA\\coordination",
+    };
+    const materialize = vi.fn(async () => fakeMaterialization({ materialized: 1 }));
+    const getWriteCoordination = vi.fn(async () => coordination);
+    const sync = createReviewerShelfSyncAdapter({
+      ...adapterOptions([page([reviewerRow("annotation-1", "日本語の引用")], 1, 0, 2)]),
+      materialize,
+      getWriteCoordination,
+    });
+
+    await expect(sync(root)).resolves.toMatchObject({ kind: "completed", materialized: 1 });
+    expect(getWriteCoordination).toHaveBeenCalledWith(root);
+    expect(materialize).toHaveBeenCalledWith(root, expect.any(Array), expect.any(Function), coordination);
+  });
+
+  it("does not fall back to the legacy writer when stable binding resolution fails", async () => {
+    const root = await createShelf();
+    const materialize = vi.fn(async () => fakeMaterialization());
+    const sync = createReviewerShelfSyncAdapter({
+      ...adapterOptions([page([reviewerRow("annotation-1", "日本語の引用")], 1, 0, 2)]),
+      materialize,
+      getWriteCoordination: async () => { throw new Error("Shelf binding confirmation was declined."); },
+    });
+
+    await expect(sync(root)).resolves.toMatchObject({
+      kind: "error",
+      error: { code: "reviewer-error", message: "Shelf binding confirmation was declined." },
+    });
+    expect(materialize).not.toHaveBeenCalled();
+  });
+
+  it("does not request a Shelf binding when Reviewer has no approved records", async () => {
+    const root = await createShelf();
+    const getWriteCoordination = vi.fn(async () => {
+      throw new Error("binding is unnecessary for an empty result");
+    });
+    const materialize = vi.fn(async () => fakeMaterialization());
+    const sync = createReviewerShelfSyncAdapter({
+      ...adapterOptions([page([], 0, 0, 2)]),
+      getWriteCoordination,
+      materialize,
+    });
+
+    await expect(sync(root)).resolves.toMatchObject({ kind: "completed", materialized: 0 });
+    expect(getWriteCoordination).not.toHaveBeenCalled();
+    expect(materialize).toHaveBeenCalledWith(root, [], expect.any(Function), undefined);
+  });
+
   it.each([
     {
       label: "a changing total",
