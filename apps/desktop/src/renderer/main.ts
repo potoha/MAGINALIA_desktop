@@ -69,6 +69,12 @@ import {
   type ProjectSearchState,
   type UnifiedSearchMode
 } from "./unified-search";
+import {
+  createShelfSourceUrlElement,
+  DEFAULT_CANONICAL_SHELF_SEARCH_FIELDS,
+  filterCanonicalShelfResults,
+  type CanonicalShelfSearchField
+} from "./shelf-search-view";
 import type { DocumentSessionChange } from "./document-sessions";
 import type { ExplorerEntry } from "../document-workspace";
 import type { WorkspaceState } from "../workspace-state-ipc";
@@ -310,6 +316,7 @@ app.innerHTML = `
               <label><input type="checkbox" data-shelf-search-field="title" checked> 書名</label>
               <label><input type="checkbox" data-shelf-search-field="authors" checked> 著者</label>
               <label><input type="checkbox" data-shelf-search-field="page" checked> ページ</label>
+              <label><input type="checkbox" data-shelf-search-field="url" checked> URL</label>
             </fieldset>
             <p id="unified-search-status" class="unified-search-status" role="status" aria-live="polite"></p>
             <section id="project-search-panel" class="project-search-panel" aria-label="Project search results" hidden>
@@ -755,9 +762,7 @@ const repositoryHistoryStatus = requiredElement<HTMLElement>("#repository-histor
 const repositoryHistoryError = requiredElement<HTMLElement>("#repository-history-error");
 
 let unifiedSearchMode: UnifiedSearchMode = "all";
-type ShelfSearchField = "quote" | "privateMemo" | "title" | "authors" | "page";
-const SHELF_SEARCH_FIELDS: readonly ShelfSearchField[] = ["quote", "privateMemo", "title", "authors", "page"];
-let shelfSearchFields = new Set<ShelfSearchField>(SHELF_SEARCH_FIELDS);
+let shelfSearchFields = new Set<CanonicalShelfSearchField>(DEFAULT_CANONICAL_SHELF_SEARCH_FIELDS);
 let selectedProjectSearchText: string | null = null;
 let projectSearchInsertionTarget: CapturedInsertionTarget | null = null;
 
@@ -3505,16 +3510,7 @@ const repositoryView: RepositoryControllerView = {
 };
 
 function filteredCanonicalShelfResults(state: ShelfViewState): readonly ShelfViewState["results"][number][] {
-  if (shelfSearchFields.size === 0) return [];
-  const query = normalizeSearchText(state.query);
-  if (query.length === 0) return state.results;
-  return state.results.filter((reference) => (
-    (shelfSearchFields.has("quote") && normalizeSearchText(reference.quote).includes(query))
-    || (shelfSearchFields.has("privateMemo") && normalizeSearchText(reference.privateMemo ?? "").includes(query))
-    || (shelfSearchFields.has("title") && normalizeSearchText(reference.title).includes(query))
-    || (shelfSearchFields.has("authors") && reference.authors.some((author) => normalizeSearchText(author).includes(query)))
-    || (shelfSearchFields.has("page") && reference.page !== undefined && normalizeSearchText(String(reference.page)).includes(query))
-  ));
+  return filterCanonicalShelfResults(state.results, state.query, shelfSearchFields);
 }
 
 function shelfFilterError(): string | null {
@@ -3562,6 +3558,8 @@ function renderShelfState(state: ShelfViewState): void {
       reference.page === undefined ? "" : `p. ${reference.page}`
     ].filter((part) => part.length > 0).join(" / ");
     details.append(metadata);
+    const sourceUrl = createShelfSourceUrlElement(reference.url, document);
+    if (sourceUrl !== null) details.append(sourceUrl);
     if (reference.privateMemo !== undefined && reference.privateMemo.length > 0) {
       const comment = document.createElement("span");
       comment.className = "shelf-private-memo";
@@ -4437,7 +4435,7 @@ for (const button of unifiedSearchModeButtons) {
 for (const input of shelfSearchFieldInputs) {
   input.addEventListener("change", () => {
     const field = input.dataset.shelfSearchField;
-    if (field !== "quote" && field !== "privateMemo" && field !== "title" && field !== "authors" && field !== "page") return;
+    if (field !== "quote" && field !== "privateMemo" && field !== "title" && field !== "authors" && field !== "page" && field !== "url") return;
     if (input.checked) shelfSearchFields.add(field);
     else shelfSearchFields.delete(field);
     if (shelfController) renderShelfState(shelfController.getState());

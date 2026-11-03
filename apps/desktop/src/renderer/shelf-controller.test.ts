@@ -17,7 +17,8 @@ const quotation: CanonicalShelfSearchReference = {
   privateMemo: "研究メモ",
   title: "検索の本",
   authors: ["山田太郎"],
-  page: 42
+  page: 42,
+  url: "https://example.test/research-source"
 };
 
 class FakeView implements ShelfControllerView {
