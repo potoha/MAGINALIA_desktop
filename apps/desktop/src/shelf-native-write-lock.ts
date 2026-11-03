@@ -4,7 +4,7 @@
  * A mutex protects the critical section; it says nothing about whether the bytes on
  * disk are sane. A writer can die in two different ways, and both must be handled:
  *
- * 1. **Another participant is alive** (Desktop Reviewer or a future Host). The mutex
+ * 1. **Another participant is alive** (Desktop Reviewer or the isolated test Host). The mutex
  *    object survives, so the next writer receives `WAIT_ABANDONED`.
  * 2. **No participant is alive** (Desktop closed, the Host is the only process and is
  *    killed). The last handle dies with it, the mutex object is destroyed, and the
@@ -54,8 +54,8 @@
  *   the marker is published happens before the first journal write, so treating it as
  *   clean is correct.
  *
- * The Desktop Reviewer path uses this wrapper now. Host saving remains disabled,
- * but a future Host writer must use the same mutex, marker and journal semantics.
+ * The Desktop Reviewer path uses this wrapper now. The Native Host may invoke it
+ * only from its isolated test-only E2E mode; normal Host save remains disabled.
  * Host v1 journal records remain readable alongside the Reviewer v2 extension.
  */
 import { randomUUID } from "node:crypto";
@@ -521,8 +521,8 @@ export async function withNativeShelfWriteSection<T>(
 /**
  * Commit one web quote under the OS mutex instead of the file lease.
  *
- * Host save remains disabled. This wrapper preserves the existing shared v1 writer
- * and remains available to the future Host-equivalent process test.
+ * Production Host save remains disabled. The isolated E2E Host is the only Host
+ * caller and uses this wrapper to preserve the common v1 writer.
  */
 export async function commitShelfQuoteWithNativeLock(
   request: ShelfQuoteWriteRequest,
@@ -582,7 +582,7 @@ export async function commitShelfQuoteWithNativeLock(
 
 /**
  * Commit a planned Reviewer record transaction under the same native critical
- * section and persistent recovery marker used by the future Host writer.
+ * section and persistent recovery marker used by the isolated test Host.
  */
 export async function commitShelfRecordTransactionWithNativeLock(
   request: Omit<ShelfRecordWriteTransactionRequest, "externalLock" | "beforeMutation" | "afterReceipt">,
