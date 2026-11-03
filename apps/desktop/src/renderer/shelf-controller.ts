@@ -64,6 +64,7 @@ function copyReference(reference: CanonicalShelfSearchReference): CanonicalShelf
     title: string;
     authors: readonly string[];
     page?: number;
+    url?: string;
   } = {
     annotationId: reference.annotationId,
     sourceId: reference.sourceId,
@@ -73,6 +74,7 @@ function copyReference(reference: CanonicalShelfSearchReference): CanonicalShelf
   };
   if (reference.privateMemo !== undefined) copy.privateMemo = reference.privateMemo;
   if (reference.page !== undefined) copy.page = reference.page;
+  if (reference.url !== undefined) copy.url = reference.url;
   return Object.freeze(copy);
 }
 

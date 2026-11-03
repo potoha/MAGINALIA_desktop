@@ -1063,6 +1063,12 @@ button:disabled {
   font-size: 0.8rem;
 }
 
+.library-reference .shelf-source-url {
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
+
 .library-result-actions {
   flex: 0 0 auto;
 }

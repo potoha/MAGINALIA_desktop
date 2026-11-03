@@ -79,6 +79,7 @@ describe("canonical Private Shelf IPC", () => {
         title: "Title",
         authors: ["Author"],
         page: 7,
+        url: "https://example.test/annotation-source",
         captureId: "raw reviewer field must not cross IPC",
       } as unknown as {
         annotationId: string;
@@ -88,6 +89,7 @@ describe("canonical Private Shelf IPC", () => {
         title: string;
         authors: readonly string[];
         page?: number;
+        url?: string;
       }],
       entities: { annotations: [], books: [] },
     }));
@@ -100,12 +102,14 @@ describe("canonical Private Shelf IPC", () => {
         title: "Title",
         authors: ["Author"],
         page: 7,
+        url: "https://example.test/annotation-source",
       } as unknown as {
         annotationId: string;
         sourceId: string;
         title: string;
         authors: readonly string[];
         page?: number;
+        url?: string;
       }],
       query,
     }));
@@ -125,6 +129,7 @@ describe("canonical Private Shelf IPC", () => {
         title: "Title",
         authors: ["Author"],
         page: 7,
+        url: "https://example.test/annotation-source",
       }],
       total: 1,
     });
