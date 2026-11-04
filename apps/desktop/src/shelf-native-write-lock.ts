@@ -18,8 +18,10 @@
  *
  * - record absent  → the previous native-lock write (if any) finished; no journal scan
  *   is needed, so the normal path stays O(1);
- * - record present → a write was in flight and did not finish, **whatever the mutex
- *   says**, so the journal is verified before anything is written;
+ * - a valid record present → a write was in flight and did not finish, **whatever the
+ *   mutex says**, so the journal is verified before anything is written;
+ * - a malformed, empty, unreadable or non-regular marker → preserve it and fail closed
+ *   for new writes; a clean journal cannot explain invalid marker evidence;
  * - `WAIT_ABANDONED` → verify the journal even when the record is absent.
  *
  * Verification on recovery (`assessShelfWriteRecoveryState`) is read-only and fails
@@ -94,12 +96,12 @@ export interface ShelfWriterRecoveryState {
   readonly startedAt: string;
 }
 
-export interface InspectedShelfWriterRecoveryState {
-  readonly path: string;
-  /** `true` when a write was started and not finished, or the record is unreadable. */
-  readonly pending: boolean;
-  readonly record?: ShelfWriterRecoveryState;
-}
+export type InspectedShelfWriterRecoveryState =
+  | { readonly path: string; readonly pending: false; readonly record?: never }
+  | { readonly path: string; readonly pending: true; readonly record: ShelfWriterRecoveryState };
+
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/u;
+const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 
 function isMissing(error: unknown): boolean {
   return error !== null && typeof error === "object" && (error as { code?: unknown }).code === "ENOENT";
@@ -111,6 +113,14 @@ function describe(error: unknown): string {
 
 function recoveryStateUnavailable(message: string, detail: string): ShelfWriteCoordinationError {
   return new ShelfWriteCoordinationError("shelf-write-recovery-state-unavailable", message, detail);
+}
+
+function recoveryStateInvalid(file: string, detail: string): ShelfWriteCoordinationError {
+  return new ShelfWriteCoordinationError(
+    "shelf-write-recovery-state-invalid",
+    "The Shelf write recovery marker is malformed; preserving it and refusing new writes.",
+    `${file}: ${detail}`
+  );
 }
 
 interface MarkerPathInspection {
@@ -147,45 +157,62 @@ async function inspectMarkerPath(file: string): Promise<MarkerPathInspection> {
 /**
  * Read the persistent recovery state.
  *
- * Any failure other than "file does not exist" counts as pending: an unreadable record
- * must never be read as "last write was fine". A non-regular entry at the marker path
- * fails closed instead of being followed.
+ * Only a genuinely absent marker is a clean state. Existing content must be a valid
+ * versioned record; malformed or unreadable evidence throws before recovery can clear or
+ * replace it. A non-regular entry fails closed instead of being followed.
  */
 export async function inspectShelfWriterRecoveryState(
   coordinationDirectory: string
 ): Promise<InspectedShelfWriterRecoveryState> {
-  const file = path.join(coordinationDirectory, SHELF_WRITER_RECOVERY_STATE_FILENAME);
+  return inspectRecoveryMarkerFile(path.join(coordinationDirectory, SHELF_WRITER_RECOVERY_STATE_FILENAME));
+}
+
+async function inspectRecoveryMarkerFile(file: string): Promise<InspectedShelfWriterRecoveryState> {
   const entry = await inspectMarkerPath(file);
   if (entry.kind === "absent") return Object.freeze({ path: file, pending: false });
   let bytes: Buffer;
   try {
     bytes = await readFile(file);
   } catch (error: unknown) {
-    // Removed between the check and the read: still "no evidence", like the check.
-    if (isMissing(error)) return Object.freeze({ path: file, pending: false });
-    return Object.freeze({ path: file, pending: true });
+    const reason = isMissing(error)
+      ? "The marker disappeared while it was being read."
+      : describe(error);
+    throw recoveryStateUnavailable("The Shelf write recovery marker cannot be read safely.", `${file}: ${reason}`);
   }
   return parseShelfWriterRecoveryBytes(file, bytes);
 }
 
-function parseShelfWriterRecoveryBytes(file: string, bytes: Uint8Array): InspectedShelfWriterRecoveryState {
-  let record: ShelfWriterRecoveryState | undefined;
+function parseShelfWriterRecoveryBytes(file: string, bytes: Uint8Array): Extract<InspectedShelfWriterRecoveryState, { pending: true }> {
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown;
-    if (
-      parsed !== null &&
-      typeof parsed === "object" &&
-      (parsed as { version?: unknown }).version === 1 &&
-      (parsed as { state?: unknown }).state === "write-in-progress" &&
-      typeof (parsed as { requestId?: unknown }).requestId === "string"
-    ) {
-      record = Object.freeze(parsed as ShelfWriterRecoveryState);
-    }
+    parsed = JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown;
   } catch {
-    // A truncated record still means "a write was in progress". Only its metadata is
-    // lost, and the metadata is diagnostic, never authoritative.
+    throw recoveryStateInvalid(file, "The marker is not valid JSON.");
   }
-  return Object.freeze({ path: file, pending: true, ...(record === undefined ? {} : { record }) });
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw recoveryStateInvalid(file, "The marker must be a JSON object.");
+  }
+  const value = parsed as Record<string, unknown>;
+  if (value.version !== 1
+    || value.state !== "write-in-progress"
+    || !Number.isSafeInteger(value.pid)
+    || (value.pid as number) < 1
+    || typeof value.requestId !== "string"
+    || !REQUEST_ID_PATTERN.test(value.requestId)
+    || typeof value.startedAt !== "string"
+    || !ISO_TIMESTAMP_PATTERN.test(value.startedAt)
+    || !Number.isFinite(Date.parse(value.startedAt))
+    || new Date(value.startedAt).toISOString() !== value.startedAt) {
+    throw recoveryStateInvalid(file, "The marker does not match the version 1 in-progress schema.");
+  }
+  const record: ShelfWriterRecoveryState = Object.freeze({
+    version: 1,
+    state: "write-in-progress",
+    pid: value.pid as number,
+    requestId: value.requestId,
+    startedAt: value.startedAt
+  });
+  return Object.freeze({ path: file, pending: true, record });
 }
 
 /**
@@ -213,8 +240,9 @@ export async function writeShelfWriterRecoveryState(options: {
     requestId: options.requestId,
     startedAt: new Date().toISOString()
   });
-  // Refuse a planted link, junction or directory before creating anything.
-  await inspectMarkerPath(file);
+  // A valid prior marker may be updated only after the caller's recovery assessment.
+  // Malformed or unreadable evidence is never replaced just because a journal scan is clean.
+  await inspectRecoveryMarkerFile(file);
 
   const temporary = path.join(
     directory,
@@ -228,9 +256,9 @@ export async function writeShelfWriterRecoveryState(options: {
     } finally {
       await handle.close();
     }
-    // Re-check immediately before the atomic replace: an entry that appeared in the
-    // meantime must not be replaced silently.
-    await inspectMarkerPath(file);
+    // Re-read immediately before the atomic replace so a malformed marker that appeared
+    // during staging is not overwritten.
+    await inspectRecoveryMarkerFile(file);
     await rename(temporary, file);
   } catch (error: unknown) {
     await unlink(temporary).catch(() => {});
@@ -250,8 +278,8 @@ export async function writeShelfWriterRecoveryState(options: {
  * cannot delete a link target or a directory.
  */
 export async function clearShelfWriterRecoveryState(file: string): Promise<void> {
-  const entry = await inspectMarkerPath(file);
-  if (entry.kind === "absent") return;
+  const marker = await inspectRecoveryMarkerFile(file);
+  if (!marker.pending) return;
   try {
     await unlink(file);
   } catch (error: unknown) {

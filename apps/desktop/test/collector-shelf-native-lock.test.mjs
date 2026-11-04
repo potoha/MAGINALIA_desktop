@@ -24,7 +24,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -944,6 +944,168 @@ test("a malformed journal is refused even though the mutex was newly created", a
     assert.equal((await readdir(coordinationDirectory(fixture))).includes("writer-recovery.json"), true);
   } finally {
     await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("the test Host refuses a malformed recovery marker beside a valid committed journal", async () => {
+  const fixture = await createShelfFixture("native-host-malformed-marker");
+  try {
+    const existing = await runWorker(baseCommand(fixture, {
+      quote: "既存の確定済みHost引用。",
+      url: "https://example.test/host-existing"
+    }));
+    assert.equal(existing.code, 0, `${JSON.stringify(existing.result)} ${existing.stderr}`);
+    const bookFile = path.join(fixture.booksDirectory, (await readdir(fixture.booksDirectory))[0]);
+    const annotationFile = path.join(fixture.annotationsDirectory, (await readdir(fixture.annotationsDirectory))[0]);
+    const bookHash = createHash("sha256").update(await readFile(bookFile)).digest("hex");
+    const annotationHash = createHash("sha256").update(await readFile(annotationFile)).digest("hex");
+    const priorJournalFiles = await readdir(journalDirectory(fixture));
+    assert.equal(priorJournalFiles.length, 1);
+    const marker = path.join(coordinationDirectory(fixture), "writer-recovery.json");
+    const markerBytes = "{\"version\": 1,";
+    await writeFile(marker, markerBytes, "utf8");
+
+    const rejected = await runWorker(baseCommand(fixture, {
+      quote: "拒否されるHost引用。",
+      url: "https://example.test/host-rejected"
+    }));
+    assert.equal(rejected.code, 3, `${JSON.stringify(rejected.result)} ${rejected.stderr}`);
+    assert.equal(rejected.result.code, "shelf-write-recovery-state-invalid");
+    assert.equal(await readFile(marker, "utf8"), markerBytes);
+    assert.equal(createHash("sha256").update(await readFile(bookFile)).digest("hex"), bookHash);
+    assert.equal(createHash("sha256").update(await readFile(annotationFile)).digest("hex"), annotationHash);
+    assert.deepEqual(await readdir(journalDirectory(fixture)), priorJournalFiles);
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 1);
+  } finally {
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("the Reviewer writer refuses an empty recovery marker beside a valid committed journal", async () => {
+  const fixture = await createShelfFixture("native-reviewer-empty-marker");
+  try {
+    const existing = await runWorker(baseCommand(fixture, {
+      quote: "既存の確定済みReviewerテスト用引用。",
+      url: "https://example.test/reviewer-existing"
+    }));
+    assert.equal(existing.code, 0, `${JSON.stringify(existing.result)} ${existing.stderr}`);
+    const bookFile = path.join(fixture.booksDirectory, (await readdir(fixture.booksDirectory))[0]);
+    const annotationFile = path.join(fixture.annotationsDirectory, (await readdir(fixture.annotationsDirectory))[0]);
+    const bookHash = createHash("sha256").update(await readFile(bookFile)).digest("hex");
+    const annotationHash = createHash("sha256").update(await readFile(annotationFile)).digest("hex");
+    const priorJournalFiles = await readdir(journalDirectory(fixture));
+    assert.equal(priorJournalFiles.length, 1);
+    const marker = path.join(coordinationDirectory(fixture), "writer-recovery.json");
+    await writeFile(marker, "", "utf8");
+
+    const rejected = await runWorker({
+      mode: "reviewer",
+      shelfRoot: fixture.shelfRoot,
+      expectedShelfId: fixture.shelfId,
+      coordinationRoot: fixture.coordinationRoot,
+      acquireTimeoutMs: 30_000,
+      reviewerRecord: { annotationId: "123e4567-e89b-42d3-a456-426614174190" }
+    });
+    assert.equal(rejected.code, 3, `${JSON.stringify(rejected.result)} ${rejected.stderr}`);
+    assert.equal(rejected.result.code, "shelf-write-recovery-state-invalid");
+    assert.equal(await readFile(marker, "utf8"), "");
+    assert.equal(createHash("sha256").update(await readFile(bookFile)).digest("hex"), bookHash);
+    assert.equal(createHash("sha256").update(await readFile(annotationFile)).digest("hex"), annotationHash);
+    assert.deepEqual(await readdir(journalDirectory(fixture)), priorJournalFiles);
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 1);
+  } finally {
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("an unreadable recovery marker blocks Reviewer and test Host without changing evidence", async (t) => {
+  const fixture = await createShelfFixture("native-unreadable-marker");
+  let marker;
+  let identity;
+  let bookFile;
+  let annotationFile;
+  let bookHash;
+  let annotationHash;
+  let denyApplied = false;
+  const markerBytes = `${JSON.stringify({
+    version: 1,
+    state: "write-in-progress",
+    pid: 4242,
+    requestId: "req-unreadable-marker",
+    startedAt: new Date().toISOString()
+  })}\n`;
+  try {
+    const existing = await runWorker(baseCommand(fixture, {
+      quote: "既存の確定済み引用。",
+      url: "https://example.test/unreadable-existing"
+    }));
+    assert.equal(existing.code, 0, `${JSON.stringify(existing.result)} ${existing.stderr}`);
+    bookFile = path.join(fixture.booksDirectory, (await readdir(fixture.booksDirectory))[0]);
+    annotationFile = path.join(fixture.annotationsDirectory, (await readdir(fixture.annotationsDirectory))[0]);
+    bookHash = createHash("sha256").update(await readFile(bookFile)).digest("hex");
+    annotationHash = createHash("sha256").update(await readFile(annotationFile)).digest("hex");
+    const priorJournalFiles = await readdir(journalDirectory(fixture));
+    assert.equal(priorJournalFiles.length, 1);
+    marker = path.join(coordinationDirectory(fixture), "writer-recovery.json");
+    await writeFile(marker, markerBytes, "utf8");
+
+    if (process.platform !== "win32") {
+      t.skip("Unreadable-file ACL behavior is verified only on Windows.");
+      return;
+    }
+    try {
+      identity = execFileSync("whoami", [], { encoding: "utf8", windowsHide: true }).trim();
+      denyApplied = true;
+      execFileSync("icacls", [marker, "/deny", `${identity}:(R)`], { stdio: "ignore", windowsHide: true });
+    } catch (error) {
+      t.skip(`This Windows account could not apply a temporary read-deny ACL: ${String(error)}`);
+      return;
+    }
+    const remainedReadable = await readFile(marker).then(() => true, () => false);
+    if (remainedReadable) {
+      t.skip("The current Windows token can still read the temporary ACL-protected marker.");
+      return;
+    }
+
+    const rejectedHost = await runWorker(baseCommand(fixture, {
+      quote: "拒否されるHost引用。",
+      url: "https://example.test/unreadable-host-rejected"
+    }));
+    assert.equal(rejectedHost.code, 3, `${JSON.stringify(rejectedHost.result)} ${rejectedHost.stderr}`);
+    assert.equal(rejectedHost.result.code, "shelf-write-recovery-state-unavailable");
+    const rejectedReviewer = await runWorker({
+      mode: "reviewer",
+      shelfRoot: fixture.shelfRoot,
+      expectedShelfId: fixture.shelfId,
+      coordinationRoot: fixture.coordinationRoot,
+      acquireTimeoutMs: 30_000,
+      reviewerRecord: { annotationId: "123e4567-e89b-42d3-a456-426614174191" }
+    });
+    assert.equal(rejectedReviewer.code, 3, `${JSON.stringify(rejectedReviewer.result)} ${rejectedReviewer.stderr}`);
+    assert.equal(rejectedReviewer.result.code, "shelf-write-recovery-state-unavailable");
+
+    assert.deepEqual(await readdir(journalDirectory(fixture)), priorJournalFiles);
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 1);
+  } finally {
+    try {
+      if (denyApplied && marker && identity) {
+        try {
+          execFileSync("icacls", [marker, "/remove:d", identity], { stdio: "ignore", windowsHide: true });
+        } catch {
+          execFileSync("icacls", [marker, "/reset"], { stdio: "ignore", windowsHide: true });
+        }
+      }
+      if (marker) assert.equal(await readFile(marker, "utf8"), markerBytes);
+      if (bookFile && annotationFile && bookHash && annotationHash) {
+        assert.equal(createHash("sha256").update(await readFile(bookFile)).digest("hex"), bookHash);
+        assert.equal(createHash("sha256").update(await readFile(annotationFile)).digest("hex"), annotationHash);
+      }
+    } finally {
+      await rm(fixture.base, { recursive: true, force: true });
+    }
   }
 });
 
