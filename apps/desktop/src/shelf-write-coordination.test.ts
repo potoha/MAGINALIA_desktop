@@ -349,65 +349,6 @@ describe("shelf write layout", () => {
   });
 });
 
-describe("desktop writer under the shared lease", () => {
-  function approvedRecord(): Parameters<typeof materializeReviewerRecords>[1][number] {
-    return {
-      annotationId: "123e4567-e89b-42d3-a456-426614174000",
-      reviewState: "APPROVED" as const,
-      packageId: "capkg:01ARZ3NDEKTSV4RRFFQ69G5FAV",
-      sourceKind: "book" as const,
-      getDate: "202602011230",
-      isbn13: "9780306406157",
-      title: "日本語の書名",
-      authors: ["著者名"],
-      quote: "レビュー済みの引用",
-      pageLabel: "12",
-      comment: "Reviewer comment"
-    };
-  }
-
-  test("the Desktop writer refuses to run while a Host-side process holds the lease", async () => {
-    const fixture = await createFixture("desktop-locked");
-    const lease = await acquireShelfWriteLease({
-      coordinationRoot: fixture.coordinationRoot,
-      shelfId: fixture.shelfId,
-      processLabel: "native-host"
-    });
-    try {
-      await expectCoordinationError(
-        materializeReviewerRecords(fixture.shelfRoot, [approvedRecord()], async () => ({ status: "not-found" }), {
-          coordinationRoot: fixture.coordinationRoot,
-          shelfId: fixture.shelfId,
-          acquireTimeoutMs: 120
-        }),
-        "shelf-write-busy"
-      );
-      expect(await readRecords(fixture.annotationsDirectory)).toHaveLength(0);
-    } finally {
-      await lease.release();
-    }
-  });
-
-  test("the Desktop writer completes under the lease and releases it afterwards", async () => {
-    const fixture = await createFixture("desktop-lease");
-    const result = await materializeReviewerRecords(
-      fixture.shelfRoot,
-      [approvedRecord()],
-      async () => ({ status: "not-found" }),
-      { coordinationRoot: fixture.coordinationRoot, shelfId: fixture.shelfId, acquireTimeoutMs: 1_000 }
-    );
-    expect(result.materialized).toBe(1);
-    expect(await readRecords(fixture.annotationsDirectory)).toHaveLength(1);
-    // The lease is free again, so a Host-side writer can take it immediately.
-    const lease = await acquireShelfWriteLease({
-      coordinationRoot: fixture.coordinationRoot,
-      shelfId: fixture.shelfId,
-      acquireTimeoutMs: 500
-    });
-    await lease.release();
-  });
-});
-
 describe("collector quote commit", () => {
   test("writes Shelf v0.4 Book and Annotation and reports a durable receipt", async () => {
     const fixture = await createFixture("commit");

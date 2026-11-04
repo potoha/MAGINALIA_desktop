@@ -9,7 +9,7 @@
         "_UNICODE",
         "WIN32_LEAN_AND_MEAN"
       ],
-      "libraries": ["Advapi32.lib"],
+      "libraries": ["Advapi32.lib", "Ole32.lib", "Shell32.lib"],
       "conditions": [
         ["OS!='win'", {
           "sources": []

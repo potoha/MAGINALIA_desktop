@@ -1,10 +1,10 @@
 /**
- * Writing a Collector web quote while holding the Windows named mutex.
+ * Writing a Private Shelf record while holding the Windows named mutex.
  *
  * A mutex protects the critical section; it says nothing about whether the bytes on
  * disk are sane. A writer can die in two different ways, and both must be handled:
  *
- * 1. **Another participant is alive** (Desktop open, or a second Host). The mutex
+ * 1. **Another participant is alive** (Desktop Reviewer or a future Host). The mutex
  *    object survives, so the next writer receives `WAIT_ABANDONED`.
  * 2. **No participant is alive** (Desktop closed, the Host is the only process and is
  *    killed). The last handle dies with it, the mutex object is destroyed, and the
@@ -54,17 +54,20 @@
  *   the marker is published happens before the first journal write, so treating it as
  *   clean is correct.
  *
- * Nothing here is imported by the product write path or by the Native Messaging Host.
- * Journal and Shelf record formats are unchanged.
+ * The Desktop Reviewer path uses this wrapper now. Host saving remains disabled,
+ * but a future Host writer must use the same mutex, marker and journal semantics.
+ * Host v1 journal records remain readable alongside the Reviewer v2 extension.
  */
 import { randomUUID } from "node:crypto";
 import { lstat, open, readFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import {
   ShelfWriteCoordinationError,
+  commitShelfRecordTransaction,
   commitShelfQuote,
   inspectShelfWriteJournal,
   resolveShelfWriteLayout,
+  type ShelfRecordWriteTransactionRequest,
   type ShelfQuoteWriteReceipt,
   type ShelfQuoteWriteRequest,
   type ShelfWriteLayout
@@ -154,17 +157,21 @@ export async function inspectShelfWriterRecoveryState(
   const file = path.join(coordinationDirectory, SHELF_WRITER_RECOVERY_STATE_FILENAME);
   const entry = await inspectMarkerPath(file);
   if (entry.kind === "absent") return Object.freeze({ path: file, pending: false });
-  let text: string;
+  let bytes: Buffer;
   try {
-    text = await readFile(file, "utf8");
+    bytes = await readFile(file);
   } catch (error: unknown) {
     // Removed between the check and the read: still "no evidence", like the check.
     if (isMissing(error)) return Object.freeze({ path: file, pending: false });
     return Object.freeze({ path: file, pending: true });
   }
+  return parseShelfWriterRecoveryBytes(file, bytes);
+}
+
+function parseShelfWriterRecoveryBytes(file: string, bytes: Uint8Array): InspectedShelfWriterRecoveryState {
   let record: ShelfWriterRecoveryState | undefined;
   try {
-    const parsed = JSON.parse(text) as unknown;
+    const parsed = JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown;
     if (
       parsed !== null &&
       typeof parsed === "object" &&
@@ -274,8 +281,6 @@ export async function assessShelfWriteRecoveryState(options: {
   readonly expectedShelfId: string;
   readonly coordinationRoot: string;
 }): Promise<ShelfWriteRecoveryAssessment> {
-  // Re-resolving validates the marker identity, the configured directories, the
-  // realpath containment and the dev/ino fingerprints of a live Shelf.
   await resolveShelfWriteLayout(options);
   // Strict journal validation: a malformed, foreign or internally inconsistent
   // record throws `shelf-write-journal-invalid` here. Nothing is repaired.
@@ -307,6 +312,13 @@ export async function assessShelfWriteRecoveryState(options: {
           `request ${record.requestId}`
         );
       }
+      if (!entry.sourceAssetsMatch) {
+        throw new ShelfWriteCoordinationError(
+          "shelf-write-receipt-missing",
+          "A committed receipt no longer matches its referenced source assets.",
+          `request ${record.requestId}`
+        );
+      }
       committed.push(record.requestId);
       continue;
     }
@@ -317,6 +329,13 @@ export async function assessShelfWriteRecoveryState(options: {
         throw new ShelfWriteCoordinationError(
           "shelf-write-lease-uncertain",
           "An interrupted write left an Annotation that does not match its staged digest.",
+          `request ${record.requestId}`
+        );
+      }
+      if (!entry.sourceAssetsMatch) {
+        throw new ShelfWriteCoordinationError(
+          "shelf-write-lease-uncertain",
+          "An interrupted write left source assets that do not match its Shelf records.",
           `request ${record.requestId}`
         );
       }
@@ -362,8 +381,7 @@ export interface NativeShelfWriteOptions {
  * Make sure a recovery record exists before this process gives up.
  *
  * An existing record is left exactly as it is: it already protects the next writer, and
- * overwriting it would erase the only pointer to the interrupted request. Nothing here
- * repairs or deletes journal records or annotation files.
+ * overwriting it would erase the only pointer to the interrupted request.
  */
 async function ensureRecoveryStateRecorded(
   layout: ShelfWriteLayout,
@@ -381,19 +399,130 @@ async function ensureRecoveryStateRecorded(
       throw new ShelfWriteCoordinationError(
         "shelf-write-recovery-state-unavailable",
         "The Shelf needs recovery, and that state could not be recorded durably.",
-        `${describe(cause)}; ${describe(error)}`
+        describe(cause) + "; " + describe(error)
       );
     }
   }
   throw cause;
 }
 
+export interface NativeShelfWriteSectionContext {
+  readonly layout: ShelfWriteLayout;
+  readonly lease: ShelfMutexLease;
+  /** Present only when abandonment or a recovery marker required journal assessment. */
+  readonly recoveryAssessment?: ShelfWriteRecoveryAssessment;
+}
+
+/**
+ * Run a writer inside the shared native critical section and perform D071 recovery
+ * before any mutation. Every staged request must be available to the caller for
+ * deterministic retry; otherwise the writer fails closed before starting another
+ * transaction. The callback owns per-transaction recovery-marker publication and
+ * removal, so batch writers can retain the marker until all interrupted requests
+ * have reached committed receipts.
+ */
+export async function withNativeShelfWriteSection<T>(
+  request: {
+    readonly shelfRoot: string;
+    readonly expectedShelfId: string;
+    readonly coordinationRoot: string;
+  },
+  recoverableRequestIds: readonly string[],
+  options: NativeShelfWriteOptions,
+  work: (context: NativeShelfWriteSectionContext) => Promise<T>
+): Promise<T> {
+  const lease = await acquireShelfMutex({
+    shelfId: request.expectedShelfId,
+    ...(options.scope === undefined ? {} : { scope: options.scope }),
+    ...(options.acquireTimeoutMs === undefined ? {} : { acquireTimeoutMs: options.acquireTimeoutMs }),
+    ...(options.pollIntervalMs === undefined ? {} : { pollIntervalMs: options.pollIntervalMs }),
+    ...(options.now === undefined ? {} : { now: options.now })
+  });
+
+  let keepHeld = false;
+  try {
+    const layout = await resolveShelfWriteLayout(request);
+    const marker = await inspectShelfWriterRecoveryState(layout.coordinationDirectory);
+    let recoveryAssessment: ShelfWriteRecoveryAssessment | undefined;
+    if (lease.abandoned || marker.pending) {
+      try {
+        recoveryAssessment = await assessShelfWriteRecoveryState(request);
+        const allowed = new Set(recoverableRequestIds);
+        const unavailable = recoveryAssessment.interruptedRequestIds.filter((id) => !allowed.has(id));
+        if (unavailable.length > 0) {
+          throw recoveryStateUnavailable(
+            "The Private Shelf has interrupted writes that this operation cannot safely resume.",
+            unavailable.join(",")
+          );
+        }
+        await options.onRecovery?.(recoveryAssessment, {
+          trigger: lease.abandoned ? "abandoned" : "pending-write",
+          lease
+        });
+        // A marker can survive a crash after the receipt was written but before its
+        // removal. Clear it only after the complete journal scan proves every receipt.
+        if (marker.pending && recoveryAssessment.interruptedRequestIds.length === 0) {
+          await clearShelfWriterRecoveryState(marker.path);
+        }
+      } catch (error: unknown) {
+        keepHeld = true;
+        await ensureRecoveryStateRecorded(
+          layout,
+          marker.record?.requestId ?? "recovery-check",
+          error
+        );
+      }
+    }
+
+    let result: T;
+    try {
+      result = await work(Object.freeze({
+        layout,
+        lease,
+        ...(recoveryAssessment === undefined ? {} : { recoveryAssessment })
+      }));
+    } catch (error: unknown) {
+      if (recoveryAssessment !== undefined && recoveryAssessment.interruptedRequestIds.length > 0) {
+        keepHeld = true;
+        await ensureRecoveryStateRecorded(
+          layout,
+          recoveryAssessment.interruptedRequestIds[0]!,
+          error
+        );
+      }
+      throw error;
+    }
+
+    if (recoveryAssessment !== undefined && recoveryAssessment.interruptedRequestIds.length > 0) {
+      try {
+        const entries = await inspectShelfWriteJournal(request);
+        const byId = new Map(entries.map((entry) => [entry.record.requestId, entry.record]));
+        const unfinished = recoveryAssessment.interruptedRequestIds.filter((id) => byId.get(id)?.state !== "committed");
+        if (unfinished.length > 0) {
+          throw recoveryStateUnavailable(
+            "Interrupted Private Shelf writes remain staged after recovery.",
+            unfinished.join(",")
+          );
+        }
+      } catch (error: unknown) {
+        keepHeld = true;
+        await ensureRecoveryStateRecorded(
+          layout,
+          recoveryAssessment.interruptedRequestIds[0]!,
+          error
+        );
+      }
+    }
+    return result;
+  } finally {
+    if (!keepHeld) lease.release();
+  }
+}
 /**
  * Commit one web quote under the OS mutex instead of the file lease.
  *
- * The writer itself is the existing single implementation (`commitShelfQuote`); the
- * external lock only replaces `acquireShelfWriteLease`, so no second write path and
- * no journal format change is introduced.
+ * Host save remains disabled. This wrapper preserves the existing shared v1 writer
+ * and remains available to the future Host-equivalent process test.
  */
 export async function commitShelfQuoteWithNativeLock(
   request: ShelfQuoteWriteRequest,
@@ -415,9 +544,6 @@ export async function commitShelfQuoteWithNativeLock(
       coordinationRoot: request.coordinationRoot
     });
     const recovery = await inspectShelfWriterRecoveryState(layout.coordinationDirectory);
-
-    // The recovery record is checked independently of abandonment, because a destroyed
-    // mutex object cannot report that its owner died.
     if (lease.abandoned || recovery.pending) {
       try {
         const assessment = await assessShelfWriteRecoveryState({
@@ -425,35 +551,62 @@ export async function commitShelfQuoteWithNativeLock(
           expectedShelfId: request.expectedShelfId,
           coordinationRoot: request.coordinationRoot
         });
+        const unrelatedInterrupted = assessment.interruptedRequestIds.filter((id) => id !== request.requestId);
+        if (unrelatedInterrupted.length > 0) {
+          throw recoveryStateUnavailable(
+            "The Private Shelf has interrupted writes that this request cannot safely resume.",
+            unrelatedInterrupted.join(",")
+          );
+        }
         await options.onRecovery?.(assessment, {
           trigger: lease.abandoned ? "abandoned" : "pending-write",
           lease
         });
       } catch (error: unknown) {
-        // Fail closed. The recovery record must outlive this process so the next
-        // writer verifies even when the OS releases the mutex on exit; this process
-        // additionally keeps the lock, so it cannot write again either.
         keepHeld = true;
         await ensureRecoveryStateRecorded(layout, request.requestId, error);
       }
     }
 
-    // Record the critical section before the first journal write, so a crash from here
-    // on is visible to the next process even if the mutex object disappears.
     const recoveryFile = await writeShelfWriterRecoveryState({
       coordinationDirectory: layout.coordinationDirectory,
       requestId: request.requestId
     });
-    try {
-      const receipt = await commitShelfQuote({ ...request, externalLock: lease });
-      // The receipt is durable at this point; only then does the Shelf count as clean.
-      await clearShelfWriterRecoveryState(recoveryFile);
-      return receipt;
-    } catch (error: unknown) {
-      // The record is intentionally kept: the next writer must verify.
-      throw error;
-    }
+    const receipt = await commitShelfQuote({ ...request, externalLock: lease });
+    await clearShelfWriterRecoveryState(recoveryFile);
+    return receipt;
   } finally {
     if (!keepHeld) lease.release();
   }
+}
+
+/**
+ * Commit a planned Reviewer record transaction under the same native critical
+ * section and persistent recovery marker used by the future Host writer.
+ */
+export async function commitShelfRecordTransactionWithNativeLock(
+  request: Omit<ShelfRecordWriteTransactionRequest, "externalLock" | "beforeMutation" | "afterReceipt">,
+  options: NativeShelfWriteOptions = {}
+): Promise<ShelfQuoteWriteReceipt> {
+  return withNativeShelfWriteSection(
+    request,
+    [request.requestId],
+    options,
+    async ({ layout, lease }) => {
+      let recoveryFile: string | undefined;
+      return commitShelfRecordTransaction({
+        ...request,
+        externalLock: lease,
+        beforeMutation: async (requestId) => {
+          recoveryFile = await writeShelfWriterRecoveryState({
+            coordinationDirectory: layout.coordinationDirectory,
+            requestId
+          });
+        },
+        afterReceipt: async () => {
+          if (recoveryFile !== undefined) await clearShelfWriterRecoveryState(recoveryFile);
+        }
+      });
+    }
+  );
 }
