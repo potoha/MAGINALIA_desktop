@@ -126,3 +126,50 @@ NOT VERIFIED: the commands in a running Electron window (menu click, dialogs), t
 binding written by Desktop and consumed by a separately installed Host, a second
 Windows user, and behavior when the `MAGINALIA` root already exists with an
 unprotected inherited ACL on a machine like the development machine.
+
+## 6. Production Host entry (PR A2)
+
+`apps/desktop/src/collector-native-host-product.ts` is the production Native Messaging
+Host `org.maginalia.collector`. It shares `collector-native-host-core.ts` (framing,
+64 KiB requests, 1 MiB responses, envelope and `save_web_quote` validation) with the
+developer entry `collector-native-host.ts`. The developer entry keeps the descriptor,
+`MAGINALIA_COLLECTOR_TEST_ONLY=1` gate, descriptor coordination root and the
+recovery probe; none of these exist in the production entry.
+
+- Caller: Chrome's first argument must equal the compiled
+  `chrome-extension://blgmoddncpknfnikdfnjelmdmphfgknf/` exactly. Otherwise every
+  request answers `host_configuration_or_origin_invalid` before anything is read.
+- No environment variable, cwd or descriptor file is read. The native addon is loaded
+  only from a fixed code location (`useProductNativeAddonLocation`; Node entry: the
+  compiled layout next to `dist/main`).
+- `health` reports `writesEnabled: true` and advertises `save_web_quote` only while
+  `readCollectorShelfConfiguration` is valid. `configured_shelf` returns the Shelf
+  UUID, `library.json` name, `type: "private"` and `writesEnabled: true`, or the
+  configuration error code.
+- `save_web_quote`: request validation (`invalid_request`), then configuration
+  (codes in section 1), then the unchanged `commitShelfQuoteWithNativeLock` with the
+  fixed coordination root. A mutex acquisition timeout maps to `shelf_write_busy`,
+  and any other writer failure maps to `save_failed`. A receipt is returned only
+  after the writer has cleared `writer-recovery.json`, and only in state `committed`
+  or `already-committed` for the requested ID and bound Shelf.
+- stdout carries frames only. Responses and stderr carry no paths, path-to-UUID
+  mapping or quote text.
+- Time budget: the Collector waits 30 s for a save. The Host's save path is the
+  configuration read (milliseconds), then at most the writer's unchanged 15 s mutex
+  acquisition timeout, then the commit (normally well under 1 s). A recovery
+  assessment after an interrupted write scans the journal and is not bounded by a
+  separate deadline. This is the only path that could approach the 30 s budget, and
+  it is NOT VERIFIED on a large journal.
+
+Tests: `npm run test:collector-product-host` covers the unit cases (origin,
+fail-closed codes, request validation, busy, receipt checks, real commit and
+idempotent replay) and real child processes:
+- the production entry with an attacker-style environment (valid test-only
+  descriptor, test gate, bogus addon path, redirected `LOCALAPPDATA`) still answers
+  `shelf_unconfigured` and creates nothing;
+- a harness running the same loop with a disposable LocalAppData commits, replays
+  `already-committed`, answers `shelf_write_busy` while another process holds the
+  mutex, and fails closed for an Everyone-writable binding and a mismatched marker.
+
+NOT VERIFIED: a real Chrome caller, the installed standalone executable, and the
+Desktop Reviewer writing concurrently with the Host on a real Shelf.
