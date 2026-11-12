@@ -2479,7 +2479,8 @@ body.resizing-sidebar * {
 
 .settings-setting-row,
 .settings-command-row,
-.settings-binding-conflict {
+.settings-binding-conflict,
+.settings-binding-notices {
   display: grid;
   gap: 0.45rem 0.75rem;
   margin: 0 0 0.7rem;
@@ -2491,14 +2492,16 @@ body.resizing-sidebar * {
 
 .settings-setting-row h3,
 .settings-command-row h3,
-.settings-binding-conflict h3 {
+.settings-binding-conflict h3,
+.settings-binding-notices h3 {
   margin: 0;
   font-size: 0.98rem;
 }
 
 .settings-setting-description,
 .settings-center-empty,
-.settings-binding-conflict p {
+.settings-binding-conflict p,
+.settings-binding-notices ul {
   margin: 0;
   color: var(--settings-muted);
   font-size: 0.9rem;
