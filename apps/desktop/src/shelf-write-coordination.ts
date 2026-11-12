@@ -1,17 +1,17 @@
 /**
- * Cross-process Private Shelf write coordination — foundation, not product wiring.
+ * Shared Private Shelf write journal and add-only record transactions.
  *
- * The Desktop main process and the Collector Native Messaging Host are separate
- * OS processes that may address the same configured Private Shelf. ADR 0019 / D070
- * accept the Host boundary but explicitly leave the locking, atomicity, recovery,
- * idempotency, and receipt mechanisms unselected.
+ * The Desktop main process and the isolated Collector Native Messaging test Host are
+ * separate OS processes that may address the same configured Private Shelf. The
+ * Reviewer uses the shared journal with a strict v2 record for deterministic
+ * recovery; existing Host v1 records remain readable. Host saves are limited to isolated E2E mode.
  *
- * This module is the technical verification of one candidate mechanism:
+ * Product Reviewer writes and the isolated E2E Host share this mechanism:
  *
  * - exclusion is keyed by the Shelf's stable folder-marker UUID (D068), not by a
  *   machine path, so the same Shelf is protected after the folder is moved/renamed;
- * - the lease lives outside the Shelf, so no coordination state becomes user data,
- *   git-visible Shelf content, or a second source of truth;
+ * - the journal and recovery marker live outside the Shelf, so coordination state
+ *   does not become git-visible Shelf content;
  * - record publication reuses `shelf-write-core` (the Reviewer writer's own
  *   primitives), so there is exactly one Shelf write implementation;
  * - the Annotation file is the single commit point: assets and Book are add-only
@@ -19,11 +19,11 @@
  *   rolled back;
  * - a durable per-request journal provides the idempotency key and the receipt.
  *
- * Nothing here is imported by the Desktop write path or by the experimental host.
- * Enabling either is a separate owner decision (see
- * `docs/collector-shelf-writer-coordination.md`, open decisions).
+ * Product Reviewer writes supply this transaction only after resolving the saved
+ * Shelf binding and confirming its typed marker. Production Host saving remains disabled.
  */
 import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, realpath, rename, link, unlink } from "node:fs/promises";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -36,6 +36,7 @@ import { assertSafeRoot } from "./repository-filesystem.js";
 import {
   ensureShelfDirectory,
   isInsideDirectory,
+  listShelfRecordFiles,
   matchShelfBook,
   publishShelfFileNoReplace,
   readExistingShelfBooks,
@@ -54,6 +55,9 @@ function loadFormatCore(): Promise<FormatCore> {
 
 export const SHELF_WRITE_LEASE_VERSION = 1 as const;
 export const SHELF_WRITE_JOURNAL_VERSION = 1 as const;
+/** Reviewer-only journal extension for deterministic recovery of optional metadata. */
+export const SHELF_REVIEWER_WRITE_JOURNAL_VERSION = 2 as const;
+export const SHELF_REVIEWER_ENRICHMENT_MAX_BYTES = 6000;
 /**
  * Heartbeat age after which a *live* holder's lease is considered uncertain.
  *
@@ -88,6 +92,7 @@ export type ShelfWriteCoordinationErrorCode =
   | "shelf-write-book-conflict"
   | "shelf-write-record-conflict"
   | "shelf-write-receipt-missing"
+  | "shelf-write-recovery-state-invalid"
   | "shelf-write-recovery-state-unavailable";
 
 export class ShelfWriteCoordinationError extends Error {
@@ -288,10 +293,9 @@ export async function resolveShelfWriteLayout(options: ResolveShelfWriteLayoutOp
   assertNoShelfOverlap(root, prospectiveCoordinationRoot);
 
   let coordinationDirectory: string;
-  let coordinationRootReal: string;
   try {
     await mkdir(options.coordinationRoot, { recursive: true });
-    coordinationRootReal = await realpath(options.coordinationRoot);
+    const coordinationRootReal = await realpath(options.coordinationRoot);
     // Re-check after creation: the created directory may resolve through a
     // junction that only becomes visible once it exists.
     assertNoShelfOverlap(root, coordinationRootReal);
@@ -676,7 +680,7 @@ export async function acquireShelfWriteLease(options: AcquireShelfWriteLeaseOpti
 export type ShelfWriteJournalState = "staged" | "committed" | "aborted";
 
 export interface ShelfWriteJournalRecord {
-  readonly version: typeof SHELF_WRITE_JOURNAL_VERSION;
+  readonly version: typeof SHELF_WRITE_JOURNAL_VERSION | typeof SHELF_REVIEWER_WRITE_JOURNAL_VERSION;
   readonly kind: "shelf-write-request";
   readonly shelfId: string;
   readonly requestId: string;
@@ -690,18 +694,41 @@ export interface ShelfWriteJournalRecord {
   readonly stagedAt: string;
   readonly updatedAt: string;
   readonly writer: { readonly pid: number; readonly process: string };
+  /** Required by v2 Reviewer records; absent from unchanged v1 Host records. */
+  readonly reviewerEnrichment?: ShelfReviewerEnrichmentSnapshot;
   readonly committedAt?: string;
   readonly abortedReason?: string;
 }
 
-async function writeJournalRecord(layout: ShelfWriteLayout, record: ShelfWriteJournalRecord): Promise<void> {
+/** The optional openBD result selected when a Reviewer request was first planned. */
+export type ShelfReviewerEnrichmentSnapshot =
+  | { readonly kind: "none" }
+  | {
+      readonly kind: "openbd";
+      readonly metadata: {
+        readonly isbn13: string;
+        readonly title: string;
+        readonly authors: readonly string[];
+        readonly publisher?: string;
+        readonly year?: number;
+      };
+    };
+
+async function writeJournalRecord(
+  layout: ShelfWriteLayout,
+  record: ShelfWriteJournalRecord
+): Promise<void> {
+  const serialized = serializeShelfRecord(record);
+  if (Buffer.byteLength(serialized, "utf8") > JOURNAL_MAX_BYTES) {
+    fail("shelf-write-invalid-request", "The Shelf write request metadata exceeds the journal size limit.");
+  }
   const directory = path.join(layout.coordinationDirectory, "requests");
   const target = path.join(directory, `${record.requestId}.json`);
   const temporary = `${target}.${randomUUID()}.tmp`;
   try {
     const handle = await open(temporary, "wx");
     try {
-      await handle.writeFile(serializeShelfRecord(record), "utf8");
+      await handle.writeFile(serialized, "utf8");
       await handle.sync();
     } finally {
       await handle.close();
@@ -720,6 +747,7 @@ const JOURNAL_REQUIRED_KEYS: readonly string[] = [
   "stagedAt", "updatedAt", "writer"
 ];
 const JOURNAL_OPTIONAL_KEYS: readonly string[] = ["committedAt", "abortedReason"];
+const REVIEWER_JOURNAL_REQUIRED_KEYS: readonly string[] = [...JOURNAL_REQUIRED_KEYS, "reviewerEnrichment"];
 const JOURNAL_WRITER_KEYS: readonly string[] = ["pid", "process"];
 const JOURNAL_MAX_BYTES = 8192;
 
@@ -730,6 +758,54 @@ function invalidJournal(detail: string): never {
 function journalString(value: unknown, label: string): string {
   if (typeof value !== "string" || value.length === 0) invalidJournal(`${label} must be a non-empty string`);
   return value;
+}
+
+function parseReviewerEnrichmentSnapshot(value: unknown): ShelfReviewerEnrichmentSnapshot {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    invalidJournal("reviewerEnrichment must be an object");
+  }
+  const snapshot = value as Record<string, unknown>;
+  if (snapshot.kind === "none") {
+    if (Object.keys(snapshot).some((key) => key !== "kind")) {
+      invalidJournal("the empty Reviewer enrichment snapshot has unknown fields");
+    }
+    return Object.freeze({ kind: "none" });
+  }
+  if (snapshot.kind !== "openbd" || Object.keys(snapshot).some((key) => key !== "kind" && key !== "metadata")) {
+    invalidJournal("reviewerEnrichment has an unknown shape");
+  }
+  const metadata = snapshot.metadata;
+  if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) {
+    invalidJournal("Reviewer openBD metadata must be an object");
+  }
+  const fields = metadata as Record<string, unknown>;
+  const allowed = new Set(["isbn13", "title", "authors", "publisher", "year"]);
+  if (Object.keys(fields).some((key) => !allowed.has(key))) {
+    invalidJournal("Reviewer openBD metadata has unknown fields");
+  }
+  if (typeof fields.isbn13 !== "string" || !/^[0-9]{13}$/u.test(fields.isbn13)
+    || typeof fields.title !== "string" || Buffer.byteLength(fields.title, "utf8") > SHELF_REVIEWER_ENRICHMENT_MAX_BYTES
+    || !Array.isArray(fields.authors) || fields.authors.length > 128
+    || !fields.authors.every((author) => typeof author === "string" && Buffer.byteLength(author, "utf8") <= SHELF_REVIEWER_ENRICHMENT_MAX_BYTES)
+    || (fields.publisher !== undefined
+      && (typeof fields.publisher !== "string" || Buffer.byteLength(fields.publisher, "utf8") > SHELF_REVIEWER_ENRICHMENT_MAX_BYTES))
+    || (fields.year !== undefined && (typeof fields.year !== "number" || !Number.isSafeInteger(fields.year) || fields.year < 0))) {
+    invalidJournal("Reviewer openBD metadata is invalid or exceeds its size bounds");
+  }
+  const normalized: ShelfReviewerEnrichmentSnapshot = Object.freeze({
+    kind: "openbd",
+    metadata: Object.freeze({
+      isbn13: fields.isbn13,
+      title: fields.title,
+      authors: Object.freeze([...fields.authors]),
+      ...(fields.publisher === undefined ? {} : { publisher: fields.publisher }),
+      ...(fields.year === undefined ? {} : { year: fields.year })
+    })
+  });
+  if (Buffer.byteLength(JSON.stringify(normalized), "utf8") > SHELF_REVIEWER_ENRICHMENT_MAX_BYTES) {
+    invalidJournal("Reviewer openBD metadata exceeds its journal size bound");
+  }
+  return normalized;
 }
 
 /**
@@ -759,16 +835,23 @@ function parseJournalRecord(
     invalidJournal("the record is not an object");
   }
   const value = raw as Record<string, unknown>;
+  const version = value.version;
+  if (version !== SHELF_WRITE_JOURNAL_VERSION && version !== SHELF_REVIEWER_WRITE_JOURNAL_VERSION) {
+    invalidJournal("unsupported record version");
+  }
+  const requiredKeys = version === SHELF_REVIEWER_WRITE_JOURNAL_VERSION
+    ? REVIEWER_JOURNAL_REQUIRED_KEYS
+    : JOURNAL_REQUIRED_KEYS;
+  const allowedKeys = new Set([...requiredKeys, ...JOURNAL_OPTIONAL_KEYS]);
   for (const key of Object.keys(value)) {
-    if (!JOURNAL_REQUIRED_KEYS.includes(key) && !JOURNAL_OPTIONAL_KEYS.includes(key)) {
+    if (!allowedKeys.has(key)) {
       invalidJournal(`unknown field "${key}"`);
     }
   }
-  for (const key of JOURNAL_REQUIRED_KEYS) {
+  for (const key of requiredKeys) {
     if (!Object.prototype.hasOwnProperty.call(value, key)) invalidJournal(`missing field "${key}"`);
   }
 
-  if (value.version !== SHELF_WRITE_JOURNAL_VERSION) invalidJournal("unsupported record version");
   if (value.kind !== "shelf-write-request") invalidJournal("unexpected record kind");
 
   const shelfId = journalString(value.shelfId, "shelfId");
@@ -780,6 +863,9 @@ function parseJournalRecord(
   const requestId = journalString(value.requestId, "requestId");
   if (!REQUEST_ID_PATTERN.test(requestId)) invalidJournal("requestId is not a valid request ID");
   if (requestId !== options.requestId) invalidJournal("the record does not match its file name");
+  if (version === SHELF_REVIEWER_WRITE_JOURNAL_VERSION && !requestId.startsWith("reviewer-")) {
+    invalidJournal("a v2 record must use a Reviewer request ID");
+  }
 
   const state = value.state;
   if (state !== "staged" && state !== "committed" && state !== "aborted") {
@@ -824,6 +910,12 @@ function parseJournalRecord(
   if (typeof writerValue.process !== "string" || writerValue.process.length === 0) {
     invalidJournal("writer.process must be a non-empty string");
   }
+  if (version === SHELF_REVIEWER_WRITE_JOURNAL_VERSION && writerValue.process !== "desktop-main-reviewer") {
+    invalidJournal("a v2 record must identify the Desktop Reviewer writer");
+  }
+  const reviewerEnrichment = version === SHELF_REVIEWER_WRITE_JOURNAL_VERSION
+    ? parseReviewerEnrichmentSnapshot(value.reviewerEnrichment)
+    : undefined;
 
   let committedAt: string | undefined;
   if (value.committedAt !== undefined) {
@@ -844,7 +936,7 @@ function parseJournalRecord(
   }
 
   return Object.freeze({
-    version: SHELF_WRITE_JOURNAL_VERSION,
+    version,
     kind: "shelf-write-request",
     shelfId,
     requestId,
@@ -857,6 +949,7 @@ function parseJournalRecord(
     stagedAt,
     updatedAt,
     writer: Object.freeze({ pid: writerValue.pid, process: writerValue.process }),
+    ...(reviewerEnrichment === undefined ? {} : { reviewerEnrichment }),
     ...(committedAt === undefined ? {} : { committedAt }),
     ...(abortedReason === undefined ? {} : { abortedReason })
   });
@@ -882,31 +975,71 @@ async function readJournalRecord(
     if (isMissing(error)) return undefined;
     fail("shelf-write-journal-unavailable", "The Shelf write journal record cannot be read.");
   }
+  return parseJournalText(text, requestId, layout.shelfId);
+}
+
+function parseJournalText(text: string, requestId: string, shelfId: string): ShelfWriteJournalRecord {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
     invalidJournal("the journal record is not valid JSON");
   }
-  return parseJournalRecord(parsed, { requestId, shelfId: layout.shelfId });
+  return parseJournalRecord(parsed, { requestId, shelfId });
 }
 
-async function annotationDigestOnDisk(directory: string, annotationId: string): Promise<string | undefined> {
-  try {
-    const bytes = await readFile(path.join(directory, shelfRecordFilename(annotationId)));
-    return createHash("sha256").update(bytes).digest("hex");
-  } catch {
-    return undefined;
-  }
+/** Read one strictly validated shared journal record without mutating the journal. */
+export async function readShelfWriteJournalRecord(options: ResolveShelfWriteLayoutOptions & {
+  readonly requestId: string;
+}): Promise<ShelfWriteJournalRecord | undefined> {
+  const layout = await resolveShelfWriteLayout(options);
+  return readJournalRecord(layout, options.requestId);
 }
 
-async function shelfRecordExists(directory: string, id: string): Promise<boolean> {
-  try {
-    const info = await lstat(path.join(directory, shelfRecordFilename(id)));
-    return info.isFile() && !info.isSymbolicLink();
-  } catch {
-    return false;
+async function annotationDigestOnDisk(layout: ShelfWriteLayout, annotationId: string): Promise<string | undefined> {
+  const files = await shelfRecordFilesById(layout, layout.annotationsDirectory, annotationId, "annotation");
+  return files.length === 1 ? files[0]!.rawDigest : undefined;
+}
+
+interface ShelfRecordFileHit {
+  readonly file: string;
+  readonly serialized: string;
+  readonly rawDigest: string;
+  readonly value: unknown;
+}
+
+/** Locate records by parsed entity identity, preserving imported YAML/nested Shelf files. */
+async function shelfRecordFilesById(
+  layout: ShelfWriteLayout,
+  directory: string,
+  id: string,
+  kind: "book" | "annotation"
+): Promise<readonly ShelfRecordFileHit[]> {
+  const format = await loadFormatCore();
+  const matches: ShelfRecordFileHit[] = [];
+  for (const file of await listShelfRecordFiles(layout.root, directory)) {
+    try {
+      const info = await lstat(file);
+      if (!info.isFile() || info.isSymbolicLink()) continue;
+      const bytes = await readFile(file);
+      const parsed = format.parseShelfEntity(kind, bytes.toString("utf8"));
+      if (!parsed.valid || (parsed.value as { readonly id?: unknown }).id !== id) continue;
+      matches.push(Object.freeze({
+        file,
+        serialized: serializeShelfRecord(parsed.value),
+        rawDigest: createHash("sha256").update(bytes).digest("hex"),
+        value: parsed.value
+      }));
+    } catch {
+      // Unknown or malformed Shelf records remain untouched; an expected record
+      // that cannot be parsed is treated as missing and fails closed at the caller.
+    }
   }
+  return Object.freeze(matches);
+}
+
+async function shelfRecordExists(layout: ShelfWriteLayout, directory: string, id: string): Promise<boolean> {
+  return (await shelfRecordFilesById(layout, directory, id, "book")).length === 1;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -969,6 +1102,386 @@ export interface ShelfQuoteWriteReceipt {
   readonly annotationDigest: string;
   readonly requestDigest: string;
   readonly recordedAt: string;
+}
+
+/**
+ * A source asset that must be add-only published before its Book record.
+ * `relativePath` is a portable Shelf path; absolute paths never enter the journal.
+ */
+export interface ShelfWriteAssetPublication {
+  readonly relativePath: string;
+  readonly bytes: Uint8Array;
+}
+
+/**
+ * One already-planned Shelf v0.4 Book + Annotation transaction. Reviewer uses this
+ * to use a strict v2 Reviewer record in the shared request journal without
+ * translating its opaque source identity into a Shelf entity ID.
+ */
+export interface ShelfRecordWritePlan {
+  readonly book: ShelfBookV04;
+  readonly annotation: ShelfAnnotationV04;
+  readonly bookReused: boolean;
+  readonly assets: readonly ShelfWriteAssetPublication[];
+  readonly reviewerEnrichment: ShelfReviewerEnrichmentSnapshot;
+}
+
+export interface ShelfRecordWriteTransactionRequest extends ResolveShelfWriteLayoutOptions {
+  readonly requestId: string;
+  readonly processLabel?: string;
+  /** The caller must already hold the shared OS mutex. There is no file-lease fallback. */
+  readonly externalLock: ShelfWriteExternalLock;
+  /**
+   * Plans from a previously validated v2 Reviewer record when present. This is how retries
+   * reuse the exact staged Book and Annotation IDs rather than generating duplicates.
+   */
+  readonly prepare: (existing: ShelfWriteJournalRecord | undefined) => Promise<ShelfRecordWritePlan>;
+  /** Called immediately before the first journal or Shelf-record mutation. */
+  readonly beforeMutation?: (requestId: string) => Promise<void>;
+  /** Called only after a committed receipt has been persisted and reverified. */
+  readonly afterReceipt?: (receipt: ShelfQuoteWriteReceipt) => Promise<void>;
+  readonly beforeAnnotationPublish?: () => void | Promise<void>;
+  readonly now?: () => number;
+}
+
+function safeShelfRelativePath(value: string): boolean {
+  if (value.length === 0 || value.includes("\\") || value.includes("\0")
+    || value.startsWith("/") || /^[A-Za-z]:/u.test(value)) return false;
+  const parts = value.split("/");
+  return parts.every((part) => part.length > 0 && part !== "." && part !== "..");
+}
+
+function bytesDigest(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function planDigests(plan: ShelfRecordWritePlan): {
+  readonly requestDigest: string;
+  readonly annotationDigest: string;
+  readonly serializedBook: string;
+  readonly serializedAnnotation: string;
+  readonly assets: readonly { readonly relativePath: string; readonly bytes: Uint8Array; readonly sha256: string }[];
+  readonly referencedAssets: readonly { readonly relativePath: string; readonly sha256: string }[];
+  readonly reviewerEnrichment: ShelfReviewerEnrichmentSnapshot;
+} {
+  const serializedBook = serializeShelfRecord(plan.book);
+  const serializedAnnotation = serializeShelfRecord(plan.annotation);
+  const reviewerEnrichment = parseReviewerEnrichmentSnapshot(plan.reviewerEnrichment);
+  if (Buffer.byteLength(JSON.stringify(reviewerEnrichment), "utf8") > SHELF_REVIEWER_ENRICHMENT_MAX_BYTES) {
+    fail("shelf-write-invalid-request", "The Reviewer enrichment snapshot exceeds its size bound.");
+  }
+  const assets = plan.assets.map((asset) => {
+    if (!safeShelfRelativePath(asset.relativePath)) {
+      fail("shelf-write-invalid-request", "A source asset path is not a safe relative Shelf path.");
+    }
+    const bytes = new Uint8Array(asset.bytes);
+    return Object.freeze({ relativePath: asset.relativePath, bytes, sha256: bytesDigest(bytes) });
+  }).sort((left, right) => left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0);
+  const referenced = new Map<string, { readonly sha256: string; readonly mediaType: string }>();
+  for (const file of [
+    ...(plan.book.source.files ?? []),
+    ...(plan.annotation.source.files ?? [])
+  ]) {
+    if (!safeShelfRelativePath(file.path) || !/^[0-9a-f]{64}$/u.test(file.sha256)) {
+      fail("shelf-write-invalid-request", "A planned source asset descriptor is invalid.");
+    }
+    const existing = referenced.get(file.path);
+    if (existing !== undefined && (existing.sha256 !== file.sha256 || existing.mediaType !== file.mediaType)) {
+      fail("shelf-write-invalid-request", "Book and Annotation disagree about a source asset.");
+    }
+    referenced.set(file.path, Object.freeze({ sha256: file.sha256, mediaType: file.mediaType }));
+  }
+  for (const asset of assets) {
+    if (referenced.get(asset.relativePath)?.sha256 !== asset.sha256) {
+      fail("shelf-write-invalid-request", "A source asset does not match its Book and Annotation descriptors.");
+    }
+  }
+  const requestDigest = digestShelfWriteContent({
+    kind: "shelf-record-transaction-v2",
+    book: JSON.parse(serializedBook) as unknown,
+    annotation: JSON.parse(serializedAnnotation) as unknown,
+    assets: assets.map(({ relativePath, sha256 }) => ({ relativePath, sha256 })),
+    reviewerEnrichment
+  });
+  return Object.freeze({
+    requestDigest,
+    annotationDigest: `sha256:${bytesDigest(Buffer.from(serializedAnnotation, "utf8"))}`,
+    serializedBook,
+    serializedAnnotation,
+    assets: Object.freeze(assets),
+    reviewerEnrichment,
+    referencedAssets: Object.freeze([...referenced.entries()].map(([relativePath, value]) => Object.freeze({
+      relativePath,
+      sha256: value.sha256
+    })))
+  });
+}
+
+async function shelfRecordMatchesSerialized(
+  layout: ShelfWriteLayout,
+  directory: string,
+  id: string,
+  serialized: string
+): Promise<boolean> {
+  const kind = id.startsWith("book:") ? "book" : "annotation";
+  const matches = await shelfRecordFilesById(layout, directory, id, kind);
+  return matches.length === 1 && matches[0]!.serialized === serialized;
+}
+
+async function shelfAssetMatches(root: string, relativePath: string, sha256: string): Promise<boolean> {
+  if (!safeShelfRelativePath(relativePath)) return false;
+  const rootReal = await realpath(root).catch(() => undefined);
+  if (rootReal === undefined) return false;
+  const parts = relativePath.split("/");
+  let parent = rootReal;
+  try {
+    for (const part of parts.slice(0, -1)) {
+      parent = path.join(parent, part);
+      const parentInfo = await lstat(parent);
+      if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink()) return false;
+      const parentReal = await realpath(parent);
+      if (!isInsideDirectory(rootReal, parentReal)) return false;
+    }
+    const target = path.join(parent, parts[parts.length - 1]!);
+    const info = await lstat(target);
+    if (!info.isFile() || info.isSymbolicLink()) return false;
+    const targetReal = await realpath(target);
+    if (!isInsideDirectory(rootReal, targetReal)) return false;
+    return await fileDigest(target) === sha256;
+  } catch {
+    return false;
+  }
+}
+
+function fileDigest(file: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(file);
+    stream.on("data", (chunk: string | Buffer) => { hash.update(chunk); });
+    stream.once("error", reject);
+    stream.once("end", () => resolve(hash.digest("hex")));
+  });
+}
+
+async function shelfRecordAssetsMatch(
+  layout: ShelfWriteLayout,
+  matches: readonly ShelfRecordFileHit[]
+): Promise<boolean> {
+  if (matches.length !== 1) return false;
+  const source = (matches[0]!.value as { readonly source?: { readonly files?: readonly { readonly path: string; readonly sha256: string }[] } }).source;
+  const files = source?.files ?? [];
+  for (const file of files) {
+    if (!await shelfAssetMatches(layout.root, file.path, file.sha256)) return false;
+  }
+  return true;
+}
+
+async function shelfAnnotationSourceAssetsMatch(
+  layout: ShelfWriteLayout,
+  sourceFiles: readonly { readonly path: string; readonly sha256: string }[]
+): Promise<boolean> {
+  for (const file of sourceFiles) {
+    if (!await shelfAssetMatches(layout.root, file.path, file.sha256)) return false;
+  }
+  return true;
+}
+
+/**
+ * Commit a planned v0.4 Book + Annotation using the Reviewer v2 extension of the
+ * existing shared request journal. Host v1 records retain their exact schema.
+ *
+ * The caller must hold the Shelf's native mutex and arrange the persistent recovery
+ * marker around this operation. This function deliberately has no legacy file-lease
+ * path. Its durable order is staged journal, source assets, add-only Book, Annotation
+ * commit point, committed receipt. The Reviewer source ID remains opaque in the
+ * Annotation metadata; the journal's `annotationId` continues to mean Shelf `ann:*`.
+ */
+export async function commitShelfRecordTransaction(
+  request: ShelfRecordWriteTransactionRequest
+): Promise<ShelfQuoteWriteReceipt> {
+  if (typeof request.requestId !== "string"
+    || !REQUEST_ID_PATTERN.test(request.requestId)
+    || !request.requestId.startsWith("reviewer-")) {
+    fail("shelf-write-invalid-request", "The request ID is invalid.");
+  }
+  if (request.processLabel !== undefined && request.processLabel !== "desktop-main-reviewer") {
+    fail("shelf-write-invalid-request", "The Reviewer journal writer label is invalid.");
+  }
+  const layout = await resolveShelfWriteLayout({
+    shelfRoot: request.shelfRoot,
+    expectedShelfId: request.expectedShelfId,
+    coordinationRoot: request.coordinationRoot
+  });
+  const existing = await readJournalRecord(layout, request.requestId);
+  if (existing?.state === "aborted") {
+    fail("shelf-write-request-mismatch", "This request ID was previously aborted and cannot be reused.");
+  }
+  if (existing?.version === SHELF_WRITE_JOURNAL_VERSION) {
+    fail(
+      "shelf-write-recovery-state-unavailable",
+      "A legacy Reviewer transaction lacks the metadata snapshot required for deterministic recovery."
+    );
+  }
+  const plan = await request.prepare(existing);
+  const format = await loadFormatCore();
+  const bookValidation = format.validateShelfEntity("book", plan.book);
+  const annotationValidation = format.validateShelfEntity("annotation", plan.annotation);
+  if (!bookValidation.valid || !annotationValidation.valid
+    || !BOOK_ID_PATTERN.test(plan.book.id)
+    || !ANNOTATION_ID_PATTERN.test(plan.annotation.id)
+    || plan.annotation.source.id !== plan.book.id
+    || typeof plan.bookReused !== "boolean") {
+    fail("shelf-write-invalid-request", "The planned Shelf records are not valid v0.4 entities.");
+  }
+  if (existing !== undefined
+    && (existing.bookId !== plan.book.id
+      || existing.annotationId !== plan.annotation.id
+      || existing.bookReused !== plan.bookReused)) {
+    fail("shelf-write-request-mismatch", "The staged request no longer uses its recorded Shelf identities.");
+  }
+  const digests = planDigests(plan);
+  if (existing !== undefined && (existing.requestDigest !== digests.requestDigest
+    || existing.annotationDigest !== digests.annotationDigest)) {
+    fail("shelf-write-request-mismatch", "The staged request no longer matches its recorded content.");
+  }
+  const nowIso = () => new Date(request.now?.() ?? Date.now()).toISOString();
+  if (existing?.state === "committed") {
+    const bookMatches = await shelfRecordMatchesSerialized(layout, layout.booksDirectory, plan.book.id, digests.serializedBook);
+    const annotationDigest = await annotationDigestOnDisk(layout, plan.annotation.id);
+    const annotationMatches = annotationDigest !== undefined
+      && `sha256:${annotationDigest}` === existing.annotationDigest;
+    const assetsMatch = await Promise.all(digests.referencedAssets.map((asset) => shelfAssetMatches(layout.root, asset.relativePath, asset.sha256)));
+    if (!bookMatches || !annotationMatches || assetsMatch.some((matches) => !matches)) {
+      fail("shelf-write-receipt-missing", "A committed Reviewer receipt no longer matches its Shelf records or source assets.");
+    }
+    const receipt = Object.freeze({
+      version: 1 as const,
+      state: "already-committed" as const,
+      requestId: existing.requestId,
+      shelfId: layout.shelfId,
+      bookId: existing.bookId,
+      annotationId: existing.annotationId,
+      bookReused: existing.bookReused,
+      annotationDigest: existing.annotationDigest,
+      requestDigest: existing.requestDigest,
+      recordedAt: existing.committedAt ?? existing.updatedAt
+    });
+    await request.afterReceipt?.(receipt);
+    return receipt;
+  }
+
+  const publicationPaths = new Set(digests.assets.map((asset) => asset.relativePath));
+  for (const asset of digests.referencedAssets) {
+    if (!publicationPaths.has(asset.relativePath)
+      && !await shelfAssetMatches(layout.root, asset.relativePath, asset.sha256)) {
+      fail(
+        "shelf-write-invalid-request",
+        "A referenced existing source asset is unavailable or does not match its v0.4 digest."
+      );
+    }
+  }
+
+  await request.externalLock.assertHeld();
+  await request.beforeMutation?.(request.requestId);
+  if (existing === undefined) {
+    const stagedAt = nowIso();
+    await writeJournalRecord(layout, {
+      version: SHELF_REVIEWER_WRITE_JOURNAL_VERSION,
+      kind: "shelf-write-request",
+      shelfId: layout.shelfId,
+      requestId: request.requestId,
+      requestDigest: digests.requestDigest,
+      state: "staged",
+      bookId: plan.book.id,
+      annotationId: plan.annotation.id,
+      bookReused: plan.bookReused,
+      annotationDigest: digests.annotationDigest,
+      reviewerEnrichment: digests.reviewerEnrichment,
+      stagedAt,
+      updatedAt: stagedAt,
+      writer: { pid: process.pid, process: request.processLabel ?? "desktop-main-reviewer" }
+    });
+  }
+
+  for (const asset of digests.assets) {
+    await request.externalLock.assertHeld();
+    await assertShelfWriteLayoutCurrent(layout);
+    const target = path.resolve(layout.root, ...asset.relativePath.split("/"));
+    if (!isInsideDirectory(layout.root, target)
+      || !await ensureShelfDirectory(layout.root, path.dirname(target))) {
+      fail("shelf-write-unsafe-path", "A source asset target is outside or unavailable in the Private Shelf.");
+    }
+    const assetBuffer = Buffer.from(asset.bytes.buffer, asset.bytes.byteOffset, asset.bytes.byteLength);
+    const state = await publishShelfFileNoReplace(target, assetBuffer);
+    if (state === "conflict") {
+      fail("shelf-write-record-conflict", "A different source asset occupies a planned Shelf path.");
+    }
+  }
+  for (const asset of digests.referencedAssets) {
+    if (!await shelfAssetMatches(layout.root, asset.relativePath, asset.sha256)) {
+      fail("shelf-write-record-conflict", "A referenced source asset is missing or differs from its v0.4 digest.");
+    }
+  }
+
+  await request.externalLock.assertHeld();
+  await assertShelfWriteLayoutCurrent(layout);
+  if (plan.bookReused) {
+    if (!await shelfRecordMatchesSerialized(layout, layout.booksDirectory, plan.book.id, digests.serializedBook)) {
+      fail("shelf-write-record-conflict", "The reused Book changed before the Reviewer Annotation was committed.");
+    }
+  } else {
+    const bookState = await publishShelfFileNoReplace(
+      path.join(layout.booksDirectory, shelfBookFilename(plan.book)),
+      Buffer.from(digests.serializedBook, "utf8")
+    );
+    if (bookState === "conflict") {
+      fail("shelf-write-record-conflict", "A different Book occupies the planned Shelf identity.");
+    }
+  }
+
+  await request.beforeAnnotationPublish?.();
+  await request.externalLock.assertHeld();
+  await assertShelfWriteLayoutCurrent(layout);
+  const annotationState = await publishShelfFileNoReplace(
+    path.join(layout.annotationsDirectory, shelfRecordFilename(plan.annotation.id)),
+    Buffer.from(digests.serializedAnnotation, "utf8")
+  );
+  if (annotationState === "conflict") {
+    fail("shelf-write-record-conflict", "A different Annotation occupies the planned Shelf identity.");
+  }
+
+  const committedAt = nowIso();
+  const receipt: ShelfQuoteWriteReceipt = Object.freeze({
+    version: 1,
+    state: "committed",
+    requestId: request.requestId,
+    shelfId: layout.shelfId,
+    bookId: plan.book.id,
+    annotationId: plan.annotation.id,
+    bookReused: plan.bookReused,
+    annotationDigest: digests.annotationDigest,
+    requestDigest: digests.requestDigest,
+    recordedAt: committedAt
+  });
+  await writeJournalRecord(layout, {
+    version: SHELF_REVIEWER_WRITE_JOURNAL_VERSION,
+    kind: "shelf-write-request",
+    shelfId: layout.shelfId,
+    requestId: request.requestId,
+    requestDigest: digests.requestDigest,
+    state: "committed",
+    bookId: plan.book.id,
+    annotationId: plan.annotation.id,
+    bookReused: plan.bookReused,
+    annotationDigest: digests.annotationDigest,
+    reviewerEnrichment: digests.reviewerEnrichment,
+    stagedAt: existing?.stagedAt ?? committedAt,
+    updatedAt: committedAt,
+    writer: { pid: process.pid, process: request.processLabel ?? "desktop-main-reviewer" },
+    committedAt
+  });
+  await request.afterReceipt?.(receipt);
+  return receipt;
 }
 
 function requireString(value: unknown, label: string): string {
@@ -1108,10 +1621,10 @@ export async function commitShelfQuote(request: ShelfQuoteWriteRequest): Promise
       fail("shelf-write-request-mismatch", "The request ID was already used with different content.");
     }
     if (journal !== undefined && journal.state === "committed") {
-      if (!await shelfRecordExists(layout.booksDirectory, journal.bookId)) {
+      if (!await shelfRecordExists(layout, layout.booksDirectory, journal.bookId)) {
         fail("shelf-write-receipt-missing", "A committed receipt exists but its Book is missing.");
       }
-      const onDisk = await annotationDigestOnDisk(layout.annotationsDirectory, journal.annotationId);
+      const onDisk = await annotationDigestOnDisk(layout, journal.annotationId);
       if (onDisk === undefined) {
         fail("shelf-write-receipt-missing", "A committed receipt exists but its Annotation is missing.");
       }
@@ -1276,6 +1789,8 @@ export interface ShelfWriteJournalEntry {
   readonly annotationPresent: boolean;
   readonly bookPresent: boolean;
   readonly matchesDisk: boolean;
+  /** Existing Book/Annotation source-file references still match files under the Shelf root. */
+  readonly sourceAssetsMatch: boolean;
 }
 
 /**
@@ -1297,11 +1812,11 @@ export async function inspectShelfWriteJournal(options: {
     if (isMissing(error)) return Object.freeze([]);
     fail("shelf-write-journal-unavailable", "The Shelf write journal cannot be listed.");
   }
-  const books = await readdir(layout.booksDirectory).catch(() => [] as string[]);
-  const annotations = await readdir(layout.annotationsDirectory).catch(() => [] as string[]);
+  const requestIds = names.filter((value) => value.endsWith(".json"))
+    .map((name) => name.slice(0, -".json".length))
+    .sort();
   const entries: ShelfWriteJournalEntry[] = [];
-  for (const name of names.filter((value) => value.endsWith(".json")).sort()) {
-    const requestId = name.slice(0, -".json".length);
+  for (const requestId of requestIds) {
     // A file whose name cannot be a request ID is not a journal record. A
     // well-named record with invalid content still throws
     // `shelf-write-journal-invalid`, because silently skipping it would let a
@@ -1309,16 +1824,28 @@ export async function inspectShelfWriteJournal(options: {
     if (!REQUEST_ID_PATTERN.test(requestId)) continue;
     const record = await readJournalRecord(layout, requestId);
     if (record === undefined) continue;
-    const annotationPresent = annotations.includes(shelfRecordFilename(record.annotationId));
-    const bookPresent = books.includes(shelfRecordFilename(record.bookId));
-    const onDisk = await annotationDigestOnDisk(layout.annotationsDirectory, record.annotationId);
+    const [annotationFiles, bookFiles] = await Promise.all([
+      shelfRecordFilesById(layout, layout.annotationsDirectory, record.annotationId, "annotation"),
+      shelfRecordFilesById(layout, layout.booksDirectory, record.bookId, "book")
+    ]);
+    const annotationPresent = annotationFiles.length > 0;
+    const bookPresent = bookFiles.length > 0;
+    const onDisk = annotationFiles.length === 1 ? annotationFiles[0]!.rawDigest : undefined;
+    const annotationSource = annotationFiles.length === 1
+      ? (annotationFiles[0]!.value as { readonly source?: { readonly files?: readonly { readonly path: string; readonly sha256: string }[] } }).source
+      : undefined;
+    const annotationAssetsMatch = annotationFiles.length === 0
+      || (annotationFiles.length === 1 && await shelfAnnotationSourceAssetsMatch(layout, annotationSource?.files ?? []));
+    const sourceAssetsMatch = (bookFiles.length === 0 || await shelfRecordAssetsMatch(layout, bookFiles))
+      && annotationAssetsMatch;
     entries.push(Object.freeze({
       record,
       annotationPresent,
       bookPresent,
+      sourceAssetsMatch,
       matchesDisk: record.annotationDigest.length === 0
         ? true
-        : onDisk !== undefined && record.annotationDigest === `sha256:${onDisk}`
+        : onDisk !== undefined && `sha256:${onDisk}` === record.annotationDigest
     }));
   }
   return Object.freeze(entries);

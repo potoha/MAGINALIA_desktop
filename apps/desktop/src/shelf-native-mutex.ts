@@ -1,9 +1,9 @@
 /**
- * Windows named-mutex write lock for one Private Shelf (technical verification).
+ * Windows named-mutex write lock for one Private Shelf.
  *
- * This is the OD-10(b) spike: the cross-process exclusion authority is a Windows
- * kernel mutex instead of a lock file. It is not reachable from the product write
- * path, the Desktop UI, or the Native Messaging Host.
+ * The Desktop Reviewer writer uses this as its cross-process exclusion authority.
+ * The future Native Messaging Host must use the same mutex; this module does not
+ * enable Host saving.
  *
  * Why a kernel mutex (see `docs/collector-shelf-native-mutex.md`):
  *
@@ -74,6 +74,8 @@ export type ShelfMutexScope = "session" | "machine";
 
 interface NativeMutexModule {
   readonly apiVersion: number;
+  /** Windows SHGetKnownFolderPath(FOLDERID_LocalAppData), validated as a local drive. */
+  getLocalAppDataPath?(): unknown;
   createMutex(name: string, options?: { security?: "current-user" | "system-only" }): object;
   openMutex(name: string): object;
   acquire(handle: object, waitMs?: number): {
@@ -226,6 +228,24 @@ export function nativeShelfMutexAvailable(): boolean {
   }
 }
 
+/** Resolve the per-user machine-local root from Windows, without environment fallbacks. */
+export function getNativeLocalAppDataPath(): string {
+  const native = loadNativeShelfMutex();
+  if (typeof native.getLocalAppDataPath !== "function") {
+    fail("native-mutex-unavailable", "The Shelf mutex addon cannot resolve Windows LocalAppData.");
+  }
+  let value: unknown;
+  try {
+    value = native.getLocalAppDataPath();
+  } catch (error: unknown) {
+    throw translateNativeError(error);
+  }
+  if (typeof value !== "string" || value.length === 0) {
+    fail("native-mutex-unavailable", "Windows LocalAppData could not be resolved.");
+  }
+  return value;
+}
+
 /**
  * Deterministic OS mutex name for one Shelf.
  *
@@ -344,6 +364,12 @@ export async function acquireShelfMutex(options: AcquireShelfMutexOptions): Prom
   const handle = handleFor(name);
   const deadline = now() + acquireTimeoutMs;
   for (;;) {
+    // Another waiter in this process may have acquired the recursive OS mutex
+    // while this task was in `delay()`. Recheck immediately before every native
+    // wait so a second waiter cannot acquire recursively and replace its token.
+    if (heldNames.has(name)) {
+      fail("shelf-write-busy", "This process already holds the Shelf write lock.", name);
+    }
     const result = native.acquire(handle, 0);
     if (result.acquired) {
       const token = randomUUID();

@@ -1,10 +1,11 @@
-/** Experimental, read-only Native Messaging foundation. Not a production contract. */
+/** Experimental Native Messaging host. Writes require its isolated test-only mode. */
 import { lstat, open } from "node:fs/promises";
 import { once } from "node:events";
 import * as path from "node:path";
 import { TextDecoder } from "node:util";
 import { inspectFolderMarkers } from "./folder-identity.js";
 import { parseShelfLocationSource } from "./shelf-location-registry.js";
+import { commitShelfQuoteWithNativeLock } from "./shelf-native-write-lock.js";
 
 const REQUEST_LIMIT = 64 * 1024;
 const RESPONSE_LIMIT = 1024 * 1024;
@@ -39,45 +40,164 @@ async function readBoundedFile(file: string, limit: number): Promise<string> {
   } finally { await handle.close(); }
 }
 
-interface Descriptor { shelfLocationPath: string; expectedShelfId: string; allowedOrigin: string }
+interface Descriptor {
+  shelfLocationPath: string;
+  expectedShelfId: string;
+  allowedOrigin: string;
+  testOnlyWritesEnabled: boolean;
+  coordinationRoot?: string;
+}
 async function descriptor(file: string | undefined, origin: string | undefined): Promise<Descriptor | undefined> {
   try {
     if (!file || !path.isAbsolute(file)) return undefined;
     const value: unknown = JSON.parse(await readBoundedFile(file, 16 * 1024));
-    if (!record(value) || !keys(value, ["experimental", "shelfLocationPath", "expectedShelfId", "allowedOrigin"]) || value.experimental !== true
+    if (!record(value) || value.experimental !== true
       || typeof value.shelfLocationPath !== "string" || !path.isAbsolute(value.shelfLocationPath)
       || typeof value.expectedShelfId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.expectedShelfId)
       || typeof value.allowedOrigin !== "string" || !/^chrome-extension:\/\/[a-p]{32}\/$/.test(value.allowedOrigin)
       || origin !== value.allowedOrigin) return undefined;
-    return { shelfLocationPath: value.shelfLocationPath, expectedShelfId: value.expectedShelfId, allowedOrigin: value.allowedOrigin };
+    if (keys(value, ["experimental", "shelfLocationPath", "expectedShelfId", "allowedOrigin"])) {
+      return {
+        shelfLocationPath: value.shelfLocationPath,
+        expectedShelfId: value.expectedShelfId,
+        allowedOrigin: value.allowedOrigin,
+        testOnlyWritesEnabled: false
+      };
+    }
+    if (keys(value, ["experimental", "shelfLocationPath", "expectedShelfId", "allowedOrigin", "testOnlyWritesEnabled", "coordinationRoot"])
+      && value.testOnlyWritesEnabled === true && typeof value.coordinationRoot === "string" && path.isAbsolute(value.coordinationRoot)) {
+      return {
+        shelfLocationPath: value.shelfLocationPath,
+        expectedShelfId: value.expectedShelfId,
+        allowedOrigin: value.allowedOrigin,
+        testOnlyWritesEnabled: true,
+        coordinationRoot: value.coordinationRoot
+      };
+    }
+    return undefined;
   } catch { return undefined; }
 }
 
-async function shelfStatus(config: Descriptor): Promise<RecordValue> {
+interface ConfiguredShelf { readonly root: string; readonly id: string; readonly name: string }
+type ShelfLoadResult = { readonly shelf: ConfiguredShelf } | { readonly error: string };
+
+async function loadConfiguredShelf(config: Descriptor): Promise<ShelfLoadResult> {
   let location: ReturnType<typeof parseShelfLocationSource>;
   try { location = parseShelfLocationSource(await readBoundedFile(config.shelfLocationPath, 64 * 1024)); }
-  catch { return error("configuration_unavailable"); }
-  if (!location) return error("configuration_unavailable");
+  catch { return { error: "configuration_unavailable" }; }
+  if (!location) return { error: "configuration_unavailable" };
   try {
     const root = location.privateShelf.registry;
-    if (root === null) return error("shelf_unconfigured");
+    if (root === null) return { error: "shelf_unconfigured" };
     const marker = await inspectFolderMarkers(root);
-    if (marker.kind !== "valid" || marker.marker.type !== "shelf") return error("shelf_identity_unavailable");
-    if (marker.marker.id.toLowerCase() !== config.expectedShelfId.toLowerCase()) return error("shelf_identity_mismatch");
+    if (marker.kind !== "valid" || marker.marker.type !== "shelf") return { error: "shelf_identity_unavailable" };
+    if (marker.marker.id.toLowerCase() !== config.expectedShelfId.toLowerCase()) return { error: "shelf_identity_mismatch" };
     const libraryText = await readBoundedFile(path.join(root, "library.json"), 1024 * 1024);
     const format = await import("@maginalia/format");
     const library = format.parseAndValidate("library", libraryText);
-    if (!library.valid) return error("shelf_unavailable");
-    return { protocol: PROTOCOL, ok: true, shelf: { id: marker.marker.id, name: library.value.name, type: "private", writesEnabled: false } };
-  } catch { return error("shelf_unavailable"); }
+    if (!library.valid) return { error: "shelf_unavailable" };
+    return { shelf: { root, id: marker.marker.id, name: library.value.name } };
+  } catch { return { error: "shelf_unavailable" }; }
 }
 
-export async function handleExperimentalRequest(value: unknown, file: string | undefined, origin: string | undefined): Promise<RecordValue> {
+function testOnlyWritesEnabled(config: Descriptor, env: NodeJS.ProcessEnv): boolean {
+  return config.testOnlyWritesEnabled && env.MAGINALIA_COLLECTOR_TEST_ONLY === "1";
+}
+
+async function shelfStatus(config: Descriptor, writesEnabled: boolean): Promise<RecordValue> {
+  const loaded = await loadConfiguredShelf(config);
+  if ("error" in loaded) return error(loaded.error);
+  return {
+    protocol: PROTOCOL,
+    ok: true,
+    shelf: { id: loaded.shelf.id, name: loaded.shelf.name, type: "private", writesEnabled }
+  };
+}
+
+const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const GET_DATE_PATTERN = /^\d{12}$/;
+
+function validSaveRequest(value: RecordValue): value is RecordValue & {
+  protocol: string; operation: string; requestId: string; quote: string; url: string; getDate: string;
+  title?: string; authors?: string[];
+} {
+  const required = ["protocol", "operation", "requestId", "quote", "url", "getDate"];
+  const optional = ["title", "authors"];
+  if (!required.every((key) => Object.hasOwn(value, key)) || Object.keys(value).some((key) => !required.includes(key) && !optional.includes(key))) return false;
+  if (typeof value.requestId !== "string" || !REQUEST_ID_PATTERN.test(value.requestId)
+    || typeof value.quote !== "string" || value.quote.trim().length === 0
+    || typeof value.url !== "string" || value.url.length > 8192
+    || typeof value.getDate !== "string" || !GET_DATE_PATTERN.test(value.getDate)) return false;
+  try {
+    const parsed = new URL(value.url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+  } catch { return false; }
+  if (Object.hasOwn(value, "title") && (typeof value.title !== "string" || value.title.length > 2048)) return false;
+  if (Object.hasOwn(value, "authors") && (!Array.isArray(value.authors) || value.authors.length > 8
+    || value.authors.some((author) => typeof author !== "string" || author.length === 0 || author.length > 512))) return false;
+  return true;
+}
+
+type QuoteWriter = typeof commitShelfQuoteWithNativeLock;
+
+async function saveWebQuote(config: Descriptor, value: RecordValue, env: NodeJS.ProcessEnv, writeQuote: QuoteWriter): Promise<RecordValue> {
+  if (!testOnlyWritesEnabled(config, env) || !config.coordinationRoot) return error("unsupported_operation");
+  if (!validSaveRequest(value)) return error("invalid_request");
+  const loaded = await loadConfiguredShelf(config);
+  if ("error" in loaded) return error(loaded.error);
+  try {
+    let recoveryProbe = false;
+    if (env.MAGINALIA_COLLECTOR_TEST_RECOVERY_PROBE_ONCE === "1") {
+      try {
+        const probe = await open(path.join(config.coordinationRoot, ".collector-e2e-recovery-probe-used"), "wx", 0o600);
+        try { await probe.writeFile("used\n", "utf8"); await probe.sync(); }
+        finally { await probe.close(); }
+        recoveryProbe = true;
+      } catch (cause) {
+        if (cause === null || typeof cause !== "object" || !("code" in cause) || cause.code !== "EEXIST") throw cause;
+      }
+    }
+    const receipt = await writeQuote({
+      requestId: value.requestId,
+      shelfRoot: loaded.shelf.root,
+      expectedShelfId: loaded.shelf.id,
+      coordinationRoot: config.coordinationRoot,
+      quote: value.quote,
+      url: value.url,
+      getDate: value.getDate,
+      ...(value.title ? { title: value.title } : {}),
+      ...(value.authors === undefined || value.authors.length === 0 ? {} : { authors: value.authors }),
+      processLabel: "collector-native-host-test-only",
+      ...(recoveryProbe ? { faults: { beforeAnnotationPublish: async () => { throw new Error("test-only recovery probe"); } } } : {})
+    });
+    return { protocol: PROTOCOL, ok: true, receipt };
+  } catch {
+    // Shelf paths, quote text and filesystem diagnostics never cross Native Messaging.
+    return error("save_failed");
+  }
+}
+
+export async function handleExperimentalRequest(
+  value: unknown,
+  file: string | undefined,
+  origin: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  writeQuote: QuoteWriter = commitShelfQuoteWithNativeLock
+): Promise<RecordValue> {
   const config = await descriptor(file, origin);
   if (!config) return error("host_configuration_or_origin_invalid");
-  if (!record(value) || !keys(value, ["protocol", "operation"]) || value.protocol !== PROTOCOL || typeof value.operation !== "string") return error("invalid_request");
-  if (value.operation === "health") return { protocol: PROTOCOL, ok: true, experimental: true, operations: ["health", "configured_shelf"], writesEnabled: false };
-  if (value.operation === "configured_shelf") return shelfStatus(config);
+  if (!record(value) || value.protocol !== PROTOCOL || typeof value.operation !== "string") return error("invalid_request");
+  if ((value.operation === "health" || value.operation === "configured_shelf") && !keys(value, ["protocol", "operation"])) return error("invalid_request");
+  const writesEnabled = testOnlyWritesEnabled(config, env);
+  if (value.operation === "health") return {
+    protocol: PROTOCOL,
+    ok: true,
+    experimental: true,
+    operations: writesEnabled ? ["health", "configured_shelf", "save_web_quote"] : ["health", "configured_shelf"],
+    writesEnabled
+  };
+  if (value.operation === "configured_shelf") return shelfStatus(config, writesEnabled);
+  if (value.operation === "save_web_quote") return saveWebQuote(config, value, env, writeQuote);
   return error("unsupported_operation");
 }
 

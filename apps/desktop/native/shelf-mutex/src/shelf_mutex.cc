@@ -1,8 +1,8 @@
 /**
  * Windows named-mutex addon for the cross-process Private Shelf write lock.
  *
- * Scope: this is a proof-of-concept native addon for Shelf write exclusion. It is
- * not referenced by the product write path or by the Native Messaging Host.
+ * Scope: this native addon provides the named mutex used by the product Reviewer writer. The future
+ * Native Messaging Host must use the same mutex. Host saving remains disabled.
  *
  * Invariants this addon establishes:
  *
@@ -26,9 +26,12 @@
 #include <node_api.h>
 #include <windows.h>
 #include <sddl.h>
+#include <knownfolders.h>
+#include <shlobj.h>
 
 #include <cstdio>
 #include <string>
+#include <cwchar>
 
 namespace {
 
@@ -395,6 +398,39 @@ napi_value StateFn(napi_env env, napi_callback_info info) {
   return out;
 }
 
+napi_value GetLocalAppDataPathFn(napi_env env, napi_callback_info /*info*/) {
+  PWSTR knownFolderPath = nullptr;
+  const HRESULT result = SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &knownFolderPath);
+  if (FAILED(result) || knownFolderPath == nullptr) {
+    ThrowError(env, "known-folder-unavailable", "The Windows LocalAppData known folder is unavailable.");
+    return nullptr;
+  }
+
+  const size_t pathLength = std::wcslen(knownFolderPath);
+  const bool isDrivePath = pathLength >= 3
+      && ((knownFolderPath[0] >= L'A' && knownFolderPath[0] <= L'Z')
+      || (knownFolderPath[0] >= L'a' && knownFolderPath[0] <= L'z'))
+      && knownFolderPath[1] == L':'
+      && (knownFolderPath[2] == L'\\' || knownFolderPath[2] == L'/');
+  wchar_t driveRoot[] = {knownFolderPath[0], L':', L'\\', L'\0'};
+  const UINT driveType = isDrivePath ? GetDriveTypeW(driveRoot) : DRIVE_UNKNOWN;
+  if (driveType != DRIVE_FIXED && driveType != DRIVE_RAMDISK) {
+    CoTaskMemFree(knownFolderPath);
+    ThrowError(env, "known-folder-not-local", "The Windows LocalAppData known folder is not on a local drive.");
+    return nullptr;
+  }
+
+  napi_value value = nullptr;
+  const napi_status status = napi_create_string_utf16(
+      env, reinterpret_cast<const char16_t*>(knownFolderPath), pathLength, &value);
+  CoTaskMemFree(knownFolderPath);
+  if (status != napi_ok) {
+    ThrowError(env, "known-folder-unavailable", "The Windows LocalAppData path could not be returned to JavaScript.");
+    return nullptr;
+  }
+  return value;
+}
+
 napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
       {"createMutex", nullptr, CreateMutexFn, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -403,6 +439,7 @@ napi_value Init(napi_env env, napi_value exports) {
       {"release", nullptr, ReleaseFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"close", nullptr, CloseHandleFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"state", nullptr, StateFn, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"getLocalAppDataPath", nullptr, GetLocalAppDataPathFn, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   if (napi_define_properties(env, exports, sizeof properties / sizeof properties[0], properties)
       != napi_ok) {
