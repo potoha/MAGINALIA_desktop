@@ -194,6 +194,7 @@ import {
 } from "./autosave-ipc";
 import { AutosaveShutdownCoordinator } from "./autosave-shutdown";
 import { establishApplicationIdentity, MAGINALIA_APPLICATION_NAME } from "./application-identity";
+import { enforceE2EIsolationBeforeStartup } from "./e2e-isolation";
 import { FirstRunCoordinator } from "./first-run-coordinator";
 import { FirstRunJournalStore } from "./first-run-setup";
 import { runFirstRunRestoreSmoke, runFirstRunSmoke } from "./first-run-smoke";
@@ -213,6 +214,11 @@ import {
   RUN_FIRST_RUN_SETUP_CHANNEL,
   isFirstRunChoices,
 } from "./first-run-ipc";
+
+// Test-only E2E isolation gate (#93). Inert unless MAGINALIA_E2E_ISOLATION_ROOT
+// is set; otherwise it exits with code 78 before any Desktop side effect when a
+// Desktop-controlled destination resolves outside the disposable test root.
+enforceE2EIsolationBeforeStartup(app);
 
 // Set a product-stable Electron identity before resolving any local stores.
 // Retain the profile Electron selected before this upgrade so existing state

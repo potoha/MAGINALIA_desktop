@@ -28,6 +28,7 @@
     "build:native": "node-gyp rebuild --directory=native/shelf-mutex",
     "test:collector-shelf-native": "npm run build:main && npm run build:native && vitest run --config vitest.config.mts src/shelf-native-mutex.test.ts && node --test test/collector-shelf-native-lock.test.mjs && node --test test/electron-native-lock-smoke.test.mjs",
     "spike:native-package": "node scripts/spike-native-mutex-package.mjs",
+    "test:e2e-isolation": "npm run build && npm run build:native && vitest run --config vitest.config.mts src/e2e-isolation.test.ts && node --test test/e2e-isolation-smoke.test.mjs",
     "smoke": "npm run build && node test/electron-smoke.mjs",
     "smoke:writing": "npm run build && node test/writing-smoke.mjs",
     "smoke:settings": "npm run build && node test/settings-smoke.mjs",
