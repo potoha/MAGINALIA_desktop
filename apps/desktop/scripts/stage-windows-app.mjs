@@ -2,6 +2,7 @@ import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { stageShelfMutexAddon } from "./shelf-mutex-addon.mjs";
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const desktopRoot = path.resolve(scriptDirectory, "..");
@@ -16,6 +17,10 @@ const lock = JSON.parse(await readFile(path.join(repositoryRoot, "package-lock.j
 if (!process.env.npm_execpath) throw new Error("Run this script through the repository npm script so its pinned npm runtime is available.");
 await access(path.join(desktopRoot, "dist", "main", "main.js"));
 await access(path.join(runtimeRoot, "reviewer", "marginalia-reviewer.exe"));
+// α2: the installed Reviewer writer requires the native Shelf mutex; fail
+// before staging anything if it is missing or not the expected /MT N-API build.
+const shelfMutex = await stageShelfMutexAddon({ desktopRoot, repositoryRoot, runtimeRoot });
+process.stdout.write(`Shelf mutex addon staged: sha256=${shelfMutex.sha256} bytes=${shelfMutex.bytes}\n`);
 await rm(stageRoot, { recursive: true, force: true });
 await mkdir(vendorRoot, { recursive: true });
 

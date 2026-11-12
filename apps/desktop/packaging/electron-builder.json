@@ -19,7 +19,8 @@
     { "from": "packaging/runtime/ndlocr-runtime-contract.json", "to": "ndlocr-runtime-contract.json" },
     { "from": "packaging/runtime/tutorial-sample", "to": "tutorial-sample" },
     { "from": "packaging/manual", "to": "manual", "filter": ["マニュアル.pdf"] },
-    { "from": "packaging/runtime/THIRD-PARTY-NOTICES", "to": "THIRD-PARTY-NOTICES" }
+    { "from": "packaging/runtime/THIRD-PARTY-NOTICES", "to": "THIRD-PARTY-NOTICES" },
+    { "from": "packaging/runtime/shelf-mutex", "to": "shelf-mutex", "filter": ["shelf_mutex.node", "PROVENANCE.json"] }
   ],
   "win": {
     "target": [{ "target": "nsis", "arch": ["x64"] }],
