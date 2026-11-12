@@ -13,6 +13,7 @@ describe("Quick Open name providers", () => {
     expect(results[0]).toMatchObject({
       resultId: "opaque-project-1",
       commandId: "maginalia.workdesk.openProject",
+      args: { projectIdentityId: "opaque-project-1" },
       title: "「卒業論文」を開く",
       category: "Workdesk Project",
       titleMatches: [{ start: 1, end: 2 }, { start: 3, end: 4 }]
@@ -37,12 +38,13 @@ describe("Quick Open name providers", () => {
     expect(results[0]).toMatchObject({
       resultId: "opaque-file-1",
       commandId: "maginalia.project.openFile",
+      args: { fileId: "opaque-file-1" },
       title: "chapter-one.md",
       category: "Project document",
       description: "Open in Research"
     });
     expect(Object.keys(results[0] ?? {}).sort()).toEqual([
-      "category", "commandId", "description", "relevance", "resultId", "title", "titleMatches"
+      "args", "category", "commandId", "description", "relevance", "resultId", "title", "titleMatches"
     ]);
   });
 });

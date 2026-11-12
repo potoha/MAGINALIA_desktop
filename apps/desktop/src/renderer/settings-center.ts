@@ -4,6 +4,7 @@ import {
   formatKeybinding,
   parseKeyboardEvent,
   type KeybindingChangeResult,
+  type KeybindingCollisionNotice,
   type KeybindingEntry,
   type KeybindingService
 } from "./keybinding-service";
@@ -16,6 +17,23 @@ import {
 } from "./settings-registry";
 
 export type SettingsCenterTab = "settings" | "shortcuts" | "cheatsheet";
+
+/** User-facing (Japanese) explanation of one deterministic shortcut collision resolution. */
+export function describeKeybindingCollisionNotice(
+  notice: KeybindingCollisionNotice,
+  titleOf: (commandId: string) => string
+): string {
+  const binding = formatKeybinding(notice.keybinding);
+  const title = titleOf(notice.commandId);
+  switch (notice.kind) {
+    case "duplicate-override":
+      return `${title} の保存済みショートカット ${binding} は ${titleOf(notice.keptCommandId)} と重複していたため、割り当てを解除しました。`;
+    case "reserved-override":
+      return `${title} の保存済みショートカット ${binding} はシステムまたはアプリケーションメニューで予約されているため、使用していません。`;
+    case "default-shadowed":
+      return `${title} の既定ショートカット ${binding} は ${titleOf(notice.keptCommandId)} に割り当て済みのため、無効になっています。`;
+  }
+}
 
 export interface SettingsCenterOptions {
   readonly settings: SettingsRegistry;
@@ -372,6 +390,8 @@ export class SettingsCenter {
       toolbar.className = "settings-center-toolbar";
       toolbar.append(makeButton("すべての割り当てをリセット", "reset-all-bindings", "reset-all-bindings"));
       this.panel.append(toolbar);
+      const notices = this.options.keybindings.getCollisionNotices();
+      if (notices.length > 0) this.panel.append(this.makeCollisionNoticePanel(notices));
       if (this.conflict !== null) this.panel.append(this.makeConflictPanel());
     }
     if (rows.length === 0) appendText(this.panel, "p", "settings-center-empty", "一致するショートカットはありません。");
@@ -413,6 +433,25 @@ export class SettingsCenter {
       row.append(makeButton("既定値に戻す", "reset-binding", `reset-binding:${entry.commandId}`, entry.commandId));
     }
     return row;
+  }
+
+  private makeCollisionNoticePanel(notices: readonly KeybindingCollisionNotice[]): HTMLElement {
+    const panel = document.createElement("section");
+    panel.className = "settings-binding-notices";
+    panel.setAttribute("role", "status");
+    panel.setAttribute("aria-labelledby", "settings-binding-notices-title");
+    appendText(panel, "h3", "", "ショートカットの重複を解決しました").id = "settings-binding-notices-title";
+    const list = document.createElement("ul");
+    const titleOf = (commandId: string) => this.options.commands.get(commandId)?.title ?? commandId;
+    for (const notice of notices) {
+      const item = document.createElement("li");
+      item.dataset.commandId = notice.commandId;
+      item.dataset.noticeKind = notice.kind;
+      item.textContent = describeKeybindingCollisionNotice(notice, titleOf);
+      list.append(item);
+    }
+    panel.append(list);
+    return panel;
   }
 
   private makeConflictPanel(): HTMLElement {

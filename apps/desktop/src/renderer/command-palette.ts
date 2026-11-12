@@ -1,5 +1,5 @@
 import type { CommandContext } from "./command-context";
-import type { CommandDescriptor, CommandRegistry, CommandSearchResult, CommandTextRange } from "./command-registry";
+import type { CommandArgs, CommandDescriptor, CommandRegistry, CommandSearchResult, CommandTextRange } from "./command-registry";
 
 export type CommandPaletteProviderId = "project" | "file";
 
@@ -7,6 +7,8 @@ export interface CommandPaletteProviderResult {
   /** Opaque Project identity or file ID; provider results never carry filesystem paths. */
   readonly resultId: string;
   readonly commandId: string;
+  /** Opaque scalar arguments passed to the generic command (never filesystem paths). */
+  readonly args?: CommandArgs;
   readonly title: string;
   readonly category: string;
   readonly description?: string;
@@ -26,7 +28,7 @@ export interface CommandPaletteOptions {
   /** Effective keybindings are supplied by the owning renderer. */
   readonly getShortcut?: (commandId: string) => string | null;
   readonly providers?: Partial<Record<CommandPaletteProviderId, CommandPaletteProvider>>;
-  /** Stages an opaque navigation identity before the registered generic command runs. */
+  /** Revalidates an opaque navigation identity before the registered generic command runs with its arguments. */
   readonly prepareProviderResult?: (providerId: CommandPaletteProviderId, resultId: string) => boolean;
   readonly onError?: (message: string) => void;
 }
@@ -51,6 +53,7 @@ interface PaletteOption {
   readonly relevance: number;
   readonly providerId?: CommandPaletteProviderId;
   readonly resultId?: string;
+  readonly args?: CommandArgs;
 }
 
 export function isImeCompositionKey(event: Pick<KeyboardEvent, "isComposing" | "keyCode">): boolean {
@@ -212,7 +215,8 @@ export class CommandPalette {
       shortcut: this.options.getShortcut?.(result.commandId) ?? null,
       relevance: result.relevance,
       providerId,
-      resultId: result.resultId
+      resultId: result.resultId,
+      ...(result.args === undefined ? {} : { args: result.args })
     };
   }
 
@@ -347,7 +351,7 @@ export class CommandPalette {
       this.options.onError?.("This navigation target is no longer available.");
       return;
     }
-    const result = await this.options.registry.execute(option.commandId, this.options.getContext());
+    const result = await this.options.registry.execute(option.commandId, this.options.getContext(), option.args);
     if (result.kind === "failed") this.options.onError?.(result.error.message);
     else if (result.kind === "disabled" || result.kind === "missing") {
       this.options.onError?.("This command is no longer available.");

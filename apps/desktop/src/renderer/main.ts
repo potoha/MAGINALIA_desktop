@@ -42,20 +42,32 @@ import {
   type SyncedBlockResolveResult
 } from "./synced-block";
 import { createLocalStorageRendererPreferenceStore, type WritingDirection } from "./renderer-preferences";
-import { createExportPresentationSettings, DEFAULT_EXPORT_PRESENTATION_SETTINGS, EXPORT_PAPER_SIZES } from "../export-presentation-settings";
+import { createExportPresentationSettings, EXPORT_PAPER_SIZES } from "../export-presentation-settings";
+import { bindExportSettingControls, EXPORT_SETTING_IDS, registerExportPresentationSettings, type ExportPresentationPatch } from "./export-settings-registration";
 import { resolvePreviewMedia } from "./project-media";
 import { resolvePreviewInternalLinks } from "./preview-links";
 import { importDroppedImageIntoDocument } from "./dropped-image";
 import { stripDerivedReferenceList } from "./reference-list";
 import { ContextKeyService } from "./command-context";
-import { CommandRegistry } from "./command-registry";
+import { CommandRegistry, type CommandArgs } from "./command-registry";
+import { registerDocumentTabCommands, ACTIVATE_DOCUMENT_COMMAND_ID } from "./document-tab-commands";
+import { registerLinkCommands, OPEN_EXTERNAL_LINK_COMMAND_ID, OPEN_INTERNAL_LINK_AT_CURSOR_COMMAND_ID, OPEN_EXTERNAL_LINK_AT_CURSOR_COMMAND_ID, OPEN_INTERNAL_LINK_COMMAND_ID } from "./link-commands";
+import {
+  INSERT_PROJECT_SEARCH_SELECTION_COMMAND_ID,
+  PROJECT_MARKDOWN_SEARCH_COMMAND_ID,
+  registerSearchCommands,
+  SHELF_INSERT_SELECTED_QUOTE_COMMAND_ID,
+  SHELF_SEARCH_COMMAND_ID,
+  SHELF_SELECT_RESULT_COMMAND_ID
+} from "./search-commands";
+import { buildApplicationMenuSnapshot } from "./application-menu-snapshot";
 import { CommandPalette } from "./command-palette";
 import { searchCurrentProjectDocuments, searchRegisteredWorkdeskProjects } from "./quick-open-search";
 import { SettingsCenter } from "./settings-center";
 import { SettingsRegistry } from "./settings-registry";
 import { formatKeybinding, KeybindingService, parseKeyboardEvent, toPlatformKeybinding } from "./keybinding-service";
 import { decideNativeInputKeybinding } from "./native-input-keybinding";
-import { APPLICATION_MENU_COMMAND_IDS, type ApplicationMenuCommandState } from "../application-menu-contract";
+import { APPLICATION_MENU_COMMAND_IDS } from "../application-menu-contract";
 import { registerCoreCommands } from "./core-commands";
 import { registerWorkbenchCommands } from "./workbench-commands";
 import { ContextMenuRegistry } from "./context-menu-registry";
@@ -1108,31 +1120,11 @@ function restoreExportSettingsControls(): void {
   exportHeaderRightInput.value = currentExportPresentationSettings.header.right;
   exportPageNumberInput.checked = currentExportPresentationSettings.pageNumber;
 }
-function saveExportSettingsFromControls(): void {
-  try {
-    currentExportPresentationSettings = createExportPresentationSettings({
-      paperSize: exportPaperSizeInput.value,
-      orientation: exportOrientationInput.value,
-      paragraphIndent: exportParagraphIndentInput.checked,
-      header: {
-        left: exportHeaderLeftInput.value,
-        center: exportHeaderCenterInput.value,
-        right: exportHeaderRightInput.value
-      },
-      pageNumber: exportPageNumberInput.checked
-    });
-    rendererPreferences.save({ ...rendererPreferences.load(), exportPresentationSettings: currentExportPresentationSettings });
-    settingsRegistry.refresh();
-  } catch {
-    // Invalid transient control state cannot alter the last valid settings.
-  }
-}
 restoreExportSettingsControls();
 let previewMediaGeneration = 0;
 let pendingPreviewEnterCaret: { readonly documentId: string; readonly revision: number; readonly offset: number } | null = null;
 let activeTableTarget: ActiveTableTarget | null = null;
 let commandContextReady = false;
-let pendingInternalLinkOpen: { readonly fileId: string } | null = null;
 let pendingSyncedBlockOpen: { readonly fileId: string; readonly target: string } | null = null;
 let pendingSyncedBlockInsert: { readonly projectId: string; readonly target: string } | null = null;
 const PROJECT_DOCUMENT_DRAG_MIME = "application/x-maginalia-project-document";
@@ -1368,8 +1360,12 @@ const previewController = new PreviewController({
           if (mayDispatchTableTarget(activeTableTarget, controller.getDocumentState(), table, cell)) void executeCommand(commandId);
         },
         onOpenInternal: ({ fileId }: { readonly target: string; readonly fileId: string }) => {
-          pendingInternalLinkOpen = { fileId };
-          void executeCommand("maginalia.link.openInTab");
+          void executeCommand(OPEN_INTERNAL_LINK_COMMAND_ID, { fileId });
+        },
+        // Embed cards expose "Open externally"; the command revalidates the URL
+        // in main before shell.openExternal (project-link-ipc).
+        onOpenExternal: (url: string) => {
+          void executeCommand(OPEN_EXTERNAL_LINK_COMMAND_ID, { url });
         },
         onOpenSyncedBlock: ({ fileId, target }: { readonly fileId: string; readonly target: string }) => {
           pendingSyncedBlockOpen = { fileId, target };
@@ -1410,9 +1406,18 @@ let repositoryController: RepositoryController | undefined;
 let repositoryReadyForHistory = false;
 let modHostAvailable = false;
 let openMarkdownAction: () => void | Promise<void> = () => undefined;
+// Runtime availability published as context keys. These are hoisted so the
+// context updater never reads controllers declared later in this module.
+const commandAvailability = {
+  documentOpen: false,
+  export: false,
+  shelf: false,
+  projectSearch: false
+};
+let shelfResultSelected = false;
 let refreshNativeApplicationMenu: () => void = () => undefined;
-function executeCommand(id: string): Promise<void> {
-  return commandRegistry.execute(id, commandContext.snapshot()).then((result) => {
+function executeCommand(id: string, args?: CommandArgs): Promise<void> {
+  return commandRegistry.execute(id, commandContext.snapshot(), args).then((result) => {
     if (result.kind === "failed") {
       documentStatus.dataset.state = "error";
       documentStatus.textContent = `Command failed: ${result.error.message}`;
@@ -1422,15 +1427,15 @@ function executeCommand(id: string): Promise<void> {
 function requestProjectFileOpen(fileId: string): void {
   const project = projectController?.getState().project;
   if (!project || fileId.length === 0) return;
-  pendingQuickOpenFile = { projectId: project.projectId, fileId };
-  void executeCommand("maginalia.project.openFile");
+  void executeCommand("maginalia.project.openFile", { fileId });
 }
 commandRegistry.register({
   id: "maginalia.document.open",
   title: "ドキュメントを開く",
   description: "現在のワークスペースでドキュメントを開きます。",
   category: "ドキュメント",
-  keywords: ["open", "document", "markdown", "file", "開く", "ドキュメント"]
+  keywords: ["open", "document", "markdown", "file", "開く", "ドキュメント"],
+  when: "document.openAvailable"
 }, () => openMarkdownAction());
 commandRegistry.register({
   id: "maginalia.project.openFile",
@@ -1439,16 +1444,20 @@ commandRegistry.register({
   category: "Project",
   keywords: ["open", "document", "file", "project", "開く", "ファイル"],
   when: "project.active"
-}, async () => {
-  const request = pendingQuickOpenFile;
-  pendingQuickOpenFile = null;
+}, async (args?: CommandArgs) => {
+  const fileId = args?.fileId;
+  if (fileId === undefined) {
+    // Without a target (for example from the Palette) offer the name picker
+    // instead of failing.
+    commandPalette?.openQuickOpen();
+    return;
+  }
   const navigation = projectController;
   const state = navigation?.getState();
-  if (request === null || navigation === undefined || !state?.project || state.project.projectId !== request.projectId
-    || !state.files.some((file) => file.fileId === request.fileId)) {
+  if (navigation === undefined || !state?.project || !state.files.some((file) => file.fileId === fileId)) {
     throw new Error("The Project document is no longer available.");
   }
-  await navigation.openFile(request.fileId);
+  await navigation.openFile(fileId);
 });
 commandRegistry.register({
   id: "maginalia.document.closeView",
@@ -1560,7 +1569,16 @@ const updateCommandContext = (): void => {
     "workdesk.childProject": activeWorkdesk !== null
       && project !== null
       && project !== undefined
-      && project.projectId !== activeWorkdesk.workdesk.documentId
+      && project.projectId !== activeWorkdesk.workdesk.documentId,
+    "explorer.creationActive": !projectInlineCreate.hidden && project !== null && project !== undefined,
+    "document.multipleTabs": mainTabDocumentIds().length > 1,
+    "document.openAvailable": commandAvailability.documentOpen,
+    "export.available": commandAvailability.export,
+    "link.externalAvailable": typeof window.maginalia.openExternalLink === "function",
+    "shelf.available": commandAvailability.shelf,
+    "shelf.resultSelected": shelfResultSelected,
+    "projectSearch.available": commandAvailability.projectSearch,
+    "projectSearch.hasSource": selectedProjectSearchText !== null
   });
   openProjectMenuItem.hidden = activeWorkdesk !== null;
   workdeskRegisterProjectButton.hidden = !workdeskHomeActive;
@@ -1590,17 +1608,27 @@ controller.onSessionChange(() => {
 });
 controller.onSelectionChange(() => updateCommandContext());
 registerWorkbenchCommands(commandRegistry, workbench, WORKBENCH_VIEW_MANIFEST);
+/**
+ * Single writer for writing direction. Commands change the active direction
+ * and remember it best-effort; the Settings entry requires persistence first
+ * (PR #70 review) so a storage failure is reported there.
+ */
+function applyWritingDirection(direction: WritingDirection, requirePersistence: boolean): void {
+  previewController.setDirection(direction, requirePersistence);
+  updateCommandContext();
+  settingsRegistry.refresh();
+}
+function requireExportController(): ExportController {
+  if (exportController === undefined) throw new Error("書き出しはこの環境では利用できません。");
+  return exportController;
+}
 registerCoreCommands(commandRegistry, {
   writing: controller,
-  setPreviewDirection: (direction) => {
-    previewController.setDirection(direction);
-    updateCommandContext();
-    settingsRegistry.refresh();
-  },
+  setPreviewDirection: (direction) => applyWritingDirection(direction, false),
   refreshReferences: () => referencesController?.refresh(),
-  exportMarkdown: () => exportController?.exportMarkdown(),
-  exportPdf: () => exportController?.exportPdf(),
-  exportDocx: () => exportController?.exportDocx(),
+  exportMarkdown: () => requireExportController().exportMarkdown(),
+  exportPdf: () => requireExportController().exportPdf(),
+  exportDocx: () => requireExportController().exportDocx(),
   saveDocument: () => controller.save(),
   contextKeys: commandContext
 });
@@ -1617,15 +1645,10 @@ settingsRegistry.register({
   owner: "maginalia.core.renderer"
 }, {
   getValue: () => rendererPreferences.load().defaultWritingDirection,
-  setValue: (value: string) => {
-    const direction: WritingDirection = value === "vertical" ? "vertical" : "horizontal";
-    previewController.setDirection(direction, true);
-    updateCommandContext();
-    settingsRegistry.refresh();
-  }
+  setValue: (value: string) => applyWritingDirection(value === "vertical" ? "vertical" : "horizontal", true)
 });
 
-function updateExportPresentationSettings(patch: NonNullable<Parameters<typeof createExportPresentationSettings>[0]>): void {
+function updateExportPresentationSettings(patch: ExportPresentationPatch): void {
   const nextSettings = createExportPresentationSettings({
     ...currentExportPresentationSettings,
     ...patch,
@@ -1638,76 +1661,9 @@ function updateExportPresentationSettings(patch: NonNullable<Parameters<typeof c
   restoreExportSettingsControls();
 }
 
-settingsRegistry.register({
-  id: "maginalia.export.paper-size",
-  title: "用紙サイズ",
-  description: "書き出し時に使う用紙サイズを選びます。",
-  category: "書き出し",
-  type: "enum",
-  options: EXPORT_PAPER_SIZES,
-  defaultValue: DEFAULT_EXPORT_PRESENTATION_SETTINGS.paperSize,
-  scope: "user",
-  owner: "maginalia.core.export"
-}, {
-  getValue: () => currentExportPresentationSettings.paperSize,
-  setValue: (value: string) => updateExportPresentationSettings({ paperSize: value })
-});
-settingsRegistry.register({
-  id: "maginalia.export.orientation",
-  title: "ページの向き",
-  description: "書き出し時の縦向きまたは横向きを選びます。",
-  category: "書き出し",
-  type: "enum",
-  options: ["portrait", "landscape"] as const,
-  defaultValue: DEFAULT_EXPORT_PRESENTATION_SETTINGS.orientation,
-  scope: "user",
-  owner: "maginalia.core.export"
-}, {
-  getValue: () => currentExportPresentationSettings.orientation,
-  setValue: (value: string) => updateExportPresentationSettings({ orientation: value })
-});
-settingsRegistry.register({
-  id: "maginalia.export.paragraph-indent",
-  title: "段落の字下げ",
-  description: "書き出す段落の先頭を字下げします。",
-  category: "書き出し",
-  type: "boolean",
-  defaultValue: DEFAULT_EXPORT_PRESENTATION_SETTINGS.paragraphIndent,
-  scope: "user",
-  owner: "maginalia.core.export"
-}, {
-  getValue: () => currentExportPresentationSettings.paragraphIndent,
-  setValue: (value: boolean) => updateExportPresentationSettings({ paragraphIndent: value })
-});
-for (const side of ["left", "center", "right"] as const) {
-  settingsRegistry.register({
-    id: `maginalia.export.header-${side}`,
-    title: `ヘッダー ${side === "left" ? "左" : side === "right" ? "右" : "中央"}`,
-    description: `書き出しヘッダーの${side === "left" ? "左" : side === "right" ? "右" : "中央"}に表示する文字列です。`,
-    category: "書き出し",
-    type: "string",
-    defaultValue: DEFAULT_EXPORT_PRESENTATION_SETTINGS.header[side],
-    scope: "user",
-    owner: "maginalia.core.export"
-  }, {
-    getValue: () => currentExportPresentationSettings.header[side],
-    setValue: (value: string) => updateExportPresentationSettings({
-      header: { ...currentExportPresentationSettings.header, [side]: value }
-    })
-  });
-}
-settingsRegistry.register({
-  id: "maginalia.export.page-number",
-  title: "ページ番号",
-  description: "書き出しフッターの中央にページ番号を表示します。",
-  category: "書き出し",
-  type: "boolean",
-  defaultValue: DEFAULT_EXPORT_PRESENTATION_SETTINGS.pageNumber,
-  scope: "user",
-  owner: "maginalia.core.export"
-}, {
-  getValue: () => currentExportPresentationSettings.pageNumber,
-  setValue: (value: boolean) => updateExportPresentationSettings({ pageNumber: value })
+registerExportPresentationSettings(settingsRegistry, {
+  get: () => currentExportPresentationSettings,
+  update: updateExportPresentationSettings
 });
 commandRegistry.register({
   id: "maginalia.document.applyProperties",
@@ -1767,9 +1723,12 @@ commandRegistry.register({
 commandRegistry.register({ id: "maginalia.editor.insertTable", title: "Insert Table", category: "Editor", keywords: ["table", "insert", "markdown"], when: "editor.hasDocument" }, () => {
   const target = controller.captureInsertionTarget();
   const documentState = controller.getDocumentState();
-  if (target === null || documentState === null) return;
+  if (target === null || documentState === null) {
+    throw new Error("表を挿入する位置を特定できません。本文の挿入位置を選択してください。");
+  }
   const inserted = insertMarkdownTable(documentState.currentText, target.range.start, target.range.end);
-  controller.applySourceEdit({ ...target, replacement: inserted.replacement });
+  const applied = controller.applySourceEdit({ ...target, replacement: inserted.replacement });
+  if (applied.kind !== "applied") throw new Error("文書が変更されたため表を挿入できませんでした。もう一度お試しください。");
 });
 const runTableOperation = (operation: TableOperation): void => {
   const target = activeTableTarget;
@@ -1965,25 +1924,28 @@ commandRegistry.register({
 
   await shelfController?.search(libraryQuery.value);
 });
-commandRegistry.register({
-  id: "maginalia.link.openInTab",
-  title: "Open Internal Link in Tab",
-  category: "Links",
-  keywords: ["wiki", "internal", "tab"],
-  when: "editor.hasDocument"
-}, async () => {
-  const request = pendingInternalLinkOpen;
-  pendingInternalLinkOpen = null;
-  const navigation = projectController;
-  const projectId = navigation?.getState().project?.projectId;
-  if (request === null || navigation === undefined || projectId === undefined
-    || typeof window.maginalia.openInternalLink !== "function") {
-    throw new Error("The internal link is no longer available.");
-  }
-  await navigation.openInternalLink(request.fileId, () => window.maginalia.openInternalLink!({
-    projectId,
-    fileId: request.fileId
-  }));
+registerLinkCommands(commandRegistry, {
+  getCaret: () => {
+    const current = controller.getDocumentState();
+    return current === null ? null : { text: current.currentText, offset: controller.getSelection().start };
+  },
+  resolveInternalTarget: async (target) => {
+    const projectId = projectController?.getState().project?.projectId;
+    if (projectId === undefined || typeof window.maginalia.resolveInternalLink !== "function") return null;
+    const resolved = await window.maginalia.resolveInternalLink({ projectId, target });
+    return resolved.kind === "resolved" ? resolved.fileId : null;
+  },
+  openInternalFile: async (fileId) => {
+    const navigation = projectController;
+    const projectId = navigation?.getState().project?.projectId;
+    if (navigation === undefined || projectId === undefined || typeof window.maginalia.openInternalLink !== "function") {
+      throw new Error("The internal link is no longer available.");
+    }
+    await navigation.openInternalLink(fileId, () => window.maginalia.openInternalLink!({ projectId, fileId }));
+  },
+  openExternal: typeof window.maginalia.openExternalLink === "function"
+    ? (url) => window.maginalia.openExternalLink!({ url })
+    : null
 });
 let commandPalette: CommandPalette | undefined;
 commandRegistry.register({
@@ -2128,11 +2090,12 @@ commandRegistry.register({
   title: "Remove Project from Workdesk",
   category: "Workdesk",
   keywords: ["project", "remove", "membership"],
-  when: "workdesk.active"
-}, async () => {
+  when: "workdesk.active",
+  // Requires the registered Project to remove; the Explorer row passes it.
+  visibility: "internal"
+}, async (args?: CommandArgs) => {
   const desk = activeWorkdesk;
-  const projectIdentityId = pendingWorkdeskProjectIdentityId;
-  pendingWorkdeskProjectIdentityId = null;
+  const projectIdentityId = args?.projectIdentityId ?? null;
   const api = getWorkdeskApi();
   if (!desk || !api || projectIdentityId === null) throw new Error("The Workdesk Project is no longer available.");
   const project = desk.projects.find((candidate) => candidate.projectIdentityId === projectIdentityId);
@@ -2148,10 +2111,9 @@ commandRegistry.register({
   category: "Workdesk",
   keywords: ["project", "open", "registered"],
   when: "workdesk.active"
-}, async () => {
+}, async (args?: CommandArgs) => {
   const desk = activeWorkdesk;
-  const projectIdentityId = pendingWorkdeskProjectIdentityId;
-  pendingWorkdeskProjectIdentityId = null;
+  const projectIdentityId = args?.projectIdentityId ?? null;
   const api = getWorkdeskApi();
   if (!desk || !api) throw new Error("Open a Workdesk to choose a registered Project.");
   if (projectIdentityId === null) {
@@ -2230,6 +2192,14 @@ commandRegistry.register({
   documentStatus.dataset.state = "saved";
   documentStatus.textContent = `Copied to ${destination.title}: ${result.file.displayName}`;
 });
+/** Shared by the Explorer and Workdesk "new document" commands. */
+function beginDocumentCreationCommand(documentType: ProjectDocumentType): void {
+  if (isLooseWorkdeskDocument() && documentType === "body") {
+    projectView.setProjectError("Workdesk documents must be memo, draft, or other.");
+    return;
+  }
+  beginProjectFileCreation(documentType);
+}
 for (const documentType of PROJECT_DOCUMENT_TYPES) {
   commandRegistry.register({
     id: `maginalia.explorer.new${documentType[0]!.toUpperCase()}${documentType.slice(1)}`,
@@ -2237,13 +2207,7 @@ for (const documentType of PROJECT_DOCUMENT_TYPES) {
     category: "Explorer",
     keywords: ["new", "markdown", documentType],
     when: "project.active"
-  }, () => {
-    if (isLooseWorkdeskDocument() && documentType === "body") {
-      projectView.setProjectError("Workdesk documents must be memo, draft, or other.");
-      return;
-    }
-    beginProjectFileCreation(documentType);
-  });
+  }, () => beginDocumentCreationCommand(documentType));
 }
 commandRegistry.register({
   id: "maginalia.explorer.newFolder",
@@ -2271,7 +2235,8 @@ commandRegistry.register({
   description: "Create the Markdown file from the active Explorer form.",
   category: "Explorer",
   keywords: ["create", "file", "markdown"],
-  when: "project.active"
+  // Only while the inline "New Markdown" form is open; it supplies the name.
+  when: "project.active && explorer.creationActive"
 }, async () => {
   await createSelectedProjectFile();
 });
@@ -2291,7 +2256,7 @@ for (const documentType of ["memo", "draft", "other"] as const) {
     category: "Workdesk",
     keywords: ["new", documentType],
     when: "editor.hasDocument && workdesk.active"
-  }, () => beginProjectFileCreation(documentType));
+  }, () => beginDocumentCreationCommand(documentType));
 }
 commandRegistry.register({
   id: "maginalia.editor.importImage",
@@ -2376,17 +2341,15 @@ const refreshNativeMenuSoon = (): void => {
   queueMicrotask(() => {
     nativeMenuRefreshPending = false;
     const context = commandContext.snapshot();
-    const enabledCommands = new Set(commandRegistry.list(context).map((command) => command.id));
-    const modalOpen = settingsCenter?.isOpen() ?? false;
-    const snapshot: ApplicationMenuCommandState[] = APPLICATION_MENU_COMMAND_IDS.map((id) => {
-      const allowedDuringModal = !modalOpen || settingsCommandsAllowedWhileModal.has(id);
-      const keybinding = keybindingService.getBinding(id);
-      const shortcut = keybinding === null ? null : toPlatformKeybinding(keybinding);
-      return {
-        id,
-        enabled: enabledCommands.has(id) && allowedDuringModal,
-        ...(shortcut === null ? {} : { shortcut })
-      };
+    const snapshot = buildApplicationMenuSnapshot({
+      commandIds: APPLICATION_MENU_COMMAND_IDS,
+      enabledCommandIds: new Set(commandRegistry.list(context).map((command) => command.id)),
+      modalOpen: settingsCenter?.isOpen() ?? false,
+      allowedDuringModal: settingsCommandsAllowedWhileModal,
+      getShortcut: (id) => {
+        const keybinding = keybindingService.getBinding(id);
+        return keybinding === null ? null : toPlatformKeybinding(keybinding);
+      }
     });
     const serialized = JSON.stringify(snapshot);
     if (serialized === lastNativeMenuSnapshot) return;
@@ -2417,17 +2380,10 @@ commandPalette = new CommandPalette({
   },
   prepareProviderResult: (providerId, resultId) => {
     if (providerId === "project") {
-      const desk = activeWorkdesk;
-      const project = desk?.projects.find((candidate) => candidate.projectIdentityId === resultId && candidate.available);
-      if (!desk || !project) return false;
-      pendingWorkdeskProjectIdentityId = project.projectIdentityId;
-      return true;
+      return activeWorkdesk?.projects.some((candidate) => candidate.projectIdentityId === resultId && candidate.available) === true;
     }
-    const navigation = projectController;
-    const state = navigation?.getState();
-    if (!state?.project || !state.files.some((file) => file.fileId === resultId)) return false;
-    pendingQuickOpenFile = { projectId: state.project.projectId, fileId: resultId };
-    return true;
+    const state = projectController?.getState();
+    return state?.project != null && state.files.some((file) => file.fileId === resultId);
   },
   getShortcut: (commandId) => {
     const binding = keybindingService.getBinding(commandId);
@@ -2490,6 +2446,16 @@ for (const contribution of [
   { id: "core.menu.selection.quote", location: "editor.selection", command: "maginalia.editor.toggleBlockquote", group: "block", order: 10 },
   { id: "core.menu.selection.bullets", location: "editor.selection", command: "maginalia.editor.toggleBulletList", group: "block", order: 20 },
   { id: "core.menu.quote.references", location: "editor.quote-ref", command: "maginalia.references.refresh", group: "quote", order: 10 },
+  { id: "core.menu.link.internal.open", location: "editor.link.internal", command: OPEN_INTERNAL_LINK_AT_CURSOR_COMMAND_ID, group: "link", order: 10 },
+  { id: "core.menu.link.internal.insert", location: "editor.link.internal", command: "maginalia.editor.insertInternalLink", group: "insert", order: 10 },
+  { id: "core.menu.link.internal.external", location: "editor.link.internal", command: "maginalia.editor.insertExternalLink", group: "insert", order: 20 },
+  { id: "core.menu.link.internal.undo", location: "editor.link.internal", command: "maginalia.editor.undo", group: "history", order: 10 },
+  { id: "core.menu.link.internal.redo", location: "editor.link.internal", command: "maginalia.editor.redo", group: "history", order: 20 },
+  { id: "core.menu.link.external.open", location: "editor.link.external", command: OPEN_EXTERNAL_LINK_AT_CURSOR_COMMAND_ID, group: "link", order: 10 },
+  { id: "core.menu.link.external.insert", location: "editor.link.external", command: "maginalia.editor.insertExternalLink", group: "insert", order: 10 },
+  { id: "core.menu.link.external.internal", location: "editor.link.external", command: "maginalia.editor.insertInternalLink", group: "insert", order: 20 },
+  { id: "core.menu.link.external.undo", location: "editor.link.external", command: "maginalia.editor.undo", group: "history", order: 10 },
+  { id: "core.menu.link.external.redo", location: "editor.link.external", command: "maginalia.editor.redo", group: "history", order: 20 },
   { id: "core.menu.media.image", location: "editor.media", command: "maginalia.editor.importImage", group: "media", order: 10 }
 ] as const) contextMenuRegistry.register(contribution);
 
@@ -2745,7 +2711,7 @@ function renderDocumentTabs(change: DocumentSessionChange): void {
       activate.append(dirty);
     }
     activate.addEventListener("click", () => {
-      void controller.activateDocument(session.documentId);
+      void executeCommand(ACTIVATE_DOCUMENT_COMMAND_ID, { documentId: session.documentId });
     });
 
     const close = document.createElement("button");
@@ -2762,7 +2728,21 @@ function renderDocumentTabs(change: DocumentSessionChange): void {
     documentTabs.append(tab);
   }
   documentTabs.hidden = mainViews.length === 0;
+  if (commandContextReady) updateCommandContext();
 }
+
+/** Opaque document IDs of the central tab strip, in visual order. */
+function mainTabDocumentIds(): readonly string[] {
+  return controller.getDocumentViews()
+    .filter((view) => view.region === "main" && view.groupId === "editor-group-1")
+    .map((view) => view.documentId);
+}
+
+registerDocumentTabCommands(commandRegistry, {
+  listTabDocumentIds: mainTabDocumentIds,
+  getActiveDocumentId: () => controller.getDocumentState()?.documentId ?? null,
+  activateDocument: (documentId) => controller.activateDocument(documentId)
+});
 
 controller.onSessionChange(renderDocumentTabs);
 
@@ -2819,8 +2799,6 @@ let selectedExplorerEntryId: string | null = null;
 let selectedExplorerFolderId: string | null = null;
 let explorerDocumentId: string | null = null;
 let explorerEntries: readonly ExplorerEntry[] = [];
-let pendingWorkdeskProjectIdentityId: string | null = null;
-let pendingQuickOpenFile: { readonly projectId: string; readonly fileId: string } | null = null;
 let pendingDocumentCloseViewId: string | null = null;
 let projectCreationFromWorkdesk = false;
 
@@ -2857,8 +2835,7 @@ function renderWorkdeskProjectNodes(projects: readonly WorkdeskProjectExplorerSh
     button.append(icon, title, type);
     button.title = project.available ? `Project: ${project.title}` : `Project: ${project.title} (unavailable on this PC)`;
     button.addEventListener("click", () => {
-      pendingWorkdeskProjectIdentityId = project.projectIdentityId;
-      void executeCommand("maginalia.workdesk.openProject");
+      void executeCommand("maginalia.workdesk.openProject", { projectIdentityId: project.projectIdentityId });
     });
     const actions = document.createElement("div");
     actions.className = "explorer-row-actions";
@@ -2869,8 +2846,7 @@ function renderWorkdeskProjectNodes(projects: readonly WorkdeskProjectExplorerSh
     remove.textContent = "Remove";
     remove.title = `Remove ${project.title} from this Workdesk`;
     remove.addEventListener("click", () => {
-      pendingWorkdeskProjectIdentityId = project.projectIdentityId;
-      void commandRegistry.execute("maginalia.workdesk.removeProject", commandContext.snapshot());
+      void executeCommand("maginalia.workdesk.removeProject", { projectIdentityId: project.projectIdentityId });
     });
     actions.append(remove);
     row.append(button, actions);
@@ -3161,6 +3137,7 @@ function cancelProjectFileCreation(restoreFocus = true): void {
   projectInlineCreate.hidden = true;
   selectedProjectDocumentType = null;
   updateProjectActionAvailability(projectController?.getState().project !== null);
+  if (commandContextReady) updateCommandContext();
   newFileForm.reset();
   if (restoreFocus) projectNewButton.focus();
 }
@@ -3192,6 +3169,7 @@ function beginProjectFileCreation(documentType: ProjectDocumentType): void {
   projectInlineDocumentType.textContent = documentType;
   projectInlineCreate.hidden = false;
   updateProjectActionAvailability(projectController?.getState().project !== null);
+  if (commandContextReady) updateCommandContext();
   setProjectMenuOpen(projectNewMenu, projectNewButton, false);
   setProjectMenuOpen(projectOverflowMenu, projectOverflowButton, false);
   newFileTitle.focus();
@@ -3593,11 +3571,21 @@ function renderShelfState(state: ShelfViewState): void {
     select.type = "button";
     select.textContent = state.selectedAnnotationId === reference.annotationId ? "Selected" : "Select";
     select.setAttribute("aria-pressed", String(state.selectedAnnotationId === reference.annotationId));
-    select.addEventListener("click", () => shelfController?.selectResult(reference.annotationId));
+    select.addEventListener("click", () => executeShelfCommand(SHELF_SELECT_RESULT_COMMAND_ID, { annotationId: reference.annotationId }));
     const insert = document.createElement("button");
     insert.type = "button";
     insert.textContent = "Insert";
-    insert.addEventListener("click", () => void shelfController?.insertResult(reference.annotationId));
+    insert.addEventListener("click", () => {
+      // Selecting first makes the Insert command's `when` true for this row;
+      // both steps are the same commands the Palette offers.
+      const annotationId = reference.annotationId;
+      void executeShelfCommandAsync(SHELF_SELECT_RESULT_COMMAND_ID, { annotationId })
+        .then((selected) => selected && executeShelfCommandAsync(
+          SHELF_INSERT_SELECTED_QUOTE_COMMAND_ID,
+          { annotationId },
+          "Open a manuscript before inserting a quotation."
+        ));
+    });
     actions.append(select, insert);
     item.append(details, actions);
     libraryResults.append(item);
@@ -3639,6 +3627,7 @@ function renderProjectSearchState(state: ProjectSearchState): void {
         projectSearchInsertionTarget = controller.captureInsertionTarget();
         projectSearchPreview.hidden = false;
         projectSearchError.hidden = true;
+        updateCommandContext();
       });
       const sync = document.createElement("button");
       sync.type = "button";
@@ -3677,7 +3666,10 @@ function renderReferencesState(state: ReferencesViewState): void {
 
 const shelfView: ShelfControllerView = {
   setShelfState(state: ShelfViewState): void {
+    shelfResultSelected = state.selectedAnnotationId !== null
+      && state.results.some((result) => result.annotationId === state.selectedAnnotationId);
     renderShelfState(state);
+    if (commandContextReady) updateCommandContext();
   }
 };
 
@@ -4406,6 +4398,8 @@ let projectSearchController: ProjectSearchController | undefined;
 const projectSearchApi = getProjectSearchApi();
 if (projectSearchApi) {
   projectSearchController = new ProjectSearchController(projectSearchApi, renderProjectSearchState);
+  commandAvailability.projectSearch = true;
+  updateCommandContext();
 } else {
   unifiedSearchStatus.textContent = "Project search is unavailable.";
 }
@@ -4424,22 +4418,67 @@ function updateUnifiedSearchMode(mode: UnifiedSearchMode): void {
   }
 }
 
+const SHELF_FIELD_REQUIRED_MESSAGE = "Choose at least one Private Shelf field to search.";
+
+/** Shelf search command implementation (form submit and Palette). */
+async function runShelfSearchCommand(query: string | undefined): Promise<void> {
+  const shelf = shelfController;
+  if (shelf === undefined) throw new Error("Shelf is unavailable.");
+  if (query === undefined && libraryQuery.value.length === 0) {
+    // From the Palette with nothing typed yet: bring the search field forward.
+    if (unifiedSearchMode === "project") updateUnifiedSearchMode("shelf");
+    await executeCommand("maginalia.view.show.library");
+    libraryQuery.focus();
+    return;
+  }
+  if (shelfSearchFields.size === 0) {
+    libraryError.textContent = SHELF_FIELD_REQUIRED_MESSAGE;
+    libraryError.hidden = false;
+    return;
+  }
+  if (query === undefined && unifiedSearchMode === "project") updateUnifiedSearchMode("shelf");
+  libraryError.hidden = true;
+  await shelf.search(query ?? libraryQuery.value);
+}
+
+/** Current-Project Markdown search command implementation (form submit and Palette). */
+async function runProjectMarkdownSearchCommand(query: string | undefined): Promise<void> {
+  const search = projectSearchController;
+  if (search === undefined) throw new Error("Project search is unavailable.");
+  if (query === undefined && libraryQuery.value.length === 0) {
+    if (unifiedSearchMode === "shelf") updateUnifiedSearchMode("project");
+    await executeCommand("maginalia.view.show.library");
+    libraryQuery.focus();
+    return;
+  }
+  if (query === undefined && unifiedSearchMode === "shelf") updateUnifiedSearchMode("project");
+  selectedProjectSearchText = null;
+  projectSearchPreview.hidden = true;
+  updateCommandContext();
+  const projectId = projectController?.getState().project?.projectId ?? null;
+  await search.search(projectId, query ?? libraryQuery.value);
+}
+
+/** The unified search form dispatches the same commands as the Palette. */
 async function runUnifiedSearch(): Promise<void> {
   const query = libraryQuery.value;
-  if ((unifiedSearchMode === "all" || unifiedSearchMode === "shelf") && shelfSearchFields.size === 0) {
-    const filterError = "Choose at least one Private Shelf field to search.";
-    libraryError.textContent = filterError;
+  const includesShelf = unifiedSearchMode === "all" || unifiedSearchMode === "shelf";
+  const includesProject = unifiedSearchMode === "all" || unifiedSearchMode === "project";
+  if (includesShelf && shelfSearchFields.size === 0) {
+    libraryError.textContent = SHELF_FIELD_REQUIRED_MESSAGE;
     libraryError.hidden = false;
     return;
   }
   libraryError.hidden = true;
-  const jobs: Promise<void>[] = [];
-  if (unifiedSearchMode === "all" || unifiedSearchMode === "shelf") jobs.push(shelfController?.search(query) ?? Promise.resolve());
-  if (unifiedSearchMode === "all" || unifiedSearchMode === "project") {
-    selectedProjectSearchText = null;
-    projectSearchPreview.hidden = true;
-    const projectId = projectController?.getState().project?.projectId ?? null;
-    jobs.push(projectSearchController?.search(projectId, query) ?? Promise.resolve());
+  const jobs: Promise<unknown>[] = [];
+  if (includesShelf) jobs.push(executeShelfCommandAsync(SHELF_SEARCH_COMMAND_ID, { query }));
+  if (includesProject) {
+    if (commandContext.snapshot()["project.active"] === true) {
+      jobs.push(executeCommand(PROJECT_MARKDOWN_SEARCH_COMMAND_ID, { query }));
+    } else {
+      projectSearchPanel.hidden = unifiedSearchMode === "shelf";
+      unifiedSearchStatus.textContent = "Open a Project before searching its Markdown.";
+    }
   }
   await Promise.all(jobs);
 }
@@ -4462,21 +4501,41 @@ for (const input of shelfSearchFieldInputs) {
   });
 }
 projectSearchInsert.addEventListener("click", () => {
-  const selected = projectSearchSource.value.slice(projectSearchSource.selectionStart, projectSearchSource.selectionEnd);
-  const result = insertProjectSearchSelection(
+  void commandRegistry.execute(INSERT_PROJECT_SEARCH_SELECTION_COMMAND_ID, commandContext.snapshot()).then((result) => {
+    if (result.kind === "executed") {
+      projectSearchError.hidden = true;
+      return;
+    }
+    projectSearchError.textContent = result.kind === "failed"
+      ? result.error.message
+      : "Select a Project result and open a document before inserting.";
+    projectSearchError.hidden = false;
+  });
+});
+
+registerSearchCommands(commandRegistry, {
+  searchShelf: runShelfSearchCommand,
+  searchProjectMarkdown: runProjectMarkdownSearchCommand,
+  selectShelfResult: (annotationId) => {
+    const shelf = shelfController;
+    if (shelf === undefined || !shelf.getState().results.some((result) => result.annotationId === annotationId)) {
+      throw new Error("The Shelf result is no longer available.");
+    }
+    shelf.selectResult(annotationId);
+  },
+  insertShelfQuote: async (annotationId) => {
+    const shelf = shelfController;
+    if (shelf === undefined) throw new Error("Shelf is unavailable.");
+    // ShelfController reports a missing result, target, or stale insertion
+    // through the Shelf status panel.
+    await shelf.insertResult(annotationId);
+  },
+  insertProjectSearchSelection: () => insertProjectSearchSelection(
     projectSearchInsertionTarget,
-    selected,
+    projectSearchSource.value.slice(projectSearchSource.selectionStart, projectSearchSource.selectionEnd),
     (target) => controller.isInsertionTargetCurrent(target),
     (target, text) => controller.insertMarkdownText(target, text)
-  );
-  if (result === "inserted") {
-    projectSearchError.hidden = true;
-    return;
-  }
-  projectSearchError.textContent = result === "empty-selection"
-    ? "Select text in the source preview before inserting it."
-    : "The destination changed before insertion. Select a Project result again.";
-  projectSearchError.hidden = false;
+  )
 });
 
 const shelfApi = getShelfApi();
@@ -4492,6 +4551,8 @@ if (!shelfApi) {
     writing: controller,
     view: shelfView
   });
+  commandAvailability.shelf = true;
+  updateCommandContext();
   libraryQuery.addEventListener("input", () => {
     shelfController?.setQuery(libraryQuery.value);
   });
@@ -4501,14 +4562,24 @@ if (!shelfApi) {
   });
 }
 
-function executeShelfCommand(command: string): void {
-  void commandRegistry.execute(command, commandContext.snapshot()).then((result) => {
-    if (result.kind !== "failed") return;
-    libraryStatus.dataset.state = "error";
-    libraryStatus.textContent = "Shelf action failed.";
-    libraryError.textContent = result.error.message;
-    libraryError.hidden = false;
+/** Dispatch a Shelf command and report failures in the Shelf panel; resolves true when it ran. */
+function executeShelfCommandAsync(command: string, args?: CommandArgs, disabledMessage?: string): Promise<boolean> {
+  return commandRegistry.execute(command, commandContext.snapshot(), args).then((result) => {
+    const message = result.kind === "failed" ? result.error.message
+      : result.kind === "disabled" && disabledMessage !== undefined ? disabledMessage
+        : null;
+    if (message !== null) {
+      libraryStatus.dataset.state = "error";
+      libraryStatus.textContent = "Shelf action failed.";
+      libraryError.textContent = message;
+      libraryError.hidden = false;
+    }
+    return result.kind === "executed";
   });
+}
+
+function executeShelfCommand(command: string, args?: CommandArgs): void {
+  void executeShelfCommandAsync(command, args);
 }
 
 // Shelf-facing controls only dispatch command IDs. They never invoke the
@@ -4559,12 +4630,23 @@ if (exportApi) {
     compose: (document) => composeSyncedMarkdown(document.currentText, document.documentId),
     getPresentationSettings: () => currentExportPresentationSettings
   });
-  for (const input of [exportPaperSizeInput, exportOrientationInput, exportParagraphIndentInput, exportPageNumberInput]) {
-    input.addEventListener("change", saveExportSettingsFromControls);
-  }
-  for (const input of [exportHeaderLeftInput, exportHeaderCenterInput, exportHeaderRightInput]) {
-    input.addEventListener("input", saveExportSettingsFromControls);
-  }
+  commandAvailability.export = true;
+  updateCommandContext();
+  // The export panel is a second surface for the registered export settings;
+  // it writes through the Settings Registry like the Settings Center does.
+  bindExportSettingControls(settingsRegistry, [
+    { settingId: EXPORT_SETTING_IDS.paperSize, event: "change", read: () => exportPaperSizeInput.value, addEventListener: (type, listener) => exportPaperSizeInput.addEventListener(type, listener) },
+    { settingId: EXPORT_SETTING_IDS.orientation, event: "change", read: () => exportOrientationInput.value, addEventListener: (type, listener) => exportOrientationInput.addEventListener(type, listener) },
+    { settingId: EXPORT_SETTING_IDS.paragraphIndent, event: "change", read: () => exportParagraphIndentInput.checked, addEventListener: (type, listener) => exportParagraphIndentInput.addEventListener(type, listener) },
+    { settingId: EXPORT_SETTING_IDS.pageNumber, event: "change", read: () => exportPageNumberInput.checked, addEventListener: (type, listener) => exportPageNumberInput.addEventListener(type, listener) },
+    { settingId: EXPORT_SETTING_IDS.headerLeft, event: "input", read: () => exportHeaderLeftInput.value, addEventListener: (type, listener) => exportHeaderLeftInput.addEventListener(type, listener) },
+    { settingId: EXPORT_SETTING_IDS.headerCenter, event: "input", read: () => exportHeaderCenterInput.value, addEventListener: (type, listener) => exportHeaderCenterInput.addEventListener(type, listener) },
+    { settingId: EXPORT_SETTING_IDS.headerRight, event: "input", read: () => exportHeaderRightInput.value, addEventListener: (type, listener) => exportHeaderRightInput.addEventListener(type, listener) }
+  ], (message) => {
+    restoreExportSettingsControls();
+    exportStatus.dataset.state = "error";
+    exportStatus.textContent = `書き出し設定を保存できませんでした: ${message}`;
+  });
   exportButton.addEventListener("click", () => void executeCommand("maginalia.document.export"));
   exportPdfButton.addEventListener("click", () => void executeCommand("maginalia.document.exportPdf"));
   exportDocxButton.addEventListener("click", () => void executeCommand("maginalia.document.exportDocx"));
@@ -4675,13 +4757,16 @@ if (!writingSmokeMode) {
 }
 
 if (writingSmokeMode) {
+  commandAvailability.documentOpen = true;
   openMarkdownAction = async () => {
     await controller.open();
     updateSmokeTextForSmoke?.();
   };
 } else if (workspaceController) {
+  commandAvailability.documentOpen = true;
   openMarkdownAction = () => workspaceController?.openDocument();
 } else if (projectController) {
+  commandAvailability.documentOpen = true;
   const clearWorkdeskAfterProjectReplacement = (previousProjectId: string | undefined): void => {
     const project = projectController?.getState().project;
     if (!project || project.projectId === previousProjectId) return;
@@ -4741,6 +4826,7 @@ if (writingSmokeMode) {
   });
 }
 
+updateCommandContext();
 openButton.addEventListener("click", () => void executeCommand("maginalia.document.open"));
 
 newFileTitle.addEventListener("input", () => {
