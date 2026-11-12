@@ -130,7 +130,7 @@ unprotected inherited ACL on a machine like the development machine.
 ## 6. Production Host entry (PR A2)
 
 `apps/desktop/src/collector-native-host-product.ts` is the production Native Messaging
-Host `org.maginalia.collector`. It shares `collector-native-host-core.ts` (framing,
+Host `org.maginalia.collector` (process entry: `collector-native-host-product-entry.ts`). It shares `collector-native-host-core.ts` (framing,
 64 KiB requests, 1 MiB responses, envelope and `save_web_quote` validation) with the
 developer entry `collector-native-host.ts`. The developer entry keeps the descriptor,
 `MAGINALIA_COLLECTOR_TEST_ONLY=1` gate, descriptor coordination root and the
@@ -167,3 +167,66 @@ idempotent replay) and real child processes:
 
 NOT VERIFIED: a real Chrome caller, the installed standalone executable, and the
 Desktop Reviewer writing concurrently with the Host on a real Shelf.
+
+## 7. Standalone Windows distributable (PR A3)
+
+`npm run dist:collector-host` (apps/desktop, Windows x64) produces
+`release/collector-host/`:
+
+| File | Content |
+| --- | --- |
+| `payload/MAGINALIA-Collector-Host.exe` | Node SEA: `node --experimental-sea-config` blob of a Vite/Rolldown CJS bundle of `collector-native-host-product-entry.ts`, injected with `postject` (new direct devDependency, already in the lockfile transitively) |
+| `payload/shelf_mutex.node` | the N-API 8 addon, static CRT (`/MT`); the build fails if it imports a VC++ runtime DLL |
+| `payload/org.maginalia.collector.json` | host manifest: `name`, `type: stdio`, `path`, exactly one `allowed_origins` entry |
+| `payload/PROVENANCE.txt` | commit SHA, Node/N-API/V8, postject, Vite, node-gyp, NSIS versions, SHA-256 of every shipped file |
+| `payload/LICENSE.txt`, `payload/NOTICE.txt` | repository license and notice |
+| `MAGINALIA-Collector-Host-Setup-<version>.exe` | per-user NSIS installer |
+| `SHA256SUMS` | payload files and installer |
+
+Build details:
+
+- `@maginalia/format` reads its schemas from disk at import time. The bundler
+  inlines the package's copied schema files, and the build fails if any non-builtin
+  `require` remains in the bundle.
+- SEA config sets `execArgv: []` and `execArgvExtension: "none"`. Verified on
+  Node 24.14.0: `NODE_OPTIONS=--require …` and CLI runtime flags are ignored; without
+  this setting the SEA honored `NODE_OPTIONS`.
+- The addon is loaded only from `dirname(process.execPath)\shelf_mutex.node`
+  (`useProductNativeAddonLocation("sea")`), selected by `node:sea`'s `isSea()`.
+  In the SEA, `argv[1]` repeats the executable, so Chrome's origin stays at
+  `argv[2]`.
+- A build-time self-test bundles `scripts/collector-host-bundle-selftest.ts` with
+  the same configuration and runs it against a disposable profile (binding, private
+  directories, real ACL check, commit, idempotent resend, schema validation). The
+  shipped executable cannot be redirected to a disposable profile by design.
+- NSIS comes from electron-builder's checksum-pinned toolset
+  (`app-builder-lib` `getMakeNsisPath`, NSIS 3.04, the same one the Desktop
+  installer uses).
+
+Installer (`packaging/collector-host/installer.nsi`):
+
+- `RequestExecutionLevel user`, no UAC, fixed directory
+  `%LOCALAPPDATA%\Programs\MAGINALIA Collector Host`, Japanese UI.
+- Writes `HKCU\Software\Google\Chrome\NativeMessagingHosts\org.maginalia.collector`
+  (default value = manifest path) and an Apps-list entry under `HKCU\…\Uninstall\MAGINALIACollectorHost`.
+- The manifest `path` is the executable name, relative to the manifest folder (Chrome on
+  Windows resolves it there). The manifest is then static ASCII, safe for non-ASCII
+  user profile paths, and needs no install-time JSON escaping.
+- Install over the top is the update.
+- Uninstall deletes only the files it installed, the program folder when empty, the
+  host key and the Apps entry. It never touches `%LOCALAPPDATA%\MAGINALIA`, a Shelf,
+  or Chrome data.
+
+`npm run smoke:collector-host` runs the built executable directly. It does not
+install or register anything. It checks that, without a binding, `health` reports
+`writesEnabled: false` and `configured_shelf`/`save_web_quote` return
+`shelf_unconfigured`. It also checks: wrong or missing origin, frame errors, a copy
+without the addon failing closed with `configuration_unavailable`, env and
+`NODE_OPTIONS` injection ignored, and the real `%LOCALAPPDATA%\MAGINALIA` unchanged.
+
+Known limitations / NOT VERIFIED:
+- Binaries are unsigned (SmartScreen).
+- The build is not byte-reproducible (linker timestamps).
+- Node.js's own license text is not yet shipped beside the embedded runtime.
+- Installer run, registry entries, Chrome discovery, Apps-list uninstall and
+  update-over-top are deferred to the joint test with the owner.

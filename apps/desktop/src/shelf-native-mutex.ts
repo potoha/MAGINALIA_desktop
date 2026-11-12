@@ -51,9 +51,11 @@ function requireNative(candidate: string): unknown {
  *
  * - `module`: the compiled layout next to this module (`dist/main` ->
  *   `native/shelf-mutex/build/Release/shelf_mutex.node`), for the Node product entry
- *   run from a built checkout.
+ *   run from a built checkout;
+ * - `sea`: `shelf_mutex.node` in the same folder as the standalone executable
+ *   (`process.execPath`), for the Node single executable application.
  */
-export type ProductNativeAddonLocation = "module";
+export type ProductNativeAddonLocation = "module" | "sea";
 let productAddonLocation: ProductNativeAddonLocation | undefined;
 
 /** Select the production addon location before the first native call. */
@@ -130,6 +132,8 @@ let nativeModule: NativeMutexModule | undefined;
 let nativeLoadError: Error | undefined;
 
 const ADDON_RESOURCE_PATH = path.join("shelf-mutex", "shelf_mutex.node");
+/** Standalone Collector Host: the addon ships next to the executable. */
+export const SEA_ADDON_FILENAME = "shelf_mutex.node";
 const ADDON_DEVELOPMENT_PATH = path.join("native", "shelf-mutex", "build", "Release", "shelf_mutex.node");
 
 export interface NativeAddonCandidateOptions {
@@ -144,7 +148,7 @@ export interface NativeAddonCandidateOptions {
 }
 
 export interface NativeAddonResolution {
-  readonly mode: "packaged" | "development" | "product-module";
+  readonly mode: "packaged" | "development" | "product-module" | "product-sea";
   readonly candidates: readonly string[];
 }
 
@@ -189,8 +193,16 @@ export function resolveNativeAddonCandidates(options: NativeAddonCandidateOption
  */
 export function resolveProductNativeAddonCandidates(
   location: ProductNativeAddonLocation,
-  options: { readonly moduleDirectory?: string | undefined },
+  options: { readonly moduleDirectory?: string | undefined; readonly executablePath?: string | undefined },
 ): NativeAddonResolution {
+  if (location === "sea") {
+    return Object.freeze({
+      mode: "product-sea",
+      candidates: Object.freeze(nonEmpty(options.executablePath)
+        ? [path.join(path.dirname(path.resolve(options.executablePath)), SEA_ADDON_FILENAME)]
+        : []),
+    });
+  }
   if (location === "module" && nonEmpty(options.moduleDirectory)) {
     return Object.freeze({
       mode: "product-module",
@@ -238,6 +250,7 @@ export function loadNativeShelfMutex(): NativeMutexModule {
   const resolution = productAddonLocation !== undefined
     ? resolveProductNativeAddonCandidates(productAddonLocation, {
       moduleDirectory: typeof __dirname === "string" ? __dirname : undefined,
+      executablePath: process.execPath,
     })
     : resolveNativeAddonCandidates({
       resourcesPath: processLike.resourcesPath,
