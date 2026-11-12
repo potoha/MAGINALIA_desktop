@@ -14,7 +14,7 @@ import {
 } from "electron";
 import { existsSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, realpath, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { findApplicationIconPath, findBrandAssetPath } from "./brand-assets";
 import {
@@ -100,6 +100,7 @@ import {
   type SaveMarkdownResult
 } from "./markdown-ipc";
 import { LibraryService } from "./library-service";
+import { inspectFolderMarkers } from "./folder-identity";
 import { createLibraryHandlers } from "./library-ipc";
 import { createShelfHandlers, REFRESH_SHELF_CHANNEL, SEARCH_SHELF_CHANNEL } from "./shelf-ipc";
 import { ConfiguredPrivateShelf } from "./configured-private-shelf";
@@ -107,6 +108,9 @@ import { ShelfLocationRegistry } from "./shelf-location-registry";
 import { resolveDesktopConfigurationPaths, type DesktopConfigurationPaths } from "./desktop-configuration";
 import { createReviewerShelfSyncAdapter } from "./reviewer-shelf-sync";
 import { materializeApprovedReviewerRecords } from "./reviewer-approval-materializer";
+import { createShelfBindingFileStore, resolveShelfBindingStoragePaths, type ShelfBindingStoragePaths } from "./shelf-binding-store";
+import { resolveReviewerShelfWriteCoordination } from "./reviewer-shelf-write-binding";
+import { getNativeLocalAppDataPath } from "./shelf-native-mutex";
 import { createReferenceHandlers } from "./reference-ipc";
 import { resolveShelfQuoteRefs } from "./shelf-resolution";
 import { PackagedReviewerLaunchStrategy, ReviewerProcessManager, UserDataReviewerWorkspaceLocator } from "./reviewer-process-manager";
@@ -280,11 +284,22 @@ const projectService = new ProjectService(
 const projectAssetService = new ProjectAssetService(documentWorkspaceService);
 const libraryService = new LibraryService();
 let desktopConfigurationPaths: DesktopConfigurationPaths | undefined;
+let shelfBindingStoragePaths: ShelfBindingStoragePaths | undefined;
+let shelfBindingStore: ReturnType<typeof createShelfBindingFileStore> | undefined;
 function getDesktopConfigurationPaths(): DesktopConfigurationPaths {
   // Electron chooses userData; resolving lazily ensures that path is final and
   // avoids accidentally binding Shelf discovery to bootstrap cwd/state.
   desktopConfigurationPaths ??= resolveDesktopConfigurationPaths(userDataPath);
   return desktopConfigurationPaths;
+}
+
+function getShelfBindingStorage(): {
+  readonly paths: ShelfBindingStoragePaths;
+  readonly store: ReturnType<typeof createShelfBindingFileStore>;
+} {
+  shelfBindingStoragePaths ??= resolveShelfBindingStoragePaths(getNativeLocalAppDataPath());
+  shelfBindingStore ??= createShelfBindingFileStore(shelfBindingStoragePaths.bindingDirectory);
+  return { paths: shelfBindingStoragePaths, store: shelfBindingStore };
 }
 
 let configuredPrivateShelf: ConfiguredPrivateShelf | undefined;
@@ -315,6 +330,81 @@ async function getActivePrivateShelfForDesktop(owner: object) {
   }
   if (selection.canceled || selection.filePaths.length !== 1) return active;
   return configured.configureAndOpen(owner, selection.filePaths[0]);
+}
+
+async function getReviewerShelfWriteCoordination(shelfRoot: string) {
+  const owner = mainWindow?.webContents;
+  if (owner === undefined || owner.isDestroyed()) throw new Error("The Desktop window is unavailable.");
+  const active = await getConfiguredPrivateShelf().getActive(owner);
+  if (active.kind !== "private-shelf" || active.folderIdentityRecovery !== undefined) {
+    throw new Error("The configured Private Shelf identity cannot be verified.");
+  }
+  const configurationPath = getDesktopConfigurationPaths().shelfLocationPath;
+  const location = await new ShelfLocationRegistry(configurationPath).load();
+  if (location.kind !== "loaded" || typeof location.config.privateShelf.registry !== "string") {
+    throw new Error("The configured Private Shelf location cannot be read.");
+  }
+  const privateShelfLocator = location.config.privateShelf.registry;
+  let canonicalConfiguredRoot: string;
+  let canonicalRequestedRoot: string;
+  try {
+    [canonicalConfiguredRoot, canonicalRequestedRoot] = await Promise.all([
+      realpath(privateShelfLocator),
+      realpath(shelfRoot),
+    ]);
+  } catch {
+    throw new Error("The configured Private Shelf is unavailable.");
+  }
+  if (path.resolve(canonicalConfiguredRoot) !== path.resolve(active.canonicalRoot)
+    || path.resolve(canonicalRequestedRoot) !== path.resolve(active.canonicalRoot)) {
+    throw new Error("The configured Private Shelf changed before Reviewer materialization.");
+  }
+  const markerInspection = await inspectFolderMarkers(active.canonicalRoot);
+  if (markerInspection.kind !== "valid" || markerInspection.marker.type !== "shelf"
+    || (active.folderIdentityId !== undefined && active.folderIdentityId.toLowerCase() !== markerInspection.marker.id.toLowerCase())) {
+    throw new Error("The configured Private Shelf marker is missing, conflicting, or changed.");
+  }
+
+  const storage = getShelfBindingStorage();
+  const context = {
+    shelfName: active.library.displayName,
+    shelfRoot: active.canonicalRoot,
+    shelfLocationPath: configurationPath,
+    privateShelfLocator,
+    typedMarker: markerInspection.marker,
+  };
+  return resolveReviewerShelfWriteCoordination({
+    storagePaths: storage.paths,
+    store: storage.store,
+    context,
+    confirmRebind: async (reason, shelf) => {
+      const detail = reason === "binding-missing"
+        ? "MAGINALIA will remember this explicitly selected Private Shelf for Reviewer writes and shared Windows coordination. It will not change Shelf files or its identity marker."
+        : "The configured Shelf path or identity differs from the saved connection. Reconfirm this Shelf to update MAGINALIA's binding. No Shelf files or identity markers will be changed.";
+      const options: MessageBoxOptions = {
+        type: "question",
+        title: "Confirm Private Shelf connection",
+        message: `Use ${shelf.shelfName} for Reviewer writes?`,
+        detail,
+        buttons: ["Confirm Shelf", "Cancel"],
+        defaultId: 1,
+        cancelId: 1,
+        noLink: true,
+      };
+      const result = mainWindow === null
+        ? await dialog.showMessageBox(options)
+        : await dialog.showMessageBox(mainWindow, options);
+      return result.response === 0;
+    },
+    reloadConfiguration: async () => {
+      const latest = await new ShelfLocationRegistry(configurationPath).load();
+      return latest.kind === "loaded" ? latest.config.privateShelf.registry : null;
+    },
+    reloadTypedMarker: async () => {
+      const latest = await inspectFolderMarkers(active.canonicalRoot).catch(() => undefined);
+      return latest?.kind === "valid" && latest.marker.type === "shelf" ? latest.marker : null;
+    },
+  });
 }
 // The main process is the only owner of the Reviewer process, workspace, and
 // loopback origin.  It is deliberately lazy: ordinary Project/Workdesk work
@@ -694,7 +784,8 @@ const reviewerShelfSync = createReviewerShelfSyncAdapter({
   // Reviewer is started only for Shelf materialization or explicit refresh.
   // Its origin and process token stay in the main process.
   getBaseUrl: getManagedReviewerBaseUrl,
-  getDesktopRequestToken: () => getReviewerProcessManager().getDesktopRequestToken()
+  getDesktopRequestToken: () => getReviewerProcessManager().getDesktopRequestToken(),
+  getWriteCoordination: getReviewerShelfWriteCoordination,
 });
 let reviewerApprovalMaterialization: Promise<void> = Promise.resolve();
 function handleReviewerCaptureApproved(event: Electron.IpcMainEvent, annotationId: unknown): void {

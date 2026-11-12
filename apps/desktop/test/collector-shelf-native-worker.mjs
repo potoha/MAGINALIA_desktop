@@ -35,11 +35,55 @@ if (typeof commandFile !== "string") {
 }
 
 const mainDirectory = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "main");
+const command = JSON.parse(await readFile(commandFile, "utf8"));
+
 const mutex = require(path.join(mainDirectory, "shelf-native-mutex.js"));
 const nativeLock = require(path.join(mainDirectory, "shelf-native-write-lock.js"));
-const coordination = require(path.join(mainDirectory, "shelf-write-coordination.js"));
+const shelfWriteCore = require(path.join(mainDirectory, "shelf-write-core.js"));
 
-const command = JSON.parse(await readFile(commandFile, "utf8"));
+// Inject crash barriers before loading the Reviewer modules. Their CommonJS import
+// namespaces then resolve the same test-only wrapped filesystem export used by the
+// exact production transaction path. No production flag or test hook is added.
+if ((command.mode === "reviewerCrashAtBoundary" || command.mode === "reviewerApprovalCrashAtBoundary")
+  && (command.boundary === "before-asset" || command.boundary === "after-annotation-before-receipt")) {
+  const publish = shelfWriteCore.publishShelfFileNoReplace;
+  let paused = false;
+  shelfWriteCore.publishShelfFileNoReplace = async (target, contents) => {
+    const absoluteTarget = path.resolve(target);
+    // The test temp folder may be on another volume than the checkout, so
+    // path.relative(shelfRoot, target) is not a usable discriminator on Windows.
+    const targetParts = absoluteTarget.split(path.sep).map((part) => part.toLowerCase());
+    const sourcesIndex = targetParts.lastIndexOf("sources");
+    const isSourceAsset = sourcesIndex >= 0 && /^[a-f0-9]{64}$/.test(targetParts[sourcesIndex + 1] ?? "");
+    const isAnnotation = typeof command.annotationsDirectory === "string"
+      && path.basename(path.dirname(absoluteTarget)).toLowerCase() === "annotations"
+      && path.basename(absoluteTarget).toLowerCase().startsWith("ann-")
+      && path.basename(absoluteTarget).toLowerCase().endsWith(".json");
+    if (!paused && command.boundary === "before-asset" && isSourceAsset) {
+      paused = true;
+      await pauseAtReviewerBoundary("staged-before-asset");
+    }
+    const state = await publish(target, contents);
+    if (!paused && command.boundary === "after-annotation-before-receipt" && isAnnotation) {
+      paused = true;
+      await pauseAtReviewerBoundary(command.boundary);
+    }
+    return state;
+  };
+}
+
+const coordination = require(path.join(mainDirectory, "shelf-write-coordination.js"));
+if ((command.mode === "reviewerCrashAtBoundary" || command.mode === "reviewerApprovalCrashAtBoundary")
+  && (command.boundary === "before-annotation" || command.boundary === "after-receipt")) {
+  const commit = coordination.commitShelfRecordTransaction;
+  coordination.commitShelfRecordTransaction = async (request) => commit({
+    ...request,
+    ...(command.boundary === "before-annotation"
+      ? { beforeAnnotationPublish: async () => pauseAtReviewerBoundary(command.boundary) }
+      : { afterReceipt: async (receipt) => pauseAtReviewerBoundary(command.boundary, receipt) })
+  });
+}
+const reviewerMaterializer = require(path.join(mainDirectory, "reviewer-shelf-materializer.js"));
 
 function emit(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -73,6 +117,134 @@ function mutexOptions() {
     ...(command.acquireTimeoutMs === undefined ? {} : { acquireTimeoutMs: command.acquireTimeoutMs }),
     ...(command.pollIntervalMs === undefined ? {} : { pollIntervalMs: command.pollIntervalMs })
   };
+}
+
+function reviewerRecordFromCommand() {
+  const record = structuredClone(command.reviewerRecord);
+  if (Array.isArray(record.sourceFiles)) {
+    record.sourceFiles = record.sourceFiles.map((file) => ({
+      ...file,
+      bytes: Array.isArray(file.bytes) ? Uint8Array.from(file.bytes) : file.bytes
+    }));
+  }
+  return record;
+}
+
+function pauseAtReviewerBoundary(boundary, receipt) {
+  emit({ ok: true, stage: "reviewer-boundary", boundary, ...(receipt === undefined ? {} : { receipt }), pid: process.pid });
+  stayAlive();
+  return new Promise(() => {});
+}
+
+async function runReviewerMaterialization() {
+  const result = await reviewerMaterializer.materializeReviewerRecords(
+    command.shelfRoot,
+    [reviewerRecordFromCommand()],
+    async () => command.metadataLookup ?? ({ status: "not-found" }),
+    {
+      coordinationRoot: command.coordinationRoot,
+      expectedShelfId: command.expectedShelfId,
+      ...(command.acquireTimeoutMs === undefined ? {} : { acquireTimeoutMs: command.acquireTimeoutMs })
+    }
+  );
+  emit({ ok: true, result, pid: process.pid });
+}
+
+async function runReviewerApprovalPath() {
+  const reviewerSync = require(path.join(mainDirectory, "reviewer-shelf-sync.js"));
+  const approvalMaterializer = require(path.join(mainDirectory, "reviewer-approval-materializer.js"));
+  const folderIdentity = require(path.join(mainDirectory, "folder-identity.js"));
+  const bindingStore = require(path.join(mainDirectory, "shelf-binding-store.js"));
+  const bindingResolver = require(path.join(mainDirectory, "reviewer-shelf-write-binding.js"));
+  const reviewerRecord = reviewerRecordFromCommand();
+  let bindingConfirmations = 0;
+  const quotation = {
+    annotationId: reviewerRecord.annotationId,
+    captureId: `capture-${reviewerRecord.annotationId}`,
+    pageId: `page-${reviewerRecord.annotationId}`,
+    sourcePageId: null,
+    isbn13: reviewerRecord.isbn13 ?? null,
+    packageId: reviewerRecord.packageId ?? null,
+    sourceKind: reviewerRecord.sourceKind ?? null,
+    getDate: reviewerRecord.getDate ?? null,
+    url: reviewerRecord.url ?? null,
+    title: reviewerRecord.title ?? null,
+    authors: reviewerRecord.authors ?? [],
+    publisher: reviewerRecord.publisher ?? null,
+    year: reviewerRecord.year ?? null,
+    quote: reviewerRecord.quote,
+    pageLabel: reviewerRecord.pageLabel,
+    comment: reviewerRecord.comment,
+    reviewState: "APPROVED",
+    reviewedAtMs: reviewerRecord.reviewedAtMs ?? 1_728_000_000_000
+  };
+  const synchronize = reviewerSync.createReviewerShelfSyncAdapter({
+    baseUrl: "http://127.0.0.1:43127/",
+    reviewerFetcher: async () => new Response(JSON.stringify({
+      results: [quotation],
+      total: 1,
+      limit: 100,
+      offset: 0
+    }), { status: 200 }),
+    lookupMetadata: async () => command.metadataLookup ?? ({ status: "not-found" }),
+    getWriteCoordination: async () => {
+      const marker = await folderIdentity.inspectFolderMarkers(command.shelfRoot);
+      if (marker.kind !== "valid" || marker.marker.type !== "shelf") {
+        throw new Error("The disposable test Shelf marker is invalid.");
+      }
+      const coordination = await bindingResolver.resolveReviewerShelfWriteCoordination({
+        storagePaths: {
+          bindingDirectory: command.bindingDirectory,
+          coordinationRoot: command.coordinationRoot
+        },
+        store: bindingStore.createShelfBindingFileStore(command.bindingDirectory),
+        context: {
+          shelfName: "Disposable test Shelf",
+          shelfRoot: command.shelfRoot,
+          shelfLocationPath: command.shelfLocationPath,
+          privateShelfLocator: command.shelfRoot,
+          typedMarker: marker.marker
+        },
+        confirmRebind: async () => {
+          bindingConfirmations += 1;
+          return true;
+        },
+        reloadConfiguration: async () => command.shelfRoot,
+        reloadTypedMarker: async () => marker.marker
+      });
+      emit({
+        ok: true,
+        stage: "reviewer-binding",
+        expectedShelfId: coordination.expectedShelfId,
+        bindingConfirmations
+      });
+      return coordination;
+    }
+  });
+  const configuredShelf = {
+    async getActive() { return { kind: "private-shelf", canonicalRoot: command.shelfRoot }; },
+    async reload() {}
+  };
+  const syncResult = await approvalMaterializer.materializeApprovedReviewerRecords(
+    {},
+    configuredShelf,
+    synchronize
+  );
+  if (syncResult === null || syncResult.kind !== "completed") {
+    throw new Error(syncResult?.error?.message ?? "Reviewer approval sync did not complete.");
+  }
+  emit({
+    ok: true,
+    path: "reviewer-approval-sync",
+    bindingConfirmations,
+    result: {
+      materialized: syncResult.materialized,
+      unchanged: syncResult.unchanged,
+      pending: syncResult.pendingRecords,
+      conflicts: syncResult.conflicts
+    },
+    pid: process.pid
+  });
 }
 
 if (command.mode === "participant") {
@@ -193,6 +365,42 @@ if (command.mode === "participant") {
   // Report the persistent recovery record without writing anything.
   try {
     emit({ ok: true, ...(await recoverySnapshot()), pid: process.pid });
+  } catch (error) {
+    reportFailure(error);
+  }
+} else if (command.mode === "reviewer") {
+  try {
+    emit({ ok: true, stage: "starting", ...(await recoverySnapshot()), pid: process.pid });
+    await runReviewerMaterialization();
+  } catch (error) {
+    reportFailure(error);
+  }
+} else if (command.mode === "reviewerCrashAtBoundary") {
+  try {
+    const boundary = command.boundary;
+    if (!["before-asset", "before-annotation", "after-annotation-before-receipt", "after-receipt"].includes(boundary)) {
+      throw new Error("unsupported Reviewer crash boundary");
+    }
+    emit({ ok: true, stage: "starting", pid: process.pid });
+    await runReviewerMaterialization();
+  } catch (error) {
+    reportFailure(error);
+  }
+} else if (command.mode === "reviewerApproval") {
+  try {
+    emit({ ok: true, stage: "starting", ...(await recoverySnapshot()), pid: process.pid });
+    await runReviewerApprovalPath();
+  } catch (error) {
+    reportFailure(error);
+  }
+} else if (command.mode === "reviewerApprovalCrashAtBoundary") {
+  try {
+    const boundary = command.boundary;
+    if (!["before-annotation", "after-annotation-before-receipt", "after-receipt"].includes(boundary)) {
+      throw new Error("unsupported Reviewer approval crash boundary");
+    }
+    emit({ ok: true, stage: "starting", ...(await recoverySnapshot()), pid: process.pid });
+    await runReviewerApprovalPath();
   } catch (error) {
     reportFailure(error);
   }
