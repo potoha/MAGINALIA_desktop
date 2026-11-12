@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ExperimentalFrameDecoder, handleExperimentalRequest, parseExperimentalFrame } from "./collector-native-host";
+import type { ShelfQuoteWriteReceipt, ShelfQuoteWriteRequest } from "./shelf-write-coordination";
 
 const protocol = "maginalia.collector.experimental.v1";
 function frame(text: string): Buffer {
@@ -89,13 +90,13 @@ describe("experimental request validation", () => {
       }));
       const requestId = "00000000-0000-4000-8000-000000000002";
       const request = { protocol, operation: "save_web_quote", requestId, quote: "Selected test quotation", url: "https://example.com/", getDate: "202611031200", title: "Sample Page", authors: [] };
-      const receipt = {
+      const receipt: ShelfQuoteWriteReceipt = {
         version: 1, state: "committed", requestId, shelfId, bookId: "book:01JBF5GD3RT8YCKM93Q5D9X0EX",
         annotationId: "ann:01JBF5GD3RT8YCKM93Q5D9X0EY", bookReused: false,
         annotationDigest: `sha256:${"a".repeat(64)}`, requestDigest: `sha256:${"b".repeat(64)}`, recordedAt: "2026-11-03T03:00:00.000Z"
       };
-      let writerRequest;
-      const writer = async (value) => { writerRequest = value; return receipt; };
+      let writerRequest: ShelfQuoteWriteRequest | undefined;
+      const writer = async (value: ShelfQuoteWriteRequest) => { writerRequest = value; return receipt; };
       const env = { MAGINALIA_COLLECTOR_TEST_ONLY: "1" };
 
       expect(await handleExperimentalRequest({ protocol, operation: "health" }, descriptorPath, origin, env))

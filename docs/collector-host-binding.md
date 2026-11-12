@@ -154,6 +154,12 @@ recovery probe; none of these exist in the production entry.
   or `already-committed` for the requested ID and bound Shelf.
 - stdout carries frames only. Responses and stderr carry no paths, path-to-UUID
   mapping or quote text.
+- Time budget: the Collector waits 30 s for a save. The Host's save path is the
+  configuration read (milliseconds), then at most the writer's unchanged 15 s mutex
+  acquisition timeout, then the commit (normally well under 1 s). A recovery
+  assessment after an interrupted write scans the journal and is not bounded by a
+  separate deadline. This is the only path that could approach the 30 s budget, and
+  it is NOT VERIFIED on a large journal.
 
 Tests: `npm run test:collector-product-host` covers the unit cases (origin,
 fail-closed codes, request validation, busy, receipt checks, real commit and
