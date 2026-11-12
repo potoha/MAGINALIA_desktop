@@ -113,6 +113,13 @@ acceptance in `test/e2e-isolation-smoke.test.mjs`. That acceptance covers:
 To run the Electron cases against a packaged `win-unpacked` executable, set
 `MAGINALIA_SMOKE_PACKAGED_EXECUTABLE`.
 
+**Packaged app.** The same isolation applies to the packaged app. Electron
+honors `--user-data-dir` in packaged builds, and the gate is part of the
+product main process. With `MAGINALIA_SMOKE_PACKAGED_EXECUTABLE` set to the α2
+`win-unpacked` executable, the acceptance passed 4/4. An *installed* NSIS app
+is isolated the same way: launch its executable through the harness. That run
+is NOT VERIFIED here because the installer was not run.
+
 ## Limits
 
 - The acceptance drives the existing `--smoke` and `--first-run-smoke` modes,

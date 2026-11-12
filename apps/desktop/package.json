@@ -49,7 +49,9 @@
     "package:windows:runtime": "node scripts/build-windows-runtime.mjs",
     "package:windows:stage": "node scripts/stage-windows-app.mjs",
     "package:windows:installer": "electron-builder --win nsis --x64 --config packaging/electron-builder.json",
-    "dist:windows": "npm run package:windows:runtime && npm run package:windows:stage && npm run package:windows:installer",
+    "package:windows:dir": "electron-builder --win dir --x64 --config packaging/electron-builder.json",
+    "verify:packaged-shelf-mutex": "node scripts/verify-packaged-shelf-mutex.mjs",
+    "dist:windows": "npm run package:windows:runtime && npm run build:native && npm run package:windows:stage && npm run package:windows:installer",
     "smoke:h5": "npm run build && node test/h5-smoke.mjs",
     "prestart": "npm run build --prefix ../.. --workspaces --if-present",
     "start": "electron dist/main/main.js"
