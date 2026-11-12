@@ -1,0 +1,4 @@
+# Byte-exact files: no line-ending conversion on checkout (core.autocrlf=true
+# would otherwise rewrite them and break contract tests and pinned hashes).
+Tutorial_sample_setup/** -text
+sidecars/reviewer/ndlocr-runtime/licenses/** -text
