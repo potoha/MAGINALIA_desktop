@@ -31,7 +31,15 @@ export interface CommandTextSearchMatch {
   readonly matches: readonly CommandTextRange[];
 }
 
-export type CommandHandler = () => void | Promise<void>;
+/**
+ * Optional, bounded invocation arguments. Values are opaque scalar strings
+ * (for example a document, file, or annotation ID) so a surface can target a
+ * concrete object without inventing a private action path. Commands that can
+ * only run with arguments are registered as `internal`, which keeps them out of
+ * the Palette, Shortcut Editor, and native menu.
+ */
+export type CommandArgs = Readonly<Record<string, string>>;
+export type CommandHandler = (args?: CommandArgs) => void | Promise<void>;
 export type CommandOrigin = "core" | "mod";
 
 interface RegisteredCommand {
@@ -165,12 +173,14 @@ export class CommandRegistry {
       || left.descriptor.id.localeCompare(right.descriptor.id));
   }
 
-  public async execute(id: string, context: CommandContext): Promise<CommandExecutionResult> {
+  public async execute(id: string, context: CommandContext, args?: CommandArgs): Promise<CommandExecutionResult> {
     const command = this.commands.get(id);
     if (command === undefined) return { kind: "missing" };
     if (!matchesWhen(context, command.descriptor.when)) return { kind: "disabled" };
+    const invocationArgs = args === undefined ? undefined : copyCommandArgs(args);
+    if (invocationArgs === null) return { kind: "failed", error: new Error("Invalid command arguments.") };
     try {
-      await command.handler();
+      await command.handler(invocationArgs);
       return { kind: "executed" };
     } catch (error: unknown) {
       return { kind: "failed", error: error instanceof Error ? error : new Error("Command failed.") };
@@ -187,6 +197,24 @@ export class CommandRegistry {
       try { listener(); } catch { /* one surface cannot break commands */ }
     }
   }
+}
+
+const MAX_COMMAND_ARGS = 8;
+const MAX_COMMAND_ARG_LENGTH = 4_096;
+
+/** Accept only a small plain record of string values; anything else is rejected. */
+function copyCommandArgs(value: unknown): CommandArgs | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return null;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length > MAX_COMMAND_ARGS) return null;
+  const copy: Record<string, string> = {};
+  for (const [key, entry] of entries) {
+    if (!/^[a-z][a-zA-Z0-9]*$/u.test(key) || typeof entry !== "string" || entry.length > MAX_COMMAND_ARG_LENGTH) return null;
+    copy[key] = entry;
+  }
+  return Object.freeze(copy);
 }
 
 interface FuzzyTextMatch {
