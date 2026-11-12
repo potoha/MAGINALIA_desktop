@@ -125,6 +125,11 @@ import {
 } from "./first-run-ipc";
 import { OPEN_BUNDLED_MANUAL_CHANNEL, type OpenBundledManualResult } from "./manual-ipc";
 import {
+  CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL,
+  CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL,
+  type CollectorSaveDestinationIpcResult
+} from "./collector-save-destination-ipc";
+import {
   CREATE_WORKDESK_CHANNEL,
   CREATE_WORKDESK_FILE_CHANNEL,
   CREATE_WORKDESK_PROJECT_CHANNEL,
@@ -361,6 +366,8 @@ export interface MarkdownPreloadApi {
   updateApplicationMenu?(snapshot: readonly ApplicationMenuCommandState[]): Promise<void>;
   onApplicationCommand?(callback: ApplicationMenuCommandCallback): EventUnsubscribe;
   openBundledManual?(): Promise<OpenBundledManualResult>;
+  configureCollectorSaveDestination?(): Promise<CollectorSaveDestinationIpcResult>;
+  clearCollectorSaveDestination?(): Promise<CollectorSaveDestinationIpcResult>;
   openMarkdown(): Promise<OpenMarkdownResult>;
   saveMarkdown(request: SaveMarkdownRequest): Promise<SaveMarkdownResult>;
   openDocument?(): Promise<OpenDocumentResult>;
@@ -429,6 +436,8 @@ export type CompleteMarkdownPreloadApi = MarkdownPreloadApi & {
   updateApplicationMenu(snapshot: readonly ApplicationMenuCommandState[]): Promise<void>;
   onApplicationCommand(callback: ApplicationMenuCommandCallback): EventUnsubscribe;
   openBundledManual(): Promise<OpenBundledManualResult>;
+  configureCollectorSaveDestination(): Promise<CollectorSaveDestinationIpcResult>;
+  clearCollectorSaveDestination(): Promise<CollectorSaveDestinationIpcResult>;
   openDocument(): Promise<OpenDocumentResult>;
   openManuscript(request: OpenManuscriptRequest): Promise<OpenManuscriptResult>;
   listExplorer(request: ExplorerListRequest): Promise<ExplorerListResult>;
@@ -519,6 +528,8 @@ export function createMarkdownPreloadApi(
       });
     },
     openBundledManual: () => invoke(OPEN_BUNDLED_MANUAL_CHANNEL) as Promise<OpenBundledManualResult>,
+    configureCollectorSaveDestination: () => invoke(CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL) as Promise<CollectorSaveDestinationIpcResult>,
+    clearCollectorSaveDestination: () => invoke(CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL) as Promise<CollectorSaveDestinationIpcResult>,
     openMarkdown: () => invoke(OPEN_MARKDOWN_CHANNEL) as Promise<OpenMarkdownResult>,
     saveMarkdown: (request) => invoke(SAVE_MARKDOWN_CHANNEL, request) as Promise<SaveMarkdownResult>,
     openDocument: () => invoke(OPEN_DOCUMENT_CHANNEL) as Promise<OpenDocumentResult>,

@@ -108,9 +108,20 @@ import { ShelfLocationRegistry } from "./shelf-location-registry";
 import { resolveDesktopConfigurationPaths, type DesktopConfigurationPaths } from "./desktop-configuration";
 import { createReviewerShelfSyncAdapter } from "./reviewer-shelf-sync";
 import { materializeApprovedReviewerRecords } from "./reviewer-approval-materializer";
-import { createShelfBindingFileStore, resolveShelfBindingStoragePaths, type ShelfBindingStoragePaths } from "./shelf-binding-store";
+import { createShelfBindingFileStore, removeShelfBindingFile, resolveShelfBindingStoragePaths, type ShelfBindingStoragePaths } from "./shelf-binding-store";
 import { resolveReviewerShelfWriteCoordination } from "./reviewer-shelf-write-binding";
-import { getNativeLocalAppDataPath } from "./shelf-native-mutex";
+import { createNativePrivateDirectory, getNativeLocalAppDataPath, inspectNativePathSecurity } from "./shelf-native-mutex";
+import {
+  clearCollectorSaveDestination,
+  collectorSaveDestinationConfirmationText,
+  configureCollectorSaveDestination,
+  type CollectorSaveDestinationDependencies,
+} from "./collector-save-destination";
+import {
+  CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL,
+  CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL,
+  type CollectorSaveDestinationIpcResult,
+} from "./collector-save-destination-ipc";
 import { createReferenceHandlers } from "./reference-ipc";
 import { resolveShelfQuoteRefs } from "./shelf-resolution";
 import { PackagedReviewerLaunchStrategy, ReviewerProcessManager, UserDataReviewerWorkspaceLocator } from "./reviewer-process-manager";
@@ -298,8 +309,78 @@ function getShelfBindingStorage(): {
   readonly store: ReturnType<typeof createShelfBindingFileStore>;
 } {
   shelfBindingStoragePaths ??= resolveShelfBindingStoragePaths(getNativeLocalAppDataPath());
-  shelfBindingStore ??= createShelfBindingFileStore(shelfBindingStoragePaths.bindingDirectory);
+  // Missing integration directories are created with a protected current-user /
+  // SYSTEM / Administrators DACL so the Collector ACL check can pass even when the
+  // inherited LocalAppData ACL grants other principals write access.
+  shelfBindingStore ??= createShelfBindingFileStore(shelfBindingStoragePaths.bindingDirectory, {
+    createDirectory: async (directory) => { createNativePrivateDirectory(directory); },
+  });
   return { paths: shelfBindingStoragePaths, store: shelfBindingStore };
+}
+
+let collectorSaveDestinationBusy = false;
+
+async function showCollectorSaveDestinationDialog(options: MessageBoxOptions) {
+  return mainWindow === null || mainWindow.isDestroyed()
+    ? dialog.showMessageBox(options)
+    : dialog.showMessageBox(mainWindow, options);
+}
+
+/** Runs one Collector save-destination command; dialogs are owned by the main process. */
+async function runCollectorSaveDestinationCommand(
+  command: (dependencies: CollectorSaveDestinationDependencies) => Promise<CollectorSaveDestinationIpcResult>,
+): Promise<CollectorSaveDestinationIpcResult> {
+  if (collectorSaveDestinationBusy) return { kind: "busy" };
+  collectorSaveDestinationBusy = true;
+  try {
+    let storage: ReturnType<typeof getShelfBindingStorage>;
+    try {
+      storage = getShelfBindingStorage();
+    } catch {
+      await showCollectorSaveDestinationDialog({
+        type: "error",
+        title: "Collector の保存先",
+        message: "Collector 連携の設定場所を確認できません。",
+        detail: "Windows のユーザー用ローカルアプリデータフォルダーを確認できませんでした。Collector の保存先の設定は変更されていません。",
+        noLink: true,
+      });
+      return { kind: "error" };
+    }
+    return await command({
+      shelfLocationPath: getDesktopConfigurationPaths().shelfLocationPath,
+      storagePaths: storage.paths,
+      store: storage.store,
+      inspectPathSecurity: inspectNativePathSecurity,
+      removeBinding: () => removeShelfBindingFile(storage.paths.bindingDirectory),
+      confirm: async (request) => {
+        const text = collectorSaveDestinationConfirmationText(request);
+        const result = await showCollectorSaveDestinationDialog({
+          type: "question",
+          title: text.title,
+          message: text.message,
+          detail: text.detail,
+          buttons: [text.confirmLabel, "キャンセル"],
+          defaultId: 1,
+          cancelId: 1,
+          noLink: true,
+        });
+        return result.response === 0;
+      },
+      notify: async (notice) => {
+        await showCollectorSaveDestinationDialog({
+          type: notice.type,
+          title: "Collector の保存先",
+          message: notice.message,
+          ...(notice.detail === undefined ? {} : { detail: notice.detail }),
+          noLink: true,
+        });
+      },
+    });
+  } catch {
+    return { kind: "error" };
+  } finally {
+    collectorSaveDestinationBusy = false;
+  }
 }
 
 let configuredPrivateShelf: ConfiguredPrivateShelf | undefined;
@@ -1364,6 +1445,14 @@ function registerMarkdownIpc(): void {
     () => mainWindow === null || mainWindow.isDestroyed() ? null : mainWindow.webContents,
     installNativeApplicationMenu
   ));
+  ipcMain.handle(CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL, async (event): Promise<CollectorSaveDestinationIpcResult> => {
+    if (event.sender !== mainWindow?.webContents) return { kind: "error" };
+    return runCollectorSaveDestinationCommand(configureCollectorSaveDestination);
+  });
+  ipcMain.handle(CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL, async (event): Promise<CollectorSaveDestinationIpcResult> => {
+    if (event.sender !== mainWindow?.webContents) return { kind: "error" };
+    return runCollectorSaveDestinationCommand(clearCollectorSaveDestination);
+  });
   ipcMain.handle(OPEN_BUNDLED_MANUAL_CHANNEL, async (event) => {
     if (event.sender !== mainWindow?.webContents) return { kind: "error" as const };
     const manualPath = app.isPackaged
@@ -1473,6 +1562,8 @@ function registerMarkdownIpc(): void {
 function unregisterMarkdownIpc(): void {
   ipcMain.removeHandler(UPDATE_APPLICATION_MENU_CHANNEL);
   ipcMain.removeHandler(OPEN_BUNDLED_MANUAL_CHANNEL);
+  ipcMain.removeHandler(CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL);
+  ipcMain.removeHandler(CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL);
   ipcMain.removeHandler(GET_FIRST_RUN_STATUS_CHANNEL);
   ipcMain.removeHandler(RUN_FIRST_RUN_SETUP_CHANNEL);
   ipcMain.removeHandler(OPEN_MARKDOWN_CHANNEL);
