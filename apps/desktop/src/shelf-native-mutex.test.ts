@@ -10,7 +10,7 @@
  * command `npm run test:collector-shelf-native` builds first and is the evidence
  * path.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, link, lstat, readFile, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -29,7 +29,9 @@ import {
 import {
   SHELF_WRITER_RECOVERY_STATE_FILENAME,
   assessShelfWriteRecoveryState,
+  clearShelfWriterRecoveryState,
   commitShelfQuoteWithNativeLock,
+  commitShelfRecordTransactionWithNativeLock,
   inspectShelfWriterRecoveryState,
   writeShelfWriterRecoveryState
 } from "./shelf-native-write-lock.js";
@@ -38,6 +40,7 @@ import {
   inspectShelfWriteJournal,
   type ShelfQuoteWriteRequest
 } from "./shelf-write-coordination.js";
+import { LibraryService } from "./library-service.js";
 
 /**
  * Windows only allows file symlinks with Developer Mode or
@@ -429,6 +432,67 @@ mutexSuite("persistent recovery state", () => {
     expect(names.filter((name) => name.startsWith(`.${SHELF_WRITER_RECOVERY_STATE_FILENAME}.`))).toEqual([]);
   });
 
+  test("a failure after Book publication preserves old hashes and leaves the prior quote readable/searchable", async () => {
+    const fixture = await createFixture("recovery-book-isolation");
+    const prior = await commitShelfQuoteWithNativeLock(request(fixture, {
+      quote: "既存の確定済み引用。",
+      url: "https://example.test/prior"
+    }), { acquireTimeoutMs: 2_000 });
+    const priorBook = path.join(fixture.booksDirectory, (await readdir(fixture.booksDirectory))[0]!);
+    const priorAnnotation = path.join(fixture.annotationsDirectory, (await readdir(fixture.annotationsDirectory))[0]!);
+    const priorHashes = {
+      book: createHash("sha256").update(await readFile(priorBook)).digest("hex"),
+      annotation: createHash("sha256").update(await readFile(priorAnnotation)).digest("hex")
+    };
+    const interrupted = request(fixture, {
+      quote: "書込み途中の引用。",
+      url: "https://example.test/interrupted",
+      faults: { beforeAnnotationPublish: () => { throw new Error("injected failure after Book publication"); } }
+    });
+
+    await expect(commitShelfQuoteWithNativeLock(interrupted, { acquireTimeoutMs: 2_000 }))
+      .rejects.toThrow("injected failure after Book publication");
+
+    const journal = await inspectShelfWriteJournal({
+      shelfRoot: fixture.shelfRoot,
+      expectedShelfId: fixture.shelfId,
+      coordinationRoot: fixture.coordinationRoot
+    });
+    const interruptedEntry = journal.find((entry) => entry.record.requestId === interrupted.requestId);
+    expect(interruptedEntry?.record.state).toBe("staged");
+    expect(interruptedEntry?.bookPresent).toBe(true);
+    expect(interruptedEntry?.annotationPresent).toBe(false);
+    expect((await inspectShelfWriterRecoveryState(coordinationDirectory(fixture))).record?.requestId)
+      .toBe(interrupted.requestId);
+    expect(createHash("sha256").update(await readFile(priorBook)).digest("hex")).toBe(priorHashes.book);
+    expect(createHash("sha256").update(await readFile(priorAnnotation)).digest("hex")).toBe(priorHashes.annotation);
+    expect((await readdir(fixture.booksDirectory)).filter((name) => name.endsWith(".json"))).toHaveLength(2);
+    expect((await readdir(fixture.annotationsDirectory)).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+
+    const service = new LibraryService();
+    try {
+      const owner = {};
+      const opened = await service.openPrivateShelfForOwner(owner, fixture.shelfRoot);
+      expect(opened.kind).toBe("opened");
+      if (opened.kind !== "opened") throw new Error("The existing Shelf citation must remain readable.");
+      const records = service.getRecordsForOwner(owner, opened.library.libraryId);
+      expect(records.kind).toBe("records");
+      if (records.kind !== "records") throw new Error("The existing Shelf records must remain readable.");
+      expect(records.records.map((record) => record.quote)).toEqual(["既存の確定済み引用。"]);
+      const priorSearch = service.searchForOwner(owner, opened.library.libraryId, "既存の確定済み引用");
+      expect(priorSearch.kind).toBe("results");
+      if (priorSearch.kind !== "results") throw new Error("The existing Shelf quote must remain searchable.");
+      expect(priorSearch.results).toHaveLength(1);
+      expect(service.searchForOwner(owner, opened.library.libraryId, "書込み途中の引用")).toMatchObject({
+        kind: "results",
+        results: []
+      });
+      expect(prior.state).toBe("committed");
+    } finally {
+      service.dispose();
+    }
+  });
+
   test("a pending record makes the next writer verify before writing", async () => {
     const fixture = await createFixture("recovery-pending");
     await mkdir(coordinationDirectory(fixture), { recursive: true });
@@ -476,17 +540,113 @@ mutexSuite("persistent recovery state", () => {
     expect(state.record?.requestId).toBe("req-interrupted");
   });
 
-  test("a truncated recovery record still counts as pending", async () => {
-    const fixture = await createFixture("recovery-truncated");
-    await mkdir(coordinationDirectory(fixture), { recursive: true });
-    await writeFile(
-      path.join(coordinationDirectory(fixture), SHELF_WRITER_RECOVERY_STATE_FILENAME),
-      "{\"version\": 1,",
-      "utf8"
-    );
-    const state = await inspectShelfWriterRecoveryState(coordinationDirectory(fixture));
-    expect(state.pending).toBe(true);
-    expect(state.record).toBeUndefined();
+  test("a complete marker cleanup follows the committed receipt and both canonical records", async () => {
+    const fixture = await createFixture("recovery-complete-order");
+    const command = request(fixture);
+    const receipt = await commitShelfQuoteWithNativeLock(command, { acquireTimeoutMs: 2_000 });
+    expect(receipt.state).toBe("committed");
+    const journal = await inspectShelfWriteJournal({
+      shelfRoot: fixture.shelfRoot,
+      expectedShelfId: fixture.shelfId,
+      coordinationRoot: fixture.coordinationRoot
+    });
+    expect(journal).toHaveLength(1);
+    expect(journal[0]!.record.state).toBe("committed");
+    expect(journal[0]!.matchesDisk).toBe(true);
+    expect(journal[0]!.bookPresent).toBe(true);
+    expect(journal[0]!.annotationPresent).toBe(true);
+    expect((await readdir(fixture.booksDirectory)).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+    expect((await readdir(fixture.annotationsDirectory)).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+    expect((await readdir(coordinationDirectory(fixture))).includes(SHELF_WRITER_RECOVERY_STATE_FILENAME)).toBe(false);
+  });
+
+  test("malformed and empty markers fail closed for Reviewer and test Host with a valid journal", async () => {
+    for (const [label, markerBytes] of [["truncated", "{\"version\": 1,"], ["empty", ""]] as const) {
+      const fixture = await createFixture(`recovery-${label}`);
+      const prior = await commitShelfQuoteWithNativeLock(request(fixture, {
+        quote: "保存済みの引用。",
+        url: "https://example.test/committed"
+      }), { acquireTimeoutMs: 2_000 });
+      const bookFile = path.join(fixture.booksDirectory, (await readdir(fixture.booksDirectory))[0]!);
+      const annotationFile = path.join(fixture.annotationsDirectory, (await readdir(fixture.annotationsDirectory))[0]!);
+      const libraryFile = path.join(fixture.shelfRoot, "library.json");
+      const before = {
+        book: createHash("sha256").update(await readFile(bookFile)).digest("hex"),
+        annotation: createHash("sha256").update(await readFile(annotationFile)).digest("hex"),
+        library: createHash("sha256").update(await readFile(libraryFile)).digest("hex")
+      };
+      const marker = path.join(coordinationDirectory(fixture), SHELF_WRITER_RECOVERY_STATE_FILENAME);
+      await writeFile(marker, markerBytes, "utf8");
+
+      const newHostRequest = request(fixture, {
+        quote: "拒否される新規引用。",
+        url: "https://example.test/rejected-host"
+      });
+      await expect(inspectShelfWriterRecoveryState(coordinationDirectory(fixture))).rejects.toMatchObject({
+        code: "shelf-write-recovery-state-invalid"
+      });
+      await expect(
+        commitShelfQuoteWithNativeLock(newHostRequest, { acquireTimeoutMs: 2_000 })
+      ).rejects.toMatchObject({ code: "shelf-write-recovery-state-invalid" });
+
+      await expect(
+        commitShelfRecordTransactionWithNativeLock({
+          shelfRoot: fixture.shelfRoot,
+          expectedShelfId: fixture.shelfId,
+          coordinationRoot: fixture.coordinationRoot,
+          requestId: `reviewer-${"a".repeat(64)}`,
+          prepare: async () => {
+            throw new Error("A Reviewer transaction must not be prepared while the marker is invalid.");
+          }
+        }, { acquireTimeoutMs: 2_000 })
+      ).rejects.toMatchObject({ code: "shelf-write-recovery-state-invalid" });
+
+      await expect(writeShelfWriterRecoveryState({
+        coordinationDirectory: coordinationDirectory(fixture),
+        requestId: "req-overwrite-invalid"
+      })).rejects.toMatchObject({ code: "shelf-write-recovery-state-invalid" });
+      await expect(clearShelfWriterRecoveryState(marker)).rejects.toMatchObject({
+        code: "shelf-write-recovery-state-invalid"
+      });
+
+      expect(await readFile(marker, "utf8")).toBe(markerBytes);
+      expect(createHash("sha256").update(await readFile(bookFile)).digest("hex")).toBe(before.book);
+      expect(createHash("sha256").update(await readFile(annotationFile)).digest("hex")).toBe(before.annotation);
+      expect(createHash("sha256").update(await readFile(libraryFile)).digest("hex")).toBe(before.library);
+      expect((await readdir(fixture.booksDirectory)).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+      expect((await readdir(fixture.annotationsDirectory)).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+      expect(await readdir(fixture.journalDirectory)).toHaveLength(1);
+      const priorJournal = await inspectShelfWriteJournal({
+        shelfRoot: fixture.shelfRoot,
+        expectedShelfId: fixture.shelfId,
+        coordinationRoot: fixture.coordinationRoot
+      });
+      expect(priorJournal).toHaveLength(1);
+      expect(priorJournal[0]!.record.requestId).toBe(prior.requestId);
+      expect(priorJournal[0]!.record.state).toBe("committed");
+
+      const service = new LibraryService();
+      try {
+        const owner = {};
+        const opened = await service.openPrivateShelfForOwner(owner, fixture.shelfRoot);
+        expect(opened.kind).toBe("opened");
+        if (opened.kind !== "opened") throw new Error("The existing Shelf citation must remain readable.");
+        const records = service.getRecordsForOwner(owner, opened.library.libraryId);
+        expect(records.kind).toBe("records");
+        if (records.kind !== "records") throw new Error("The existing Shelf records must remain readable.");
+        expect(records.records.map((record) => record.quote)).toEqual(["保存済みの引用。"]);
+        const search = service.searchForOwner(owner, opened.library.libraryId, "保存済みの引用");
+        expect(search.kind).toBe("results");
+        if (search.kind !== "results") throw new Error("The existing Shelf quote must remain searchable.");
+        expect(search.results).toHaveLength(1);
+        expect(service.searchForOwner(owner, opened.library.libraryId, "拒否される新規引用")).toMatchObject({
+          kind: "results",
+          results: []
+        });
+      } finally {
+        service.dispose();
+      }
+    }
   });
 
   test("the recovery record is not a journal record", async () => {
@@ -584,21 +744,25 @@ mutexSuite("recovery marker file safety", () => {
     expect((await lstat(markerPath(fixture))).isDirectory()).toBe(true);
   });
 
-  hardlinkTest("an existing regular marker is replaced without modifying a hardlinked sentinel", async () => {
+  hardlinkTest("a valid marker is replaced without modifying its hardlinked sentinel", async () => {
     const fixture = await createFixture("marker-hardlink");
     await mkdir(coordinationDirectory(fixture), { recursive: true });
     const sentinel = path.join(fixture.base, "hardlink-sentinel.txt");
-    await writeFile(sentinel, "SENTINEL\n", "utf8");
-    // The marker is a second name for the sentinel's inode. Truncating it in place would
+    await writeShelfWriterRecoveryState({
+      coordinationDirectory: coordinationDirectory(fixture),
+      requestId: "req-hardlink-original"
+    });
+    const originalMarker = await readFile(markerPath(fixture));
+    // The sentinel is a second name for the marker's inode. Truncating in place would
     // destroy the sentinel; replacing the directory entry must not.
-    await link(sentinel, markerPath(fixture));
+    await link(markerPath(fixture), sentinel);
 
     await writeShelfWriterRecoveryState({
       coordinationDirectory: coordinationDirectory(fixture),
       requestId: "req-hardlink"
     });
 
-    expect(await readFile(sentinel, "utf8")).toBe("SENTINEL\n");
+    expect(await readFile(sentinel)).toEqual(originalMarker);
     const written = JSON.parse(await readFile(markerPath(fixture), "utf8"));
     expect(written.state).toBe("write-in-progress");
     expect(written.requestId).toBe("req-hardlink");
