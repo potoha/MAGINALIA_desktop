@@ -1,12 +1,12 @@
 /**
  * Shared Private Shelf write journal and add-only record transactions.
  *
- * The Desktop main process and the future Collector Native Messaging Host are
+ * The Desktop main process and the isolated Collector Native Messaging test Host are
  * separate OS processes that may address the same configured Private Shelf. The
  * Reviewer uses the shared journal with a strict v2 record for deterministic
- * recovery; existing Host v1 records remain readable. Host saving remains disabled.
+ * recovery; existing Host v1 records remain readable. Host saves are limited to isolated E2E mode.
  *
- * Product Reviewer writes and the future Host writer share this mechanism:
+ * Product Reviewer writes and the isolated E2E Host share this mechanism:
  *
  * - exclusion is keyed by the Shelf's stable folder-marker UUID (D068), not by a
  *   machine path, so the same Shelf is protected after the folder is moved/renamed;
@@ -20,7 +20,7 @@
  * - a durable per-request journal provides the idempotency key and the receipt.
  *
  * Product Reviewer writes supply this transaction only after resolving the saved
- * Shelf binding and confirming its typed marker. Host saving remains disabled.
+ * Shelf binding and confirming its typed marker. Production Host saving remains disabled.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
