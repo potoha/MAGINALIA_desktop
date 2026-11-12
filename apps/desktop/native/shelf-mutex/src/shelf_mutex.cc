@@ -26,6 +26,7 @@
 #include <node_api.h>
 #include <windows.h>
 #include <sddl.h>
+#include <aclapi.h>
 #include <knownfolders.h>
 #include <shlobj.h>
 
@@ -431,6 +432,217 @@ napi_value GetLocalAppDataPathFn(napi_env env, napi_callback_info /*info*/) {
   return value;
 }
 
+void SetString(napi_env env, napi_value object, const char* name, const std::wstring& text) {
+  napi_value value = nullptr;
+  napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(text.c_str()), text.size(), &value);
+  napi_set_named_property(env, object, name, value);
+}
+
+void SetBool(napi_env env, napi_value object, const char* name, bool flag) {
+  napi_value value = nullptr;
+  napi_get_boolean(env, flag, &value);
+  napi_set_named_property(env, object, name, value);
+}
+
+void SetUint32(napi_env env, napi_value object, const char* name, uint32_t number) {
+  napi_value value = nullptr;
+  napi_create_uint32(env, number, &value);
+  napi_set_named_property(env, object, name, value);
+}
+
+std::wstring SidToString(PSID sid) {
+  if (sid == nullptr || !IsValidSid(sid)) return std::wstring();
+  LPWSTR text = nullptr;
+  if (!ConvertSidToStringSidW(sid, &text)) return std::wstring();
+  std::wstring result(text);
+  LocalFree(text);
+  return result;
+}
+
+/**
+ * Report the raw security facts of one existing filesystem entry without following a
+ * final reparse point:
+ *
+ *   { exists: false }
+ *   { exists: true, isDirectory, isReparsePoint, ownerSid, currentUserSid,
+ *     daclPresent, aces: [{ type, sid, mask, inheritOnly }] }
+ *
+ * The entry is opened once with FILE_FLAG_OPEN_REPARSE_POINT, and the attributes, owner
+ * and DACL are all read from that one handle, so a link at the final component is
+ * reported as a reparse point instead of being resolved to its target. Policy (which
+ * principals may hold write access) stays in JavaScript so it can be unit-tested.
+ *
+ * ACE `type` is "allow" or "deny" for the plain and callback ACE layouts that carry a
+ * SID directly after the mask, "allow-object" / "deny-object" for object ACEs (whose
+ * SID is not reported), and "other" for anything else.
+ */
+napi_value InspectPathSecurityFn(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
+  std::wstring target;
+  if (argc < 1 || !GetString(env, argv[0], &target) || target.empty() || target.size() > 32767
+      || target.find(L'\0') != std::wstring::npos) {
+    ThrowError(env, "security-invalid-argument", "inspectPathSecurity(path) requires a path.");
+    return nullptr;
+  }
+
+  HANDLE file = CreateFileW(target.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                            nullptr);
+  napi_value out = nullptr;
+  if (napi_create_object(env, &out) != napi_ok) return nullptr;
+  if (file == INVALID_HANDLE_VALUE) {
+    const DWORD error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+      SetBool(env, out, "exists", false);
+      return out;
+    }
+    ThrowError(env, "security-inspection-failed", Win32Message("CreateFileW", error));
+    return nullptr;
+  }
+
+  BY_HANDLE_FILE_INFORMATION details{};
+  if (!GetFileInformationByHandle(file, &details)) {
+    const DWORD error = GetLastError();
+    CloseHandle(file);
+    ThrowError(env, "security-inspection-failed", Win32Message("GetFileInformationByHandle", error));
+    return nullptr;
+  }
+
+  PSID owner = nullptr;
+  PACL dacl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  const DWORD status = GetSecurityInfo(file, SE_FILE_OBJECT,
+                                       OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                                       &owner, nullptr, &dacl, nullptr, &descriptor);
+  CloseHandle(file);
+  if (status != ERROR_SUCCESS) {
+    ThrowError(env, "security-inspection-failed", Win32Message("GetSecurityInfo", status));
+    return nullptr;
+  }
+
+  const std::wstring currentUser = CurrentUserSidString();
+  if (currentUser.empty()) {
+    LocalFree(descriptor);
+    ThrowError(env, "security-inspection-failed", "The current Windows user SID is unavailable.");
+    return nullptr;
+  }
+
+  SetBool(env, out, "exists", true);
+  SetBool(env, out, "isDirectory", (details.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+  SetBool(env, out, "isReparsePoint", (details.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
+  SetString(env, out, "ownerSid", SidToString(owner));
+  SetString(env, out, "currentUserSid", currentUser);
+  SetBool(env, out, "daclPresent", dacl != nullptr);
+
+  napi_value aces = nullptr;
+  napi_create_array(env, &aces);
+  if (dacl != nullptr) {
+    for (DWORD index = 0; index < dacl->AceCount; ++index) {
+      void* raw = nullptr;
+      if (!GetAce(dacl, index, &raw) || raw == nullptr) continue;
+      const auto* header = static_cast<ACE_HEADER*>(raw);
+      napi_value entry = nullptr;
+      napi_create_object(env, &entry);
+      const char* type = "other";
+      std::wstring sid;
+      DWORD mask = 0;
+      switch (header->AceType) {
+        case ACCESS_ALLOWED_ACE_TYPE:
+        case ACCESS_ALLOWED_CALLBACK_ACE_TYPE: {
+          const auto* ace = static_cast<ACCESS_ALLOWED_ACE*>(raw);
+          type = "allow";
+          mask = ace->Mask;
+          sid = SidToString(const_cast<DWORD*>(&ace->SidStart));
+          break;
+        }
+        case ACCESS_DENIED_ACE_TYPE:
+        case ACCESS_DENIED_CALLBACK_ACE_TYPE: {
+          const auto* ace = static_cast<ACCESS_DENIED_ACE*>(raw);
+          type = "deny";
+          mask = ace->Mask;
+          sid = SidToString(const_cast<DWORD*>(&ace->SidStart));
+          break;
+        }
+        case ACCESS_ALLOWED_OBJECT_ACE_TYPE:
+        case ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE:
+          type = "allow-object";
+          mask = static_cast<ACCESS_ALLOWED_OBJECT_ACE*>(raw)->Mask;
+          break;
+        case ACCESS_DENIED_OBJECT_ACE_TYPE:
+        case ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE:
+          type = "deny-object";
+          mask = static_cast<ACCESS_DENIED_OBJECT_ACE*>(raw)->Mask;
+          break;
+        default:
+          break;
+      }
+      napi_value typeValue = nullptr;
+      napi_create_string_utf8(env, type, NAPI_AUTO_LENGTH, &typeValue);
+      napi_set_named_property(env, entry, "type", typeValue);
+      SetString(env, entry, "sid", sid);
+      SetUint32(env, entry, "mask", mask);
+      SetBool(env, entry, "inheritOnly", (header->AceFlags & INHERIT_ONLY_ACE) != 0);
+      napi_set_element(env, aces, index, entry);
+    }
+  }
+  napi_set_named_property(env, out, "aces", aces);
+  LocalFree(descriptor);
+  return out;
+}
+
+/**
+ * Create one missing directory with an explicit, protected (non-inherited) DACL that
+ * grants full control only to the current user, SYSTEM and BUILTIN\Administrators, and
+ * with the current user as owner. Children inherit the same three entries.
+ *
+ * Returns "created", or "exists" when an entry is already present. An existing entry is
+ * never re-permissioned here: callers verify it and fail closed when it is unsafe.
+ */
+napi_value CreatePrivateDirectoryFn(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
+  std::wstring target;
+  if (argc < 1 || !GetString(env, argv[0], &target) || target.empty() || target.size() > 32767
+      || target.find(L'\0') != std::wstring::npos) {
+    ThrowError(env, "security-invalid-argument", "createPrivateDirectory(path) requires a path.");
+    return nullptr;
+  }
+  const std::wstring sid = CurrentUserSidString();
+  if (sid.empty()) {
+    ThrowError(env, "security-inspection-failed", "The current Windows user SID is unavailable.");
+    return nullptr;
+  }
+  const std::wstring sddl = L"O:" + sid + L"D:P(A;OICI;FA;;;" + sid + L")(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &descriptor,
+                                                            nullptr)) {
+    ThrowWin32(env, "ConvertStringSecurityDescriptorToSecurityDescriptor", GetLastError());
+    return nullptr;
+  }
+  SECURITY_ATTRIBUTES attributes{};
+  attributes.nLength = sizeof attributes;
+  attributes.lpSecurityDescriptor = descriptor;
+  attributes.bInheritHandle = FALSE;
+  const BOOL created = CreateDirectoryW(target.c_str(), &attributes);
+  const DWORD error = created ? ERROR_SUCCESS : GetLastError();
+  LocalFree(descriptor);
+  napi_value result = nullptr;
+  if (created) {
+    napi_create_string_utf8(env, "created", NAPI_AUTO_LENGTH, &result);
+    return result;
+  }
+  if (error == ERROR_ALREADY_EXISTS) {
+    napi_create_string_utf8(env, "exists", NAPI_AUTO_LENGTH, &result);
+    return result;
+  }
+  ThrowError(env, "security-directory-create-failed", Win32Message("CreateDirectoryW", error));
+  return nullptr;
+}
+
 napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
       {"createMutex", nullptr, CreateMutexFn, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -440,6 +652,8 @@ napi_value Init(napi_env env, napi_value exports) {
       {"close", nullptr, CloseHandleFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"state", nullptr, StateFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"getLocalAppDataPath", nullptr, GetLocalAppDataPathFn, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"inspectPathSecurity", nullptr, InspectPathSecurityFn, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"createPrivateDirectory", nullptr, CreatePrivateDirectoryFn, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   if (napi_define_properties(env, exports, sizeof properties / sizeof properties[0], properties)
       != napi_ok) {

@@ -76,6 +76,10 @@ interface NativeMutexModule {
   readonly apiVersion: number;
   /** Windows SHGetKnownFolderPath(FOLDERID_LocalAppData), validated as a local drive. */
   getLocalAppDataPath?(): unknown;
+  /** Raw owner/DACL/reparse facts for one entry, read from a handle that does not follow links. */
+  inspectPathSecurity?(target: string): unknown;
+  /** Create one missing directory with a protected current-user/SYSTEM/Administrators DACL. */
+  createPrivateDirectory?(target: string): unknown;
   createMutex(name: string, options?: { security?: "current-user" | "system-only" }): object;
   openMutex(name: string): object;
   acquire(handle: object, waitMs?: number): {
@@ -244,6 +248,28 @@ export function getNativeLocalAppDataPath(): string {
     fail("native-mutex-unavailable", "Windows LocalAppData could not be resolved.");
   }
   return value;
+}
+
+/** Raw native result; interpreted by `collector-path-security.ts`. */
+export function inspectNativePathSecurity(target: string): unknown {
+  const native = loadNativeShelfMutex();
+  if (typeof native.inspectPathSecurity !== "function") {
+    fail("native-mutex-unavailable", "The Shelf mutex addon cannot inspect Windows file security.");
+  }
+  return native.inspectPathSecurity(target);
+}
+
+/** Returns "created" or "exists"; an existing entry is never re-permissioned. */
+export function createNativePrivateDirectory(target: string): "created" | "exists" {
+  const native = loadNativeShelfMutex();
+  if (typeof native.createPrivateDirectory !== "function") {
+    fail("native-mutex-unavailable", "The Shelf mutex addon cannot create a private directory.");
+  }
+  const result = native.createPrivateDirectory(target);
+  if (result !== "created" && result !== "exists") {
+    fail("native-mutex-failed", "The private directory result is invalid.");
+  }
+  return result;
 }
 
 /**

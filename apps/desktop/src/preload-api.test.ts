@@ -58,6 +58,7 @@ import {
 } from "./preload-api";
 import { GET_FIRST_RUN_STATUS_CHANNEL, RUN_FIRST_RUN_SETUP_CHANNEL } from "./first-run-ipc";
 import { OPEN_BUNDLED_MANUAL_CHANNEL } from "./manual-ipc";
+import { CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL, CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL } from "./collector-save-destination-ipc";
 import { APPLICATION_MENU_COMMAND_CHANNEL, UPDATE_APPLICATION_MENU_CHANNEL } from "./application-menu-contract";
 
 describe("preload boundary", () => {
@@ -75,6 +76,8 @@ describe("preload boundary", () => {
       "updateApplicationMenu",
       "onApplicationCommand",
       "openBundledManual",
+      "configureCollectorSaveDestination",
+      "clearCollectorSaveDestination",
       "openMarkdown",
       "saveMarkdown",
       "openDocument",
@@ -136,6 +139,8 @@ describe("preload boundary", () => {
     await api.runFirstRunSetup({ workdeskMode: "new", privateShelfMode: "existing", registerPublicShelf: false });
     api.onFirstRunProgress(() => undefined);
     await api.openBundledManual();
+    await api.configureCollectorSaveDestination();
+    await api.clearCollectorSaveDestination();
     await api.openMarkdown();
     await api.saveMarkdown({ sessionId: "opaque-session", text: "# Draft\r\n" });
     await api.openDocument();
@@ -260,6 +265,8 @@ describe("preload boundary", () => {
       { channel: GET_FIRST_RUN_STATUS_CHANNEL, args: [] },
       { channel: RUN_FIRST_RUN_SETUP_CHANNEL, args: [{ workdeskMode: "new", privateShelfMode: "existing", registerPublicShelf: false }] },
       { channel: OPEN_BUNDLED_MANUAL_CHANNEL, args: [] },
+      { channel: CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL, args: [] },
+      { channel: CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL, args: [] },
       { channel: OPEN_MARKDOWN_CHANNEL, args: [] },
       { channel: SAVE_MARKDOWN_CHANNEL, args: [{ sessionId: "opaque-session", text: "# Draft\r\n" }] },
       { channel: OPEN_DOCUMENT_CHANNEL, args: [] },

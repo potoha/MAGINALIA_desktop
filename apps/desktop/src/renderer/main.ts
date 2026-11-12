@@ -2017,6 +2017,26 @@ commandRegistry.register({
     projectView.setProjectError("取扱説明書を開けませんでした。チュートリアルの「マキナの置き手紙」を開いてください。");
   }
 });
+// Collector save destination: the main process owns the confirmation and result
+// dialogs and writes only the machine-local binding; no Shelf data is changed.
+commandRegistry.register({
+  id: "maginalia.collector.configureSaveDestination",
+  title: "Collector の保存先を設定",
+  description: "Use the configured Private Shelf as the MAGINALIA Collector save destination.",
+  category: "Collector",
+  keywords: ["collector", "browser", "extension", "save", "shelf", "保存先"]
+}, async () => {
+  await window.maginalia.configureCollectorSaveDestination?.();
+});
+commandRegistry.register({
+  id: "maginalia.collector.clearSaveDestination",
+  title: "Collector の保存先を解除",
+  description: "Remove the MAGINALIA Collector save destination setting without changing Shelf data.",
+  category: "Collector",
+  keywords: ["collector", "browser", "extension", "unbind", "clear", "解除"]
+}, async () => {
+  await window.maginalia.clearCollectorSaveDestination?.();
+});
 commandRegistry.register({
   id: "maginalia.workdesk.open",
   title: "Open Workdesk",

@@ -29,6 +29,8 @@ describe("native application menu contract", () => {
     expect(APPLICATION_MENU_COMMAND_IDS).toContain("maginalia.editor.findInDocument");
     expect(APPLICATION_MENU_COMMAND_IDS).toContain("maginalia.editor.replaceInDocument");
     expect(APPLICATION_MENU_COMMAND_IDS).toContain("maginalia.document.closeView");
+    expect(APPLICATION_MENU_COMMAND_IDS).toContain("maginalia.collector.configureSaveDestination");
+    expect(APPLICATION_MENU_COMMAND_IDS).toContain("maginalia.collector.clearSaveDestination");
   });
 
   it("bounds renderer state to unique allowlisted commands and safe accelerators", () => {

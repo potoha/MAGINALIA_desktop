@@ -61,7 +61,23 @@ async function assertExistingDirectoryChain(directory: string): Promise<void> {
   }
 }
 
-async function ensureSafeDirectoryChain(directory: string): Promise<void> {
+/**
+ * Creates one missing directory component. Product Desktop injects the native
+ * protected-DACL creator; tests and non-Windows builds use plain `mkdir`.
+ */
+export type ShelfBindingDirectoryCreator = (directory: string) => Promise<void>;
+
+async function defaultCreateDirectory(directory: string): Promise<void> {
+  try { await mkdir(directory); } catch (createError: unknown) {
+    if (createError === null || typeof createError !== "object" || !("code" in createError)
+      || (createError as { readonly code?: unknown }).code !== "EEXIST") throw createError;
+  }
+}
+
+async function ensureSafeDirectoryChain(
+  directory: string,
+  createDirectory: ShelfBindingDirectoryCreator = defaultCreateDirectory,
+): Promise<void> {
   const absolute = path.resolve(directory);
   const parsed = path.parse(absolute);
   let current = parsed.root;
@@ -71,10 +87,7 @@ async function ensureSafeDirectoryChain(directory: string): Promise<void> {
       await lstat(current);
     } catch (error: unknown) {
       if (!isMissing(error)) throw error;
-      try { await mkdir(current); } catch (createError: unknown) {
-        if (createError === null || typeof createError !== "object" || !("code" in createError)
-          || (createError as { readonly code?: unknown }).code !== "EEXIST") throw createError;
-      }
+      await createDirectory(current);
     }
     let info;
     try { info = await lstat(current); } catch { throw new Error("The Shelf binding directory could not be opened."); }
@@ -128,9 +141,18 @@ async function readBoundedBinding(file: string): Promise<string | null> {
  * disposable directory. The directory inherits the current user's LocalAppData
  * ACL and all existing path components are checked before use.
  */
-export function createShelfBindingFileStore(bindingDirectory: string): SecureShelfBindingPersistenceAdapter {
+export interface ShelfBindingFileStoreOptions {
+  /** Creates missing directory components (defaults to plain `mkdir`). */
+  readonly createDirectory?: ShelfBindingDirectoryCreator;
+}
+
+export function createShelfBindingFileStore(
+  bindingDirectory: string,
+  options: ShelfBindingFileStoreOptions = {},
+): SecureShelfBindingPersistenceAdapter {
   const directory = path.resolve(bindingDirectory);
   const file = path.join(directory, BINDING_FILE);
+  const createDirectory = options.createDirectory ?? defaultCreateDirectory;
 
   return Object.freeze({
     async readBindingText(): Promise<string | null> {
@@ -142,7 +164,11 @@ export function createShelfBindingFileStore(bindingDirectory: string): SecureShe
       if (Buffer.byteLength(serializedBinding, "utf8") > MAX_BINDING_BYTES) {
         throw new Error("The Shelf binding is too large.");
       }
-      await ensureSafeDirectoryChain(directory);
+      await ensureSafeDirectoryChain(directory, createDirectory);
+      // Single-writer limitation (#87 P1): this generation check and the recheck
+      // below are not a cross-process compare-and-swap. Two Desktop processes can both
+      // pass them and the later rename wins. Accepted for alpha because only an explicit
+      // Desktop UI action writes the binding; see docs/collector-host-binding.md.
       const current = await readBoundedBinding(file);
       const currentGeneration = current === null ? null : bindingGeneration(current);
       if (currentGeneration !== expectedGeneration) throw new Error("The Shelf binding generation changed.");
@@ -169,6 +195,33 @@ export function createShelfBindingFileStore(bindingDirectory: string): SecureShe
       }
     },
   });
+}
+
+/**
+ * Remove only the binding descriptor (explicit Desktop "clear" action). The Shelf,
+ * its journal, the coordination directory and the binding directory itself are never
+ * touched. Returns false when there was no descriptor. A non-regular entry or an
+ * unsafe directory chain is refused instead of being followed.
+ */
+export async function removeShelfBindingFile(bindingDirectory: string): Promise<boolean> {
+  const directory = path.resolve(bindingDirectory);
+  const file = path.join(directory, BINDING_FILE);
+  await assertExistingDirectoryChain(directory);
+  let info;
+  try { info = await lstat(file); } catch (error: unknown) {
+    if (isMissing(error) || isNotDirectory(error)) return false;
+    throw error;
+  }
+  if (!info.isFile() || info.isSymbolicLink()) {
+    throw new Error("The Shelf binding entry is not a regular file; refusing to remove it.");
+  }
+  try {
+    await unlink(file);
+  } catch (error: unknown) {
+    if (isMissing(error)) return false;
+    throw error;
+  }
+  return true;
 }
 
 function bindingGeneration(text: string): number {
