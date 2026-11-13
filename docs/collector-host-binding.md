@@ -146,10 +146,16 @@ recovery probe; none of these exist in the production entry.
   `readCollectorShelfConfiguration` is valid. `configured_shelf` returns the Shelf
   UUID, `library.json` name, `type: "private"` and `writesEnabled: true`, or the
   configuration error code.
-- `save_web_quote`: request validation (`invalid_request`), then configuration
-  (codes in section 1), then the unchanged `commitShelfQuoteWithNativeLock` with the
-  fixed coordination root. A mutex acquisition timeout maps to `shelf_write_busy`,
-  and any other writer failure maps to `save_failed`. A receipt is returned only
+- `save_web_quote`: request validation (`invalid_request`, including the writer's
+  strict `getDate` ranges), then configuration (codes in section 1), then the
+  `commitShelfQuoteWithNativeLock` writer with the fixed coordination root. The
+  writer validates the request (shape, `get.date`, planned Book/Annotation schema,
+  journal digest conflict for a reused request ID) before it publishes
+  `writer-recovery.json`, so a request that can never succeed leaves no marker and
+  no journal record; such permanent request errors (`shelf-write-invalid-request`,
+  `shelf-write-request-mismatch`) map to `invalid_request`. A mutex acquisition
+  timeout maps to `shelf_write_busy`, and any other writer failure maps to
+  `save_failed`. A receipt is returned only
   after the writer has cleared `writer-recovery.json`, and only in state `committed`
   or `already-committed` for the requested ID and bound Shelf.
 - stdout carries frames only. Responses and stderr carry no paths, path-to-UUID

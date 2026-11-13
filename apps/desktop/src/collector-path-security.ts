@@ -117,7 +117,9 @@ export function evaluatePathSecurity(
   for (const ace of facts.aces) {
     // Inherit-only entries (for example CREATOR OWNER templates) do not apply to this entry.
     if (ace.inheritOnly) continue;
-    if (ace.type === "allow-object" && (ace.mask & WRITE_ACCESS_MASK) !== 0) {
+    // Object-specific allows and ACE types this check cannot classify ("other") are
+    // ignored only when they carry no write-capable right; otherwise fail closed.
+    if ((ace.type === "allow-object" || ace.type === "other") && (ace.mask & WRITE_ACCESS_MASK) !== 0) {
       return Object.freeze({ ok: false, violation: "unsupported-ace" });
     }
     if (ace.type !== "allow" || (ace.mask & WRITE_ACCESS_MASK) === 0) continue;

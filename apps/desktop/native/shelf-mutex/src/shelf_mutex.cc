@@ -1,8 +1,8 @@
 /**
  * Windows named-mutex addon for the cross-process Private Shelf write lock.
  *
- * Scope: this native addon provides the named mutex used by the product Reviewer writer. The future
- * Native Messaging Host must use the same mutex. Host saving remains disabled.
+ * Scope: this native addon provides the named mutex shared by the product Reviewer writer
+ * and the product Collector Native Messaging Host, so both serialize on the same Shelf.
  *
  * Invariants this addon establishes:
  *

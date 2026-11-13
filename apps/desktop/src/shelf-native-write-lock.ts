@@ -56,9 +56,11 @@
  *   the marker is published happens before the first journal write, so treating it as
  *   clean is correct.
  *
- * The Desktop Reviewer path uses this wrapper now. The Native Host may invoke it
- * only from its isolated test-only E2E mode; normal Host save remains disabled.
- * Host v1 journal records remain readable alongside the Reviewer v2 extension.
+ * The Desktop Reviewer and the product Collector Native Messaging Host both use this
+ * wrapper. The marker is published only after pure request validation and immediately
+ * before the first journal or Shelf mutation, and a receipt is returned only after the
+ * marker has been cleared. Host v1 journal records remain readable alongside the
+ * Reviewer v2 extension.
  */
 import { randomUUID } from "node:crypto";
 import { lstat, open, readFile, rename, unlink } from "node:fs/promises";
@@ -69,6 +71,7 @@ import {
   commitShelfQuote,
   inspectShelfWriteJournal,
   resolveShelfWriteLayout,
+  type ShelfRecordFileLister,
   type ShelfRecordWriteTransactionRequest,
   type ShelfQuoteWriteReceipt,
   type ShelfQuoteWriteRequest,
@@ -308,6 +311,8 @@ export async function assessShelfWriteRecoveryState(options: {
   readonly shelfRoot: string;
   readonly expectedShelfId: string;
   readonly coordinationRoot: string;
+  /** Test seam forwarded to the journal inspection so directory scans can be counted. */
+  readonly listRecordFiles?: ShelfRecordFileLister;
 }): Promise<ShelfWriteRecoveryAssessment> {
   await resolveShelfWriteLayout(options);
   // Strict journal validation: a malformed, foreign or internally inconsistent
@@ -549,8 +554,9 @@ export async function withNativeShelfWriteSection<T>(
 /**
  * Commit one web quote under the OS mutex instead of the file lease.
  *
- * Production Host save remains disabled. The isolated E2E Host is the only Host
- * caller and uses this wrapper to preserve the common v1 writer.
+ * The product Collector Native Messaging Host and its isolated E2E mode call this
+ * wrapper, which preserves the common v1 writer. The recovery marker is published by
+ * the writer just before its first mutation (not before request validation).
  */
 export async function commitShelfQuoteWithNativeLock(
   request: ShelfQuoteWriteRequest,
@@ -596,12 +602,25 @@ export async function commitShelfQuoteWithNativeLock(
       }
     }
 
-    const recoveryFile = await writeShelfWriterRecoveryState({
-      coordinationDirectory: layout.coordinationDirectory,
-      requestId: request.requestId
+    // The marker is published by the writer immediately before its first journal or
+    // Shelf mutation, i.e. only after pure request validation has passed. A request
+    // that can never succeed therefore leaves neither a marker nor a journal record.
+    const markerFile = path.join(layout.coordinationDirectory, SHELF_WRITER_RECOVERY_STATE_FILENAME);
+    let markerPublished = false;
+    const receipt = await commitShelfQuote({
+      ...request,
+      externalLock: lease,
+      beforeMutation: async (requestId) => {
+        await writeShelfWriterRecoveryState({
+          coordinationDirectory: layout.coordinationDirectory,
+          requestId
+        });
+        markerPublished = true;
+      }
     });
-    const receipt = await commitShelfQuote({ ...request, externalLock: lease });
-    await clearShelfWriterRecoveryState(recoveryFile);
+    // Clear only after the committed receipt exists. A marker that survived an earlier
+    // crash and was just verified by recovery is cleared by the same receipt.
+    if (markerPublished || recovery.pending) await clearShelfWriterRecoveryState(markerFile);
     return receipt;
   } finally {
     if (!keepHeld) lease.release();
