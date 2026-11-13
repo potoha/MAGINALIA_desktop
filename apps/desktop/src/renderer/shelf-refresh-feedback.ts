@@ -13,16 +13,28 @@ export const SHELF_REFRESH_FAILED_MESSAGE = "更新できませんでした。�
 export const SHELF_REFRESH_RELOAD_FAILED_MESSAGE = "更新できませんでした。Shelfの内容を再読み込みできませんでした。";
 export const SHELF_REFRESH_UNAVAILABLE_MESSAGE = "更新できませんでした。この環境ではShelfを更新できません。";
 
+export type ShelfRefreshCountScope = "library" | "search";
+
 /**
- * Builds the success message from the real post-refresh quotation count and,
- * when known, the count before this refresh.
+ * Builds the success message from the real post-refresh count and, when
+ * known, the count before this refresh. With an active query the count is for
+ * the displayed search results only, and the text says so.
  */
-export function shelfRefreshSuccessMessage(total: number, previousTotal: number | null): string {
-  if (previousTotal === null) return `更新しました。引用 ${total} 件`;
+export function shelfRefreshSuccessMessage(
+  total: number,
+  previousTotal: number | null,
+  scope: ShelfRefreshCountScope = "library"
+): string {
+  const label = scope === "search" ? "表示中の検索結果" : "引用";
+  if (previousTotal === null) return `更新しました。${label} ${total} 件`;
   const added = total - previousTotal;
-  if (added > 0) return `更新しました。引用 ${total} 件（前回から ${added} 件追加）`;
-  if (added === 0) return `更新しました。変更はありません（引用 ${total} 件）`;
-  return `更新しました。引用 ${total} 件（前回から ${-added} 件減少）`;
+  if (added > 0) return `更新しました。${label} ${total} 件（前回から ${added} 件追加）`;
+  if (added === 0) {
+    return scope === "search"
+      ? `更新しました。表示中の検索結果に変更はありません（${total} 件）`
+      : `更新しました。変更はありません（引用 ${total} 件）`;
+  }
+  return `更新しました。${label} ${total} 件（前回から ${-added} 件減少）`;
 }
 
 export interface ShelfRefreshRunner {
@@ -42,7 +54,7 @@ export async function runShelfRefresh(runner: ShelfRefreshRunner): Promise<Shelf
     return { kind: "error", message: SHELF_REFRESH_UNAVAILABLE_MESSAGE };
   }
   const before = runner.getState();
-  const previousTotal = before.status === "ready" ? (before.total ?? before.results.length) : null;
+  const beforeTotal = before.status === "ready" ? (before.total ?? before.results.length) : null;
 
   let result: RefreshShelfResult;
   try {
@@ -56,5 +68,8 @@ export async function runShelfRefresh(runner: ShelfRefreshRunner): Promise<Shelf
   const after = runner.getState();
   if (after.status !== "ready") return { kind: "error", message: SHELF_REFRESH_RELOAD_FAILED_MESSAGE };
   const total = after.total ?? after.results.length;
-  return { kind: "success", message: shelfRefreshSuccessMessage(total, previousTotal) };
+  // A count from a different query is not comparable: show no delta.
+  const previousTotal = before.query === after.query ? beforeTotal : null;
+  const scope: ShelfRefreshCountScope = after.query.trim() === "" ? "library" : "search";
+  return { kind: "success", message: shelfRefreshSuccessMessage(total, previousTotal, scope) };
 }

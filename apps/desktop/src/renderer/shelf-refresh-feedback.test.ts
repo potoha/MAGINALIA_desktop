@@ -30,7 +30,7 @@ function searchResult(count: number): SearchShelfResult {
 const refreshed: RefreshShelfResult = { kind: "refreshed", materialized: 0, unchanged: 0, pending: 0, conflicts: 0, failed: 0 };
 const writing: ShelfWritingPort = { captureInsertionTarget: () => null, insertQuoteRef: () => { throw new Error("unused"); } };
 
-function harness(counts: number[], refresh: () => Promise<RefreshShelfResult> = async () => refreshed) {
+function harness(counts: number[], refresh: () => Promise<RefreshShelfResult> = async () => refreshed, reloadQuery: string | null = "") {
   let last: ShelfViewState | undefined;
   const view: ShelfControllerView = { setShelfState: (s) => { last = s; } };
   const queue = [...counts];
@@ -46,7 +46,7 @@ function harness(counts: number[], refresh: () => Promise<RefreshShelfResult> = 
   const run = (): Promise<ShelfRefreshFeedback> => runShelfRefresh({
     refreshShelf,
     getState: () => controller.getState(),
-    reload: () => controller.search("")
+    reload: () => controller.search(reloadQuery ?? undefined)
   });
   return { controller, api, refreshShelf, run, getLast: () => last };
 }
@@ -57,6 +57,36 @@ describe("shelfRefreshSuccessMessage", () => {
     expect(shelfRefreshSuccessMessage(5, 5)).toBe("更新しました。変更はありません（引用 5 件）");
     expect(shelfRefreshSuccessMessage(5, null)).toBe("更新しました。引用 5 件");
     expect(shelfRefreshSuccessMessage(2, 5)).toBe("更新しました。引用 2 件（前回から 3 件減少）");
+    expect(shelfRefreshSuccessMessage(2, null, "search")).toBe("更新しました。表示中の検索結果 2 件");
+  });
+});
+
+describe("runShelfRefresh with an active query", () => {
+  it("labels counts as displayed search results", async () => {
+    const h = harness([1, 2], async () => refreshed, "term");
+    await h.controller.search("term");
+    expect((await h.run()).message).toBe("更新しました。表示中の検索結果 2 件（前回から 1 件追加）");
+  });
+
+  it("labels unchanged and decreased search results", async () => {
+    const same = harness([2, 2], async () => refreshed, "term");
+    await same.controller.search("term");
+    expect((await same.run()).message).toBe("更新しました。表示中の検索結果に変更はありません（2 件）");
+    const less = harness([5, 2], async () => refreshed, "term");
+    await less.controller.search("term");
+    expect((await less.run()).message).toBe("更新しました。表示中の検索結果 2 件（前回から 3 件減少）");
+  });
+
+  it("uses the no-previous form for the first load with a query", async () => {
+    const h = harness([2], async () => refreshed, "term");
+    h.controller.setQuery("term");
+    expect((await h.run()).message).toBe("更新しました。表示中の検索結果 2 件");
+  });
+
+  it("uses the no-previous form when the query changed between reads", async () => {
+    const h = harness([9, 1], async () => refreshed, "term");
+    await h.controller.search("");
+    expect((await h.run()).message).toBe("更新しました。表示中の検索結果 1 件");
   });
 });
 
