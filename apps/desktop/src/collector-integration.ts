@@ -101,7 +101,7 @@ export function isLocalAbsoluteWindowsPath(value: unknown): value is string {
   return path.win32.normalize(value) === value && !value.endsWith("\\");
 }
 
-interface IntegrationPaths {
+export interface IntegrationPaths {
   readonly programFolder: string;
   readonly manifestPath: string;
   readonly statePath: string;
@@ -112,11 +112,11 @@ interface IntegrationPaths {
   readonly localAppData: string;
 }
 
-function slotFolder(paths: IntegrationPaths, slot: CollectorHostSlot): string {
+export function slotFolder(paths: IntegrationPaths, slot: CollectorHostSlot): string {
   return path.win32.join(paths.programFolder, `host-${slot}`);
 }
 
-function resolvePaths(registry: CollectorRegistryAdapter): IntegrationPaths | undefined {
+export function resolveIntegrationPaths(registry: CollectorRegistryAdapter): IntegrationPaths | undefined {
   try {
     const userProgramFiles = registry.getKnownFolderPath("UserProgramFiles");
     const localAppData = registry.getKnownFolderPath("LocalAppData");
@@ -560,7 +560,7 @@ export async function inspectCollectorIntegration(
     sink.add(reason);
   };
 
-  const paths = resolvePaths(dependencies.registry);
+  const paths = resolveIntegrationPaths(dependencies.registry);
   if (paths === undefined) incomplete("known-folder-unavailable");
 
   let registration: HostRegistrationOwnership | "unknown" = "unknown";

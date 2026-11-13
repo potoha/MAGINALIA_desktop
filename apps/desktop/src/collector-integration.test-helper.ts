@@ -26,18 +26,19 @@ import type { PathSecurityFacts } from "./collector-path-security.js";
 
 export const sha256 = (text: string | Uint8Array): string => createHash("sha256").update(text).digest("hex");
 
-interface FakeNode {
+export interface FakeNode {
   kind: "file" | "directory" | "other";
   reparse: boolean;
   content: Uint8Array;
+  mtimeMs?: number;
 }
 
-const key = (target: string): string => path.win32.normalize(target).toLowerCase();
+export const fakeKey = (target: string): string => path.win32.normalize(target).toLowerCase();
 
 export type FakeFileSystemCall = "stat" | "readSmallFile" | "sha256File";
 
 export class FakeCollectorFileSystem implements CollectorIntegrationFileSystem {
-  private readonly nodes = new Map<string, FakeNode>();
+  protected readonly nodes = new Map<string, FakeNode>();
   public readonly calls: Array<{ readonly method: FakeFileSystemCall }> = [];
   /** Paths (lower-case keys) whose access throws. */
   public readonly failing = new Set<string>();
@@ -46,13 +47,13 @@ export class FakeCollectorFileSystem implements CollectorIntegrationFileSystem {
 
   public addDirectory(target: string, options: { readonly reparse?: boolean } = {}): void {
     const parent = path.win32.dirname(target);
-    if (parent !== target && !this.nodes.has(key(parent)) && /^[A-Za-z]:\\.+/u.test(parent)) this.addDirectory(parent);
-    this.nodes.set(key(target), { kind: "directory", reparse: options.reparse === true, content: new Uint8Array() });
+    if (parent !== target && !this.nodes.has(fakeKey(parent)) && /^[A-Za-z]:\\.+/u.test(parent)) this.addDirectory(parent);
+    this.nodes.set(fakeKey(target), { kind: "directory", reparse: options.reparse === true, content: new Uint8Array() });
   }
 
   public addFile(target: string, content: string | Uint8Array, options: { readonly reparse?: boolean; readonly kind?: "file" | "other" } = {}): void {
     this.addDirectory(path.win32.dirname(target));
-    this.nodes.set(key(target), {
+    this.nodes.set(fakeKey(target), {
       kind: options.kind ?? "file",
       reparse: options.reparse === true,
       content: typeof content === "string" ? new TextEncoder().encode(content) : content,
@@ -60,40 +61,40 @@ export class FakeCollectorFileSystem implements CollectorIntegrationFileSystem {
   }
 
   public remove(target: string): void {
-    this.nodes.delete(key(target));
+    this.nodes.delete(fakeKey(target));
   }
 
   public setReparse(target: string, reparse: boolean): void {
-    const node = this.nodes.get(key(target));
+    const node = this.nodes.get(fakeKey(target));
     if (node === undefined) throw new Error("fixture: unknown path");
     node.reparse = reparse;
   }
 
   public has(target: string): boolean {
-    return this.nodes.has(key(target));
+    return this.nodes.has(fakeKey(target));
   }
 
   public text(target: string): string {
-    const node = this.nodes.get(key(target));
+    const node = this.nodes.get(fakeKey(target));
     if (node === undefined) throw new Error("fixture: unknown path");
     return new TextDecoder().decode(node.content);
   }
 
   private enter(method: FakeFileSystemCall, target: string): void {
     this.calls.push({ method });
-    if (this.failing.has(key(target))) throw new Error("injected file-system failure");
+    if (this.failing.has(fakeKey(target))) throw new Error("injected file-system failure");
   }
 
   public async stat(target: string): Promise<CollectorFileEntry | null> {
     this.enter("stat", target);
-    const node = this.nodes.get(key(target));
+    const node = this.nodes.get(fakeKey(target));
     return node === undefined ? null : { kind: node.kind, isReparsePoint: node.reparse, size: node.content.byteLength };
   }
 
   public async readSmallFile(target: string, maxBytes: number): Promise<CollectorFileRead> {
     this.enter("readSmallFile", target);
-    this.readPaths.push(key(target));
-    const node = this.nodes.get(key(target));
+    this.readPaths.push(fakeKey(target));
+    const node = this.nodes.get(fakeKey(target));
     if (node === undefined || node.kind !== "file") return { kind: "missing" };
     if (node.content.byteLength > maxBytes) return { kind: "too-large" };
     return { kind: "ok", bytes: node.content };
@@ -101,7 +102,7 @@ export class FakeCollectorFileSystem implements CollectorIntegrationFileSystem {
 
   public async sha256File(target: string): Promise<string | null> {
     this.enter("sha256File", target);
-    const node = this.nodes.get(key(target));
+    const node = this.nodes.get(fakeKey(target));
     return node === undefined || node.kind !== "file" ? null : sha256(node.content);
   }
 }
@@ -198,7 +199,7 @@ export function createIntegrationFixture(options: { readonly installed?: boolean
         fileSystem,
         inspectPathSecurity: (target: string) => {
           securityCalls.push(target);
-          const configured = securityFacts.get(key(target));
+          const configured = securityFacts.get(fakeKey(target));
           if (configured === "throw") throw new Error("injected security inspection failure");
           if (configured !== undefined) return configured;
           // Default: existing entries (per the fake tree) are safe, others do not exist.
@@ -228,4 +229,4 @@ export function createIntegrationFixture(options: { readonly installed?: boolean
   return fixture;
 }
 
-export const securityKey = key;
+export const securityKey = fakeKey;
