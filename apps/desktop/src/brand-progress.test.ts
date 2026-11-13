@@ -31,14 +31,14 @@ describe("brand progress presentation", () => {
     expect(html).not.toContain("transform: scaleX(var(--progress");
     expect(html).toContain("data:image/png;base64,logo");
     expect(html).toContain("data:image/png;base64,marker");
-    expect(html).toContain("MAGINALIA desktop α1");
+    expect(html).toContain("MAGINALIA α2 wild berry");
   });
 
   it("has a readable fallback when one or both branded images are unavailable", () => {
     const html = renderBrandProgressHtml({ logoDataUrl: null, markerDataUrl: null });
 
     expect(html).toContain("brand-fallback");
-    expect(html).toContain("MAGINALIA <small>desktop α1 · Before Kaldi</small>");
+    expect(html).toContain("MAGINALIA <small>α2 wild berry</small>");
     expect(html).toContain("linear-gradient(93deg, #baff13");
     expect(html).toContain("clip-path: inset(0 58% 0 0)");
   });
