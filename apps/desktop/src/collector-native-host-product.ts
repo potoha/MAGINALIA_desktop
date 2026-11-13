@@ -149,8 +149,3 @@ export async function runCollectorProductHost(options: CollectorProductHostRunOp
     options.streams,
   );
 }
-
-if (typeof require !== "undefined" && require.main === module) {
-  void runCollectorProductHost({ origin: collectorCallerOrigin(process.argv, 2), addonLocation: "module" })
-    .catch(() => { process.stderr.write("Collector host failed.\n"); process.exitCode = 1; });
-}

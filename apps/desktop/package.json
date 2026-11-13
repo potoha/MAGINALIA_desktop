@@ -50,6 +50,8 @@
     "package:windows:stage": "node scripts/stage-windows-app.mjs",
     "package:windows:installer": "electron-builder --win nsis --x64 --config packaging/electron-builder.json",
     "dist:windows": "npm run package:windows:runtime && npm run package:windows:stage && npm run package:windows:installer",
+    "dist:collector-host": "npm run build:main && node scripts/build-collector-host.mjs",
+    "smoke:collector-host": "node scripts/smoke-collector-host.mjs",
     "smoke:h5": "npm run build && node test/h5-smoke.mjs",
     "prestart": "npm run build --prefix ../.. --workspaces --if-present",
     "start": "electron dist/main/main.js"
@@ -59,6 +61,7 @@
     "electron": "44.3.0",
     "electron-builder": "^26.15.3",
     "node-gyp": "12.4.0",
+    "postject": "1.0.0-alpha.6",
     "typescript": "7.0.2",
     "vite": "8.3.0",
     "vitest": "5.0.0"

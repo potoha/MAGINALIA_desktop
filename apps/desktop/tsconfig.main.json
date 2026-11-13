@@ -22,6 +22,7 @@
     "src/collector-native-host.ts",
     "src/collector-native-host-core.ts",
     "src/collector-native-host-product.ts",
+    "src/collector-native-host-product-entry.ts",
     "src/d5-smoke.ts",
     "src/shelf-smoke.ts",
     "src/preload.ts",
