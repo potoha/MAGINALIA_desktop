@@ -1,7 +1,7 @@
 {
   "name": "@maginalia/desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "main": "dist/main/main.js",
   "dependencies": {
     "@maginalia/format": "0.1.0-alpha.0",
@@ -54,8 +54,9 @@
     "verify:packaged-shelf-mutex": "node scripts/verify-packaged-shelf-mutex.mjs",
     "test:windows-integration-registry": "npm run build:native && node scripts/test-windows-integration-registry.mjs",
     "verify:packaged-windows-integration": "node scripts/verify-packaged-windows-integration.mjs",
-    "dist:windows": "npm run package:windows:runtime && npm run build:native && npm run package:windows:stage && npm run package:windows:installer",
-    "dist:collector-host": "npm run build:main && node scripts/build-collector-host.mjs",
+    "verify:packaged-collector-payload": "node scripts/verify-packaged-collector-payload.mjs",
+    "package:windows:collector-host": "npm run build:main && node scripts/build-collector-host.mjs",
+    "dist:windows": "npm run package:windows:runtime && npm run build:native && npm run package:windows:collector-host && npm run package:windows:stage && npm run package:windows:installer",
     "smoke:collector-host": "node scripts/smoke-collector-host.mjs",
     "smoke:h5": "npm run build && node test/h5-smoke.mjs",
     "prestart": "npm run build --prefix ../.. --workspaces --if-present",

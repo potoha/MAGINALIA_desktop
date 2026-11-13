@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://maginalia.invalid/schemas/collector-payload.schema.json",
+  "title": "MAGINALIA Collector payload descriptor (resources/collector-payload.json)",
+  "description": "Generated at build time by scripts/stage-collector-payload.mjs (design: collector-wizard-integration-design section 2.1). The compiled constants in the main process are authoritative; this file is informational.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "payloadId", "host", "extension", "protocol"],
+  "properties": {
+    "version": { "const": 1 },
+    "payloadId": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+\\+[0-9a-f]{7}$", "description": "<desktop version>+<short commit>" },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "files"],
+      "properties": {
+        "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+        "files": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["MAGINALIA-Collector-Host.exe", "shelf_mutex.node"],
+          "properties": {
+            "MAGINALIA-Collector-Host.exe": { "$ref": "#/$defs/sha256" },
+            "shelf_mutex.node": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      }
+    },
+    "extension": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "id", "zipSha256", "files"],
+      "properties": {
+        "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+        "id": { "type": "string", "pattern": "^[a-p]{32}$" },
+        "zipSha256": { "$ref": "#/$defs/sha256" },
+        "files": {
+          "type": "object",
+          "required": ["manifest.json"],
+          "minProperties": 1,
+          "maxProperties": 64,
+          "propertyNames": { "pattern": "^[^/\\\\:\\u0000-\\u001f]+$", "maxLength": 128 },
+          "additionalProperties": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    },
+    "protocol": { "const": "maginalia.collector.experimental.v1" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

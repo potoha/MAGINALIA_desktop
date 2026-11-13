@@ -1,27 +1,30 @@
 /**
- * Build the standalone Windows x64 MAGINALIA Collector Native Messaging Host
- * (Desktop #86): a Node single executable application (SEA) with the prebuilt
- * `shelf_mutex.node` next to it, plus a per-user NSIS installer.
+ * Build the Collector Native Messaging Host PAYLOAD for the Desktop installer
+ * (collector-wizard-integration-design §2.1/§2.5): a Node single executable
+ * application (SEA) with the prebuilt `shelf_mutex.node` next to it, plus licenses,
+ * notices and provenance. It builds no installer and registers nothing: the Desktop
+ * app places and registers the Host at runtime, and `stage-windows-app.mjs` copies this
+ * payload into the Desktop resources.
  *
- *   npm run dist:collector-host
+ *   npm run package:windows:collector-host      (after `npm run build:native`)
  *
- * Output (apps/desktop/release/collector-host/):
- *   payload/MAGINALIA-Collector-Host.exe       Node SEA (bundle of collector-native-host-product.ts)
- *   payload/shelf_mutex.node                   N-API 8 addon, static CRT (/MT)
- *   payload/org.maginalia.collector.json       Chrome host manifest (path relative to itself)
- *   payload/PROVENANCE.txt                     commit, toolchain, SHA-256 of every shipped file
- *   MAGINALIA-Collector-Host-Setup-<version>.exe
- *   SHA256SUMS                                 payload files and the installer
+ * Output (apps/desktop/release/collector-host/payload/):
+ *   MAGINALIA-Collector-Host.exe     Node SEA (bundle of collector-native-host-product-entry.ts)
+ *   shelf_mutex.node                 the N-API 8 addon from `npm run build:native`, static CRT (/MT)
+ *   LICENSE.txt NOTICE.txt NODE-LICENSE.txt PROVENANCE.txt
  *
  * The build reads the toolchain from this checkout only. Nothing is installed or
- * registered on the build machine.
+ * registered on the build machine. It must run on Node.js >= 24 (the SEA embeds the
+ * building runtime) and takes the Node LICENSE from next to that node.exe.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import os from "node:os";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { HOST_ADDON, HOST_EXECUTABLE, PAYLOAD_VERSION } from "./collector-payload.mjs";
 
 const require = createRequire(import.meta.url);
 const desktop = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -30,12 +33,9 @@ const output = path.join(desktop, "release", "collector-host");
 const stage = path.join(output, "stage");
 const payload = path.join(output, "payload");
 
-export const HOST_VERSION = "0.1.0";
 export const HOST_NAME = "org.maginalia.collector";
-export const EXECUTABLE = "MAGINALIA-Collector-Host.exe";
-export const ADDON = "shelf_mutex.node";
-export const MANIFEST = `${HOST_NAME}.json`;
-export const INSTALLER = `MAGINALIA-Collector-Host-Setup-${HOST_VERSION}.exe`;
+export const EXECUTABLE = HOST_EXECUTABLE;
+export const ADDON = HOST_ADDON;
 const SEA_FUSE = "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2";
 
 function sha256(bytes) {
@@ -112,10 +112,14 @@ export async function bundle(entry, fileName) {
   return file;
 }
 
-async function buildAddon() {
-  run(process.execPath, [require.resolve("node-gyp/bin/node-gyp.js"), "rebuild", "--directory=native/shelf-mutex"], { stdio: ["ignore", "ignore", "inherit"] });
+/**
+ * The Host ships the very addon `npm run build:native` produced (the same build that
+ * `shelf-mutex-addon.mjs` stages for the Desktop Reviewer). It is not rebuilt here, so
+ * both resources copies are byte-identical; `stage-windows-app.mjs` asserts that.
+ */
+async function readAddon() {
   const addon = path.join(desktop, "native", "shelf-mutex", "build", "Release", ADDON);
-  const bytes = await readFile(addon);
+  const bytes = await readFile(addon).catch(() => { throw new Error("shelf_mutex.node is missing; run `npm run build:native` first."); });
   // /MT: the addon must not depend on the Visual C++ redistributable.
   const text = bytes.toString("latin1").toLowerCase();
   for (const dll of ["vcruntime140.dll", "msvcp140.dll", "ucrtbase.dll", "api-ms-win-crt-"]) {
@@ -143,13 +147,6 @@ async function buildExecutable(bundleFile) {
   const { inject } = require("postject");
   await inject(executable, "NODE_SEA_BLOB", await readFile(blob), { sentinelFuse: SEA_FUSE, overwrite: true });
   return executable;
-}
-
-async function nsis() {
-  const builderRequire = createRequire(require.resolve("electron-builder/package.json"));
-  const toolset = builderRequire("app-builder-lib/out/toolsets/windows");
-  // Same checksum-pinned NSIS bundle electron-builder uses for the Desktop installer.
-  return toolset.getMakeNsisPath(null);
 }
 
 /**
@@ -231,8 +228,46 @@ async function writeNotice(nodeLicenseSha256, bundled) {
   await writeFile(path.join(payload, "NOTICE.txt"), `${sections.join("\n")}\n`);
 }
 
+/**
+ * Prove on the built executable that Node's own startup hooks cannot be used to inject
+ * code: NODE_OPTIONS=--require and CLI runtime flags must be ignored (SEA `execArgv: []`).
+ */
+async function assertExecutableIgnoresNodeOptions(executable) {
+  const probeRoot = await mkdtemp(path.join(os.tmpdir(), "collector-host-build-probe-"));
+  try {
+    const marker = path.join(probeRoot, "injected.txt");
+    const preload = path.join(probeRoot, "preload.cjs");
+    await writeFile(preload, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "x");
+`);
+    const frame = Buffer.alloc(4);
+    const body = Buffer.from(JSON.stringify({ protocol: "maginalia.collector.experimental.v1", operation: "health" }));
+    frame.writeUInt32LE(body.length);
+    for (const [args, env] of [
+      [[`chrome-extension://${"a".repeat(32)}/`], { ...process.env, NODE_OPTIONS: `--require ${preload}` }],
+      [["--require", preload], process.env],
+    ]) {
+      await new Promise((resolve, reject) => {
+        const child = spawn(executable, args, { cwd: probeRoot, env, stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
+        child.once("error", reject);
+        child.once("close", resolve);
+        child.stdin.end(Buffer.concat([frame, body]));
+      });
+      if (await stat(marker).then(() => true, () => false)) {
+        throw new Error("The built Host executable ran a NODE_OPTIONS/--require preload; the SEA must ignore runtime flags.");
+      }
+    }
+  } finally {
+    await rm(probeRoot, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   if (process.platform !== "win32" || process.arch !== "x64") throw new Error("The Collector Host is built on Windows x64 only.");
+  if (Number.parseInt(process.versions.node.split(".")[0], 10) < 24) throw new Error(`The Collector Host must be built with Node.js >= 24 (found ${process.version}).`);
+  const desktopPackage = JSON.parse(await readFile(path.join(desktop, "package.json"), "utf8"));
+  if (desktopPackage.version !== PAYLOAD_VERSION) {
+    throw new Error(`apps/desktop/package.json version ${desktopPackage.version} must equal the Host payload version ${PAYLOAD_VERSION}.`);
+  }
   const nodeLicense = await readNodeLicense();
   const nodeLicenseSha256 = sha256(nodeLicense);
   for (const required of [
@@ -247,37 +282,27 @@ async function main() {
 
   const origin = await allowedOrigin();
   const bundleFile = await bundle(path.join(desktop, "src", "collector-native-host-product-entry.ts"), "collector-host.cjs");
-  const addon = await buildAddon();
+  const addon = await readAddon();
   // Same bundler configuration, disposable profile: proves the bundled write path.
   const selfTest = await bundle(path.join(desktop, "scripts", "collector-host-bundle-selftest.ts"), "collector-host-selftest.cjs");
   if (!run(process.execPath, [selfTest]).includes("COLLECTOR_HOST_BUNDLE_SELFTEST_OK")) {
     throw new Error("The Collector Host bundle self-test did not pass.");
   }
-  await buildExecutable(bundleFile);
+  const executable = await buildExecutable(bundleFile);
+  await assertExecutableIgnoresNodeOptions(executable);
   await copyFile(addon, path.join(payload, ADDON));
-  // Chrome on Windows resolves a relative `path` against the manifest's folder, so the
-  // manifest is static ASCII and safe for any (including non-ASCII) install path.
-  await writeFile(path.join(payload, MANIFEST), `${JSON.stringify({
-    name: HOST_NAME,
-    description: "MAGINALIA Collector Native Messaging Host",
-    path: EXECUTABLE,
-    type: "stdio",
-    allowed_origins: [origin],
-  }, null, 2)}\n`);
   await copyFile(path.join(repository, "LICENSE"), path.join(payload, "LICENSE.txt"));
   await writeFile(path.join(payload, "NODE-LICENSE.txt"), nodeLicense);
   const bundled = await collectBundledPackageLicenses(bundleFile);
   await writeNotice(nodeLicenseSha256, bundled);
 
-  const makensis = await nsis();
-  const nsisVersion = run(makensis.path, ["/VERSION"], { env: { ...process.env, ...(makensis.env ?? {}) } });
   const commit = run("git", ["rev-parse", "HEAD"]);
   const dirty = run("git", ["status", "--porcelain"]).length > 0;
   const shipped = (await readdir(payload)).sort();
   const lines = [
-    "MAGINALIA Collector Host - build provenance",
+    "MAGINALIA Collector Host payload - build provenance",
     "",
-    `version: ${HOST_VERSION}`,
+    `payload version: ${PAYLOAD_VERSION} (= apps/desktop/package.json version)`,
     `host name: ${HOST_NAME}`,
     `allowed origin: ${origin}`,
     `git commit: ${commit}${dirty ? " (working tree had uncommitted changes)" : ""}`,
@@ -289,8 +314,7 @@ async function main() {
     `postject: ${require("postject/package.json").version}`,
     `vite: ${require("vite/package.json").version}`,
     `node-gyp: ${require("node-gyp/package.json").version}`,
-    `nsis: ${nsisVersion} (electron-builder ${require("electron-builder/package.json").version} toolset)`,
-    "addon: N-API 8, static CRT (/MT), no VC++ runtime import (checked)",
+    "addon: N-API 8, static CRT (/MT), no VC++ runtime import (checked); copied from npm run build:native",
     "signing: unsigned (SmartScreen warning is a known limitation)",
     "",
     "SHA-256 of shipped files:",
@@ -298,17 +322,8 @@ async function main() {
   for (const file of shipped) lines.push(`${sha256(await readFile(path.join(payload, file)))}  ${file}`);
   await writeFile(path.join(payload, "PROVENANCE.txt"), `${lines.join("\n")}\n`);
 
-  run(makensis.path, [
-    "/V2", "/INPUTCHARSET", "UTF8",
-    `/DVERSION=${HOST_VERSION}`,
-    `/DPAYLOAD=${payload}`,
-    `/DOUTFILE=${path.join(output, INSTALLER)}`,
-    path.join(desktop, "packaging", "collector-host", "installer.nsi"),
-  ], { env: { ...process.env, ...(makensis.env ?? {}) }, stdio: ["ignore", "ignore", "inherit"] });
-
   const sums = [];
   for (const file of (await readdir(payload)).sort()) sums.push(`${sha256(await readFile(path.join(payload, file)))}  payload/${file}`);
-  sums.push(`${sha256(await readFile(path.join(output, INSTALLER)))}  ${INSTALLER}`);
   await writeFile(path.join(output, "SHA256SUMS"), `${sums.join("\n")}\n`);
   await rm(stage, { recursive: true, force: true });
   process.stdout.write(`${sums.join("\n")}\n`);
