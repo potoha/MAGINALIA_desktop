@@ -2868,3 +2868,32 @@ body.first-run-mode #app {
     clip-path: inset(0 64% 0 0);
   }
 }
+
+.shelf-refresh-feedback {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin: 0;
+}
+
+.shelf-refresh-message {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 0.4rem 0.6rem;
+  border-left: 3px solid #2f6b3f;
+  background: #eef6ef;
+  color: #1f4a2b;
+  font-size: 0.85rem;
+}
+
+.shelf-refresh-feedback[data-state="error"] .shelf-refresh-message {
+  border-left-color: #8d2929;
+  background: #fbeeee;
+  color: #6f1d1d;
+}
+
+.shelf-refresh-message:empty {
+  padding: 0;
+  border: 0;
+  background: none;
+}

@@ -16,6 +16,7 @@ import {
   type ShelfControllerView,
   type ShelfViewState
 } from "./shelf-controller";
+import { runShelfRefresh, type ShelfRefreshFeedback } from "./shelf-refresh-feedback";
 import { MonacoMarkdownSurface } from "./monaco-surface";
 import {
   createPreviewQuoteMap,
@@ -341,6 +342,10 @@ app.innerHTML = `
                 <p id="project-search-error" class="library-error" role="alert" hidden></p>
               </div>
             </section>
+            <div id="shelf-refresh-feedback" class="shelf-refresh-feedback" data-state="success">
+              <p id="shelf-refresh-message" class="shelf-refresh-message" role="status" aria-live="polite"></p>
+              <button id="shelf-refresh-dismiss" type="button" aria-label="更新結果を閉じる" hidden>閉じる</button>
+            </div>
             <p id="library-status" class="library-status" role="status" aria-live="polite">Search the selected Private Shelf.</p>
             <p id="library-error" class="library-error" role="alert" aria-live="assertive" hidden></p>
             <p id="references-status" class="references-status" data-state="empty" role="status" aria-live="polite">Open a document to refresh References.</p>
@@ -707,6 +712,9 @@ const libraryQuery = requiredElement<HTMLInputElement>("#library-query");
 const librarySearchButton = requiredElement<HTMLButtonElement>("#library-search");
 const libraryStatus = requiredElement<HTMLElement>("#library-status");
 const libraryError = requiredElement<HTMLElement>("#library-error");
+const shelfRefreshFeedback = requiredElement<HTMLElement>("#shelf-refresh-feedback");
+const shelfRefreshMessage = requiredElement<HTMLElement>("#shelf-refresh-message");
+const shelfRefreshDismissButton = requiredElement<HTMLButtonElement>("#shelf-refresh-dismiss");
 const referencesStatus = requiredElement<HTMLElement>("#references-status");
 const referencesUnresolved = requiredElement<HTMLElement>("#references-unresolved");
 const libraryResults = requiredElement<HTMLUListElement>("#library-results");
@@ -1896,33 +1904,27 @@ commandRegistry.register({
   category: "Shelf",
   keywords: ["reviewer", "approved", "quotation", "refresh"]
 }, async () => {
-  const refreshShelf = window.maginalia.refreshShelf;
-  if (typeof refreshShelf !== "function") {
-    libraryStatus.dataset.state = "error";
-    libraryStatus.textContent = "Shelf refresh is unavailable.";
-    libraryError.textContent = "Shelf refresh is unavailable in this Desktop runtime.";
-    libraryError.hidden = false;
-    return;
-  }
-  let result: Awaited<ReturnType<typeof refreshShelf>>;
-  try {
-    result = await refreshShelf();
-  } catch (_error: unknown) {
-    libraryStatus.dataset.state = "error";
-    libraryStatus.textContent = "Shelf refresh failed.";
-    libraryError.textContent = "The canonical Private Shelf could not be refreshed.";
-    libraryError.hidden = false;
-    return;
-  }
-  if (result.kind === "error") {
-    libraryStatus.dataset.state = "error";
-    libraryStatus.textContent = "Shelf refresh failed.";
-    libraryError.textContent = result.message;
-    libraryError.hidden = false;
-    return;
-  }
-
-  await shelfController?.search(libraryQuery.value);
+  // Clear first so an identical repeated result is announced again.
+  clearShelfRefreshFeedback();
+  const feedback = await runShelfRefresh({
+    refreshShelf: window.maginalia.refreshShelf,
+    getState: () => shelfController?.getState() ?? { query: "", status: "idle", results: [], selectedAnnotationId: null, error: null },
+    reload: async () => { await shelfController?.search(libraryQuery.value); }
+  });
+  showShelfRefreshFeedback(feedback);
+});
+function showShelfRefreshFeedback(feedback: ShelfRefreshFeedback): void {
+  shelfRefreshFeedback.dataset.state = feedback.kind;
+  shelfRefreshMessage.textContent = feedback.message;
+  shelfRefreshDismissButton.hidden = false;
+}
+function clearShelfRefreshFeedback(): void {
+  shelfRefreshMessage.textContent = "";
+  shelfRefreshDismissButton.hidden = true;
+}
+shelfRefreshDismissButton.addEventListener("click", () => {
+  clearShelfRefreshFeedback();
+  refreshShelfButton.focus();
 });
 registerLinkCommands(commandRegistry, {
   getCaret: () => {
