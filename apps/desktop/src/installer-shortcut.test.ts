@@ -36,9 +36,9 @@ describe("optional Desktop shortcut installer policy", () => {
     const source = await readFile(installerScriptPath, "utf8");
 
     expect(source).toContain('!define MAGINALIA_PRERELEASE_NAME "MAGINALIA α2 wild berry"');
-    expect(source).toContain('IfFileExists "$DESKTOP\${MAGINALIA_PRERELEASE_NAME}.lnk" 0 MAGINALIA_PrereleaseDesktopShortcutDone');
-    expect(source).toContain('t "$INSTDIR\${MAGINALIA_PRERELEASE_NAME}.exe"');
-    expect(source).not.toContain('Delete "$DESKTOP\${MAGINALIA_PRERELEASE_NAME}.lnk"');
+    expect(source).toContain('IfFileExists "$DESKTOP\\${MAGINALIA_PRERELEASE_NAME}.lnk" 0 MAGINALIA_PrereleaseDesktopShortcutDone');
+    expect(source).toContain('t "$INSTDIR\\${MAGINALIA_PRERELEASE_NAME}.exe"');
+    expect(source).not.toContain('Delete "$DESKTOP\\${MAGINALIA_PRERELEASE_NAME}.lnk"');
     expect(source).toContain('${OrIf} $MAGINALIA_PRERELEASE_LINK_REMOVED == "1"');
   });
 });
