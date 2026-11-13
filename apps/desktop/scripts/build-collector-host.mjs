@@ -157,7 +157,7 @@ export async function verifyExecutableIgnoresRuntimeOptions(executable) {
   header.writeUInt32LE(body.length);
   const input = Buffer.concat([header, body]);
   const attempts = [
-    { label: "NODE_OPTIONS", args: [], env: { ...process.env, NODE_OPTIONS: `--require ${preload}` } },
+    { label: "NODE_OPTIONS", args: [], env: { ...process.env, NODE_OPTIONS: `--require "${preload}"` } },
     { label: "CLI --require", args: ["--require", preload], env: process.env },
   ];
   for (const attempt of attempts) {

@@ -1010,21 +1010,17 @@ interface ShelfRecordFileHit {
   readonly value: unknown;
 }
 
-/** Lists the record files under a Shelf directory; injectable so tests can count scans. */
-export type ShelfRecordFileLister = (root: string, directory: string) => Promise<string[]>;
-
 /** Parsed record files of one Shelf directory, keyed by entity ID (one scan, many lookups). */
 type ShelfRecordIndex = ReadonlyMap<string, readonly ShelfRecordFileHit[]>;
 
 async function buildShelfRecordIndex(
   layout: ShelfWriteLayout,
   directory: string,
-  kind: "book" | "annotation",
-  lister: ShelfRecordFileLister = listShelfRecordFiles
+  kind: "book" | "annotation"
 ): Promise<ShelfRecordIndex> {
   const format = await loadFormatCore();
   const index = new Map<string, ShelfRecordFileHit[]>();
-  for (const file of await lister(layout.root, directory)) {
+  for (const file of await listShelfRecordFiles(layout.root, directory)) {
     try {
       const info = await lstat(file);
       if (!info.isFile() || info.isSymbolicLink()) continue;
@@ -1170,7 +1166,7 @@ export interface ShelfRecordWriteTransactionRequest extends ResolveShelfWriteLay
   readonly prepare: (existing: ShelfWriteJournalRecord | undefined) => Promise<ShelfRecordWritePlan>;
   /** Called immediately before the first journal or Shelf-record mutation. */
   readonly beforeMutation?: (requestId: string) => Promise<void>;
-  /** Called only after a committed receipt has been persisted and reverified. */
+  /** Called only after the committed receipt has been written to the journal (not re-read). */
   readonly afterReceipt?: (receipt: ShelfQuoteWriteReceipt) => Promise<void>;
   readonly beforeAnnotationPublish?: () => void | Promise<void>;
   readonly now?: () => number;
@@ -1844,8 +1840,6 @@ export async function inspectShelfWriteJournal(options: {
   readonly shelfRoot: string;
   readonly expectedShelfId: string;
   readonly coordinationRoot: string;
-  /** Test seam: replaces the record-directory lister so scans can be counted. */
-  readonly listRecordFiles?: ShelfRecordFileLister;
 }): Promise<readonly ShelfWriteJournalEntry[]> {
   const layout = await resolveShelfWriteLayout(options);
   const directory = path.join(layout.coordinationDirectory, "requests");
@@ -1872,8 +1866,8 @@ export async function inspectShelfWriteJournal(options: {
     if (!REQUEST_ID_PATTERN.test(requestId)) continue;
     const record = await readJournalRecord(layout, requestId);
     if (record === undefined) continue;
-    annotationIndex ??= await buildShelfRecordIndex(layout, layout.annotationsDirectory, "annotation", options.listRecordFiles);
-    bookIndex ??= await buildShelfRecordIndex(layout, layout.booksDirectory, "book", options.listRecordFiles);
+    annotationIndex ??= await buildShelfRecordIndex(layout, layout.annotationsDirectory, "annotation");
+    bookIndex ??= await buildShelfRecordIndex(layout, layout.booksDirectory, "book");
     const annotationFiles = annotationIndex.get(record.annotationId) ?? NO_RECORD_HITS;
     const bookFiles = bookIndex.get(record.bookId) ?? NO_RECORD_HITS;
     const annotationPresent = annotationFiles.length > 0;

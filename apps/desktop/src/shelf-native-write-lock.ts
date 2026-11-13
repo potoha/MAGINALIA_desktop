@@ -71,7 +71,6 @@ import {
   commitShelfQuote,
   inspectShelfWriteJournal,
   resolveShelfWriteLayout,
-  type ShelfRecordFileLister,
   type ShelfRecordWriteTransactionRequest,
   type ShelfQuoteWriteReceipt,
   type ShelfQuoteWriteRequest,
@@ -311,8 +310,6 @@ export async function assessShelfWriteRecoveryState(options: {
   readonly shelfRoot: string;
   readonly expectedShelfId: string;
   readonly coordinationRoot: string;
-  /** Test seam forwarded to the journal inspection so directory scans can be counted. */
-  readonly listRecordFiles?: ShelfRecordFileLister;
 }): Promise<ShelfWriteRecoveryAssessment> {
   await resolveShelfWriteLayout(options);
   // Strict journal validation: a malformed, foreign or internally inconsistent
@@ -578,9 +575,10 @@ export async function commitShelfQuoteWithNativeLock(
       coordinationRoot: request.coordinationRoot
     });
     const recovery = await inspectShelfWriterRecoveryState(layout.coordinationDirectory);
+    let assessment: ShelfWriteRecoveryAssessment | undefined;
     if (lease.abandoned || recovery.pending) {
       try {
-        const assessment = await assessShelfWriteRecoveryState({
+        assessment = await assessShelfWriteRecoveryState({
           shelfRoot: request.shelfRoot,
           expectedShelfId: request.expectedShelfId,
           coordinationRoot: request.coordinationRoot
@@ -607,17 +605,32 @@ export async function commitShelfQuoteWithNativeLock(
     // that can never succeed therefore leaves neither a marker nor a journal record.
     const markerFile = path.join(layout.coordinationDirectory, SHELF_WRITER_RECOVERY_STATE_FILENAME);
     let markerPublished = false;
-    const receipt = await commitShelfQuote({
-      ...request,
-      externalLock: lease,
-      beforeMutation: async (requestId) => {
-        await writeShelfWriterRecoveryState({
-          coordinationDirectory: layout.coordinationDirectory,
-          requestId
-        });
-        markerPublished = true;
+    let receipt: ShelfQuoteWriteReceipt;
+    try {
+      receipt = await commitShelfQuote({
+        ...request,
+        externalLock: lease,
+        beforeMutation: async (requestId) => {
+          await writeShelfWriterRecoveryState({
+            coordinationDirectory: layout.coordinationDirectory,
+            requestId
+          });
+          markerPublished = true;
+        }
+      });
+    } catch (error: unknown) {
+      // Recovery found an interrupted write (possibly only through WAIT_ABANDONED, with
+      // no marker on disk). If this attempt failed before publishing a marker, the next
+      // writer would see neither abandonment nor marker and skip assessment while the
+      // staged request is still unfinished. Record the evidence and keep the mutex held.
+      if (!markerPublished && assessment !== undefined && assessment.interruptedRequestIds.length > 0) {
+        // An already-present marker is itself the evidence and is left untouched, so the
+        // mutex is held only when this attempt has to create that evidence.
+        keepHeld = !recovery.pending;
+        await ensureRecoveryStateRecorded(layout, assessment.interruptedRequestIds[0]!, error);
       }
-    });
+      throw error;
+    }
     // Clear only after the committed receipt exists. A marker that survived an earlier
     // crash and was just verified by recovery is cleared by the same receipt.
     if (markerPublished || recovery.pending) await clearShelfWriterRecoveryState(markerFile);

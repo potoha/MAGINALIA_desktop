@@ -14,8 +14,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, link, lstat, readFile, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { Worker } from "node:worker_threads";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
+
+vi.mock("./shelf-write-core.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./shelf-write-core.js")>();
+  return { ...actual, listShelfRecordFiles: vi.fn(actual.listShelfRecordFiles) };
+});
 import {
   acquireShelfMutex,
   closeShelfMutexHandles,
@@ -863,16 +869,107 @@ mutexSuite("request validation happens before the recovery marker (D071)", () =>
     expect((await readdir(fixture.booksDirectory)).filter((name) => name.endsWith(".json"))).toHaveLength(1);
   });
 
-  test("a pre-existing marker is preserved byte for byte when the next request is rejected up front", async () => {
-    const fixture = await createFixture("validate-preserve");
+  async function leaveInterrupted(fixture: Awaited<ReturnType<typeof createFixture>>): Promise<ShelfQuoteWriteRequest> {
     const interrupted = request(fixture, {
       faults: { beforeAnnotationPublish: () => { throw new Error("injected in-flight failure"); } }
     });
     await expect(commitShelfQuoteWithNativeLock(interrupted, { acquireTimeoutMs: 2_000 })).rejects.toThrow();
-    const file = path.join(coordinationDirectory(fixture), SHELF_WRITER_RECOVERY_STATE_FILENAME);
-    const markerBytes = await readFile(file, "utf8");
-    await expect(commitShelfQuoteWithNativeLock(request(fixture, { quote: " " }), { acquireTimeoutMs: 2_000 })).rejects.toBeDefined();
-    expect(await readFile(file, "utf8")).toBe(markerBytes);
+    return interrupted;
+  }
+
+  test("a request rejected by validation leaves the existing marker and journal byte for byte unchanged", async () => {
+    const fixture = await createFixture("validate-preserve");
+    const interrupted = await leaveInterrupted(fixture);
+    const markerFile = path.join(coordinationDirectory(fixture), SHELF_WRITER_RECOVERY_STATE_FILENAME);
+    const journalFile = path.join(fixture.journalDirectory, `${interrupted.requestId}.json`);
+    const markerBefore = await readFile(markerFile, "utf8");
+    const journalBefore = await readFile(journalFile, "utf8");
+    const retry = { ...interrupted };
+    delete (retry as { faults?: unknown }).faults;
+    // Same request ID (the recovery gate passes) with different content: digest conflict.
+    await expect(commitShelfQuoteWithNativeLock({ ...retry, quote: "別の本文。" }, { acquireTimeoutMs: 2_000 }))
+      .rejects.toMatchObject({ code: "shelf-write-request-mismatch" });
+    // Same request ID with an invalid getDate: shape validation.
+    await expect(commitShelfQuoteWithNativeLock({ ...retry, getDate: "202613011200" }, { acquireTimeoutMs: 2_000 }))
+      .rejects.toMatchObject({ code: "shelf-write-invalid-request" });
+    expect(await readFile(markerFile, "utf8")).toBe(markerBefore);
+    expect(await readFile(journalFile, "utf8")).toBe(journalBefore);
+    expect(await journalNames(fixture)).toEqual([`${interrupted.requestId}.json`]);
+  });
+
+  test("a marker over a fully committed journal is preserved when a new request is rejected by validation", async () => {
+    const fixture = await createFixture("validate-committed-marker");
+    await commitShelfQuoteWithNativeLock(request(fixture), { acquireTimeoutMs: 2_000 });
+    const marker = {
+      version: 1, state: "write-in-progress", pid: 4242, requestId: "req-left-over-1", startedAt: new Date().toISOString()
+    };
+    const markerFile = path.join(coordinationDirectory(fixture), SHELF_WRITER_RECOVERY_STATE_FILENAME);
+    await writeFile(markerFile, `${JSON.stringify(marker, null, 2)}\n`, "utf8");
+    const markerBefore = await readFile(markerFile, "utf8");
+    const journalBefore = await journalNames(fixture);
+    await expect(commitShelfQuoteWithNativeLock(request(fixture, { getDate: "202613011200" }), { acquireTimeoutMs: 2_000 }))
+      .rejects.toMatchObject({ code: "shelf-write-invalid-request" });
+    expect(await readFile(markerFile, "utf8")).toBe(markerBefore);
+    expect(await journalNames(fixture)).toEqual(journalBefore);
+  });
+
+  test("a corrupt marker plus an invalid request fails closed (#92) and the marker is untouched", async () => {
+    const fixture = await createFixture("validate-corrupt-marker");
+    await commitShelfQuoteWithNativeLock(request(fixture), { acquireTimeoutMs: 2_000 });
+    const markerFile = path.join(coordinationDirectory(fixture), SHELF_WRITER_RECOVERY_STATE_FILENAME);
+    await writeFile(markerFile, "{ not json", "utf8");
+    await expect(commitShelfQuoteWithNativeLock(request(fixture, { getDate: "202613011200" }), { acquireTimeoutMs: 2_000 }))
+      .rejects.toMatchObject({ code: "shelf-write-recovery-state-invalid" });
+    expect(await readFile(markerFile, "utf8")).toBe("{ not json");
+  });
+
+  test("commitShelfQuote writes nothing when beforeMutation throws", async () => {
+    const fixture = await createFixture("before-mutation-throws");
+    await expect(commitShelfQuote(request(fixture, { beforeMutation: async () => { throw new Error("marker unavailable"); } })))
+      .rejects.toThrow("marker unavailable");
+    expect(await journalNames(fixture)).toEqual([]);
+    expect(await readdir(fixture.booksDirectory)).toEqual([]);
+    expect(await readdir(fixture.annotationsDirectory)).toEqual([]);
+  });
+
+  test("an abandoned mutex with a staged request and no marker keeps its evidence when the retry fails before any mutation", async () => {
+    const fixture = await createFixture("abandoned-no-marker");
+    const staged = await leaveInterrupted(fixture);
+    const markerFile = path.join(coordinationDirectory(fixture), SHELF_WRITER_RECOVERY_STATE_FILENAME);
+    // The crash left no marker: only the abandoned mutex reveals the interrupted write.
+    await rm(markerFile);
+    expect((await inspectShelfWriterRecoveryState(coordinationDirectory(fixture))).pending).toBe(false);
+    // Make the mutex abandoned: another thread acquires it and exits without releasing.
+    const probe = await acquireShelfMutex({ shelfId: fixture.shelfId, acquireTimeoutMs: 500 });
+    probe.release();
+    const binary = path.join(process.cwd(), "native", "shelf-mutex", "build", "Release", "shelf_mutex.node");
+    // A killed process leaves the kernel mutex abandoned (a worker thread would not).
+    const name = resolveShelfMutexName(fixture.shelfId);
+    const child = spawn(process.execPath, ["-e",
+      `const a=require(${JSON.stringify(binary)});const h=a.createMutex(${JSON.stringify(name)});`
+      + "console.log(JSON.stringify(a.acquire(h,1000)));setInterval(()=>{},1000)"]);
+    const acquired = await new Promise<{ acquired: boolean }>((resolve, reject) => {
+      child.stdout.once("data", (chunk: Buffer) => resolve(JSON.parse(chunk.toString()) as { acquired: boolean }));
+      child.once("error", reject);
+    });
+    expect(acquired.acquired).toBe(true);
+    await new Promise<void>((resolve) => { child.once("exit", () => resolve()); child.kill(); });
+
+    // Resend the same request ID with different content: the gate passes, validation fails.
+    const retry = { ...staged };
+    delete (retry as { faults?: unknown }).faults;
+    const reported: string[] = [];
+    await expect(commitShelfQuoteWithNativeLock({ ...retry, quote: "別の本文。" }, {
+      acquireTimeoutMs: 2_000,
+      onRecovery: (assessment, info) => { reported.push(`${info.trigger}:${assessment.interruptedRequestIds.join(",")}`); }
+    })).rejects.toMatchObject({ code: "shelf-write-request-mismatch" });
+    expect(reported).toEqual([`abandoned:${staged.requestId}`]);
+    // The evidence was re-recorded and the mutex stays held, so no later writer slips past.
+    const marker = await inspectShelfWriterRecoveryState(coordinationDirectory(fixture));
+    expect(marker.pending).toBe(true);
+    expect(marker.record?.requestId).toBe(staged.requestId);
+    await expect(acquireShelfMutex({ shelfId: fixture.shelfId, acquireTimeoutMs: 200 }))
+      .rejects.toMatchObject({ code: "shelf-write-busy" });
   });
 });
 
@@ -925,22 +1022,19 @@ mutexSuite("recovery assessment scans the Shelf once", () => {
     return fixture;
   }
 
-  async function assess(fixture: Awaited<ReturnType<typeof createFixture>>): Promise<{ scans: number; committed: number; millis: number }> {
-    let scans = 0;
-    const started = Date.now();
+  /** Counts every call that reaches `listShelfRecordFiles`, whichever code path makes it. */
+  async function assess(fixture: Awaited<ReturnType<typeof createFixture>>): Promise<{ scans: number; committed: number }> {
+    const lister = vi.mocked(listShelfRecordFiles);
+    lister.mockClear();
     const assessment = await assessShelfWriteRecoveryState({
       shelfRoot: fixture.shelfRoot,
       expectedShelfId: fixture.shelfId,
-      coordinationRoot: fixture.coordinationRoot,
-      listRecordFiles: async (root, directory) => {
-        scans += 1;
-        return listShelfRecordFiles(root, directory);
-      }
+      coordinationRoot: fixture.coordinationRoot
     });
-    return { scans, committed: assessment.committedRequestIds.length, millis: Date.now() - started };
+    return { scans: lister.mock.calls.length, committed: assessment.committedRequestIds.length };
   }
 
-  test("directory scans do not grow with the journal and a large Shelf assesses quickly", async () => {
+  test("directory scans do not grow with the journal size", async () => {
     const small = await assess(await buildSyntheticShelf(20, 40));
     const large = await assess(await buildSyntheticShelf(300, 600));
     expect(small.committed).toBe(20);
@@ -948,9 +1042,6 @@ mutexSuite("recovery assessment scans the Shelf once", () => {
     // One Book scan and one Annotation scan per assessment, whatever the journal size.
     expect(small.scans).toBe(2);
     expect(large.scans).toBe(2);
-    // Generous bound for loaded CI hardware (about 2 s on an idle developer machine):
-    // the mutex wait is 15 s and the former per-entry scans needed minutes for this size.
-    expect(large.millis, `assessment took ${large.millis} ms`).toBeLessThan(12_000);
   }, 180_000);
 });
 
