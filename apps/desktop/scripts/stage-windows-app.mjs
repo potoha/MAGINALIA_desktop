@@ -66,6 +66,7 @@ async function writeThirdPartyNotices() {
     const source = path.join(repositoryRoot, filename);
     try { await cp(source, path.join(noticesRoot, `MAGINALIA-${filename}`)); } catch { /* NOTICE is optional in the current repository. */ }
   }
+  await cp(path.join(desktopRoot, "assets", "fonts", "jost", "OFL.txt"), path.join(noticesRoot, "Jost-OFL.txt"));
   await collectNpmNotices(path.join(stageRoot, "node_modules"), path.join(noticesRoot, "node"));
   await collectPythonNotices(path.join(repositoryRoot, "sidecars", "reviewer", ".venv", "Lib", "site-packages"), path.join(noticesRoot, "python"));
   await collectPythonNotices(path.join(repositoryRoot, "sidecars", "reviewer", "ndlocr-runtime", ".venv", "Lib", "site-packages"), path.join(noticesRoot, "python-ndlocr"));
