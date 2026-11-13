@@ -55,15 +55,14 @@ describe("Collector ownership / ACL policy (fakes)", () => {
       .toEqual({ ok: false, violation: "unsupported-ace" });
   });
 
-  it("fails closed on an unclassifiable (other) ACE that carries a write-capable right", () => {
+  it("fails closed on an unclassifiable (other) ACE, whose rights the addon reports as mask 0", () => {
     const dir = safeFacts(true);
-    for (const mask of [0x2, 0x10000, 0x40000000, 0x1f01ff]) {
+    for (const mask of [0, 0x2, 0x1f01ff]) {
       expect(evaluatePathSecurity(withAce(dir, { type: "other", sid: "S-1-1-0", mask }), "directory"))
         .toEqual({ ok: false, violation: "unsupported-ace" });
     }
-    // Harmless "other" entries stay ignored: no write right, or inherit-only.
-    expect(evaluatePathSecurity(withAce(dir, { type: "other", sid: "S-1-1-0", mask: 0x1200a9 }), "directory")).toEqual({ ok: true });
-    expect(evaluatePathSecurity(withAce(dir, { type: "other", sid: "S-1-1-0", mask: 0x1f01ff, inheritOnly: true }), "directory"))
+    // Inherit-only entries do not apply to this entry and stay ignored.
+    expect(evaluatePathSecurity(withAce(dir, { type: "other", sid: "S-1-1-0", mask: 0, inheritOnly: true }), "directory"))
       .toEqual({ ok: true });
   });
 
