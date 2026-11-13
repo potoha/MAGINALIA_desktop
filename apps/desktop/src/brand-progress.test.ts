@@ -31,7 +31,7 @@ describe("brand progress presentation", () => {
     expect(html).not.toContain("transform: scaleX(var(--progress");
     expect(html).toContain("data:image/png;base64,logo");
     expect(html).toContain("data:image/png;base64,marker");
-    expect(html).toContain("MAGINALIA α2 wild berry");
+    expect(html).toContain("MAGINALIA Alpha2 Wild Berry");
   });
 
   it("has a readable fallback when one or both branded images are unavailable", () => {

@@ -43,7 +43,7 @@ remain manual acceptance steps.
 
 ## Upgrade over α1
 
-Release name: "MAGINALIA α2 wild berry" (Desktop version 0.2.0). Statically
+Release name: "MAGINALIA Alpha2 Wild Berry" (Desktop version 0.2.0). Statically
 compared with tag `v0.1.0-alpha.1`. These are unchanged:
 
 - `appId` `org.maginalia.desktop.alpha1`. electron-builder derives `APP_GUID`
@@ -59,8 +59,8 @@ compared with tag `v0.1.0-alpha.1`. These are unchanged:
 - electron-builder 26.15.3 and Electron 44.3.0.
 
 These change with the release name: `productName` and `shortcutName`
-(`MAGINALIA α2 wild berry`), the executable name derived from `productName`
-(`MAGINALIA α2 wild berry.exe`) and the version.
+(`MAGINALIA Alpha2 Wild Berry`), the executable name derived from `productName`
+(`MAGINALIA Alpha2 Wild Berry.exe`) and the version.
 
 ### Install directory and shortcuts (static analysis, installer not run)
 
@@ -77,7 +77,7 @@ These change with the release name: `productName` and `shortcutName`
   created by `installer-shortcut.nsh`). `installer-shortcut.nsh` therefore
   deletes `MAGINALIA desktop α1.lnk` on the Desktop only when its target is
   `<INSTDIR>\MAGINALIA desktop α1.exe`, checked with Windows PowerShell and
-  `WScript.Shell`, and then creates `MAGINALIA α2 wild berry.lnk`. If the target
+  `WScript.Shell`, and then creates `MAGINALIA Alpha2 Wild Berry.lnk`. If the target
   differs or the check fails, nothing is deleted.
 - Not verified on a machine: the above is derived from the electron-builder
   template and from compiling both α1 and α2 installers (stubbed payload) and

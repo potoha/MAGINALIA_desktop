@@ -18,7 +18,7 @@ export function normalizeBrandProgress(progress: BrandProgressValue): BrandProgr
 
 export function createBrandProgressState(message: string, progress: BrandProgressValue): BrandProgressState {
   return Object.freeze({
-    message: message.trim() || "MAGINALIA α2 wild berry を準備しています",
+    message: message.trim() || "MAGINALIA Alpha2 Wild Berry を準備しています",
     progress: normalizeBrandProgress(progress),
   });
 }
@@ -31,11 +31,11 @@ export function createBrandProgressState(message: string, progress: BrandProgres
 export function renderBrandProgressHtml(images: BrandProgressImages): string {
   const logo = images.logoDataUrl === null
     ? ""
-    : `<img id="brand-image" class="brand-image" src="${escapeAttribute(images.logoDataUrl)}" alt="MAGINALIA α2 wild berry">`;
+    : `<img id="brand-image" class="brand-image" src="${escapeAttribute(images.logoDataUrl)}" alt="MAGINALIA Alpha2 Wild Berry">`;
   const markerStyle = images.markerDataUrl === null
     ? ""
     : `--marker-image: url('${escapeAttribute(images.markerDataUrl)}');`;
-  const initialState = createBrandProgressState("MAGINALIA α2 wild berry を起動しています", 0);
+  const initialState = createBrandProgressState("MAGINALIA Alpha2 Wild Berry を起動しています", 0);
 
   return `<!doctype html>
 <html lang="ja">
@@ -43,7 +43,7 @@ export function renderBrandProgressHtml(images: BrandProgressImages): string {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
-  <title>MAGINALIA α2 wild berry</title>
+  <title>MAGINALIA Alpha2 Wild Berry</title>
   <style>
     :root {
       color-scheme: light;
@@ -119,7 +119,7 @@ export function renderBrandProgressHtml(images: BrandProgressImages): string {
 </head>
 <body>
   <main id="brand-progress" role="dialog" aria-labelledby="brand-title" aria-describedby="startup-message" style="${markerStyle}">
-    <h1 id="brand-title" class="visually-hidden">MAGINALIA α2 wild berry</h1>
+    <h1 id="brand-title" class="visually-hidden">MAGINALIA Alpha2 Wild Berry</h1>
     <div class="brand">
       ${logo}
       <div id="brand-fallback" class="brand-fallback" aria-hidden="true">MAGINALIA <small>α2 wild berry</small></div>
@@ -128,7 +128,7 @@ export function renderBrandProgressHtml(images: BrandProgressImages): string {
       <span class="message-paint" aria-hidden="true"></span>
       <p id="startup-message" class="message-text" role="status" aria-live="polite">${escapeHtml(initialState.message)}</p>
     </div>
-    <div id="startup-progress" class="progress-track" role="progressbar" aria-label="MAGINALIA α2 wild berry の起動状況" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+    <div id="startup-progress" class="progress-track" role="progressbar" aria-label="MAGINALIA Alpha2 Wild Berry の起動状況" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
       <span class="progress-stroke" aria-hidden="true"></span>
     </div>
     <div class="footer"><span>wild berry</span><span id="progress-caption">0%</span></div>
@@ -155,7 +155,7 @@ export function renderBrandProgressHtml(images: BrandProgressImages): string {
         const value = state.progress === null || !Number.isFinite(state.progress)
           ? null
           : Math.max(0, Math.min(1, state.progress));
-        message.textContent = state.message || "MAGINALIA α2 wild berry を準備しています";
+        message.textContent = state.message || "MAGINALIA Alpha2 Wild Berry を準備しています";
         root.classList.toggle("is-indeterminate", value === null);
         if (value === null) {
           messagePaint.style.removeProperty("clip-path");
