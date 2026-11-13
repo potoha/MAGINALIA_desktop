@@ -421,10 +421,6 @@ class ReasonSink {
   }
 }
 
-function isRegularFile(entry: CollectorFileEntry | null): entry is CollectorFileEntry {
-  return entry !== null && entry.kind === "file" && !entry.isReparsePoint;
-}
-
 interface StructureResult {
   readonly extensionVersionOnDisk: string | null;
 }
@@ -488,8 +484,10 @@ async function checkStructure(
     const entry = await fileSystem.stat(manifestPath);
     if (entry === null) {
       sink.add("extension-file-missing");
-    } else if (!isRegularFile(entry)) {
-      sink.add(entry.isReparsePoint ? "reparse-point-found" : "extension-manifest-invalid");
+    } else if (entry.isReparsePoint) {
+      sink.add("reparse-point-found");
+    } else if (entry.kind !== "file") {
+      sink.add("extension-manifest-invalid");
     } else {
       const read = await fileSystem.readSmallFile(manifestPath, MAX_EXTENSION_MANIFEST_BYTES);
       let version: unknown;
