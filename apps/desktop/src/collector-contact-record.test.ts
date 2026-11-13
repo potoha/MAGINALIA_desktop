@@ -93,6 +93,22 @@ describe("Collector contact record", () => {
     }
   });
 
+  it("does the same bounded work for an oversize existing record and rewrites it", async () => {
+    const { current, file, folder } = await withIntegrationFolder();
+    const time = clock("2026-11-13T09:00:00.000Z");
+    const record = createCollectorContactRecorder({ resolveLocalAppDataPath: () => current.localAppData, inspectPathSecurity: fakeSafeInspector, now: time.now });
+    // A valid-looking record padded far beyond the 4 KiB limit is never parsed.
+    const padded = JSON.stringify({ version: 1, ...values, contactedAt: "2026-11-13T09:00:00.000Z", pad: "x".repeat(64 * 1024 * 1024) });
+    await writeFile(file, padded);
+    const started = Date.now();
+    expect(await record(values)).toBe("written");
+    expect(Date.now() - started).toBeLessThan(5_000);
+    const text = await readFile(file, "utf8");
+    expect(text.length).toBeLessThan(1024);
+    expect(Object.keys(JSON.parse(text))).toEqual(["version", "protocol", "hostVersion", "extensionVersion", "contactedAt"]);
+    expect(await readdir(folder)).toEqual([COLLECTOR_CONTACT_RECORD_FILENAME]);
+  });
+
   it("skips silently when the integration folder is missing and does not create it", async () => {
     const current = await createCollectorFixture();
     fixture = current;

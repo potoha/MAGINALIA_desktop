@@ -20,7 +20,7 @@
  * - It never throws and never reports a diagnostic: the caller's response is unchanged.
  */
 import { randomUUID } from "node:crypto";
-import { lstat, open, readFile, rename, unlink } from "node:fs/promises";
+import { lstat, open, rename, unlink } from "node:fs/promises";
 import * as path from "node:path";
 import { inspectAndEvaluatePathSecurity, type PathSecurityInspector } from "./collector-path-security.js";
 import { resolveShelfBindingStoragePaths } from "./shelf-binding-store.js";
@@ -61,8 +61,17 @@ async function classifyEntry(file: string): Promise<EntryState> {
 /** True when `file` already holds the same values written less than the minimum interval ago. */
 async function isFresh(file: string, values: CollectorContactValues, now: Date): Promise<boolean> {
   try {
-    const text = await readFile(file, "utf8");
-    if (Buffer.byteLength(text, "utf8") > MAX_CONTACT_RECORD_BYTES) return false;
+    // Read at most one byte more than the limit: an oversize entry is simply rewritten.
+    const handle = await open(file, "r");
+    let text: string;
+    try {
+      const buffer = Buffer.alloc(MAX_CONTACT_RECORD_BYTES + 1);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      if (bytesRead > MAX_CONTACT_RECORD_BYTES) return false;
+      text = buffer.subarray(0, bytesRead).toString("utf8");
+    } finally {
+      await handle.close();
+    }
     const record = JSON.parse(text) as Record<string, unknown> | null;
     if (record === null || typeof record !== "object" || record.version !== 1
       || record.protocol !== values.protocol || record.hostVersion !== values.hostVersion

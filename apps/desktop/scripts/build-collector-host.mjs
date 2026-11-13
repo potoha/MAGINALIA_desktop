@@ -107,6 +107,11 @@ export async function bundle(entry, fileName) {
   });
   const file = path.join(stage, fileName);
   const code = await readFile(file, "utf8");
+  // A define that did not take effect would silently fall back to the runtime default.
+  if (code.includes("__COLLECTOR_HOST_VERSION__")
+    || (entry.endsWith("collector-native-host-product-entry.ts") && !code.includes(`COLLECTOR_HOST_VERSION = ${JSON.stringify(PAYLOAD_VERSION)}`))) {
+    throw new Error("The Collector Host version was not injected into the bundle.");
+  }
   // Fail the build if a non-builtin module would be resolved from disk at runtime.
   // Ajv's code-generation templates contain `require("...")` text inside template
   // literals (only used for standalone code export); those are not runtime requires.

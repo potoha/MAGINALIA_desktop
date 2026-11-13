@@ -39,7 +39,7 @@ declare const __COLLECTOR_HOST_VERSION__: string | undefined;
 
 /**
  * Host version reported by `host_info` and the contact record. The Host SEA build
- * (`scripts/build-collector-host.mjs`) replaces `__COLLECTOR_HOST_VERSION__` with the
+ * (`scripts/build-collector-host.mjs`) replaces the compile-time version identifier below with the
  * payload version at bundle time; every other build uses the default.
  */
 export const COLLECTOR_HOST_VERSION: string = typeof __COLLECTOR_HOST_VERSION__ === "string"
