@@ -56,9 +56,11 @@
  *   the marker is published happens before the first journal write, so treating it as
  *   clean is correct.
  *
- * The Desktop Reviewer path uses this wrapper now. The Native Host may invoke it
- * only from its isolated test-only E2E mode; normal Host save remains disabled.
- * Host v1 journal records remain readable alongside the Reviewer v2 extension.
+ * The Desktop Reviewer and the product Collector Native Messaging Host both use this
+ * wrapper. The marker is published only after pure request validation and immediately
+ * before the first journal or Shelf mutation, and a receipt is returned only after the
+ * marker has been cleared. Host v1 journal records remain readable alongside the
+ * Reviewer v2 extension.
  */
 import { randomUUID } from "node:crypto";
 import { lstat, open, readFile, rename, unlink } from "node:fs/promises";
@@ -549,8 +551,9 @@ export async function withNativeShelfWriteSection<T>(
 /**
  * Commit one web quote under the OS mutex instead of the file lease.
  *
- * Production Host save remains disabled. The isolated E2E Host is the only Host
- * caller and uses this wrapper to preserve the common v1 writer.
+ * The product Collector Native Messaging Host and its isolated E2E mode call this
+ * wrapper, which preserves the common v1 writer. The recovery marker is published by
+ * the writer just before its first mutation (not before request validation).
  */
 export async function commitShelfQuoteWithNativeLock(
   request: ShelfQuoteWriteRequest,
@@ -572,9 +575,10 @@ export async function commitShelfQuoteWithNativeLock(
       coordinationRoot: request.coordinationRoot
     });
     const recovery = await inspectShelfWriterRecoveryState(layout.coordinationDirectory);
+    let assessment: ShelfWriteRecoveryAssessment | undefined;
     if (lease.abandoned || recovery.pending) {
       try {
-        const assessment = await assessShelfWriteRecoveryState({
+        assessment = await assessShelfWriteRecoveryState({
           shelfRoot: request.shelfRoot,
           expectedShelfId: request.expectedShelfId,
           coordinationRoot: request.coordinationRoot
@@ -596,12 +600,40 @@ export async function commitShelfQuoteWithNativeLock(
       }
     }
 
-    const recoveryFile = await writeShelfWriterRecoveryState({
-      coordinationDirectory: layout.coordinationDirectory,
-      requestId: request.requestId
-    });
-    const receipt = await commitShelfQuote({ ...request, externalLock: lease });
-    await clearShelfWriterRecoveryState(recoveryFile);
+    // The marker is published by the writer immediately before its first journal or
+    // Shelf mutation, i.e. only after pure request validation has passed. A request
+    // that can never succeed therefore leaves neither a marker nor a journal record.
+    const markerFile = path.join(layout.coordinationDirectory, SHELF_WRITER_RECOVERY_STATE_FILENAME);
+    let markerPublished = false;
+    let receipt: ShelfQuoteWriteReceipt;
+    try {
+      receipt = await commitShelfQuote({
+        ...request,
+        externalLock: lease,
+        beforeMutation: async (requestId) => {
+          await writeShelfWriterRecoveryState({
+            coordinationDirectory: layout.coordinationDirectory,
+            requestId
+          });
+          markerPublished = true;
+        }
+      });
+    } catch (error: unknown) {
+      // Recovery found an interrupted write (possibly only through WAIT_ABANDONED, with
+      // no marker on disk). If this attempt failed before publishing a marker, the next
+      // writer would see neither abandonment nor marker and skip assessment while the
+      // staged request is still unfinished. Record the evidence and keep the mutex held.
+      if (!markerPublished && assessment !== undefined && assessment.interruptedRequestIds.length > 0) {
+        // An already-present marker is itself the evidence and is left untouched, so the
+        // mutex is held only when this attempt has to create that evidence.
+        keepHeld = !recovery.pending;
+        await ensureRecoveryStateRecorded(layout, assessment.interruptedRequestIds[0]!, error);
+      }
+      throw error;
+    }
+    // Clear only after the committed receipt exists. A marker that survived an earlier
+    // crash and was just verified by recovery is cleared by the same receipt.
+    if (markerPublished || recovery.pending) await clearShelfWriterRecoveryState(markerFile);
     return receipt;
   } finally {
     if (!keepHeld) lease.release();

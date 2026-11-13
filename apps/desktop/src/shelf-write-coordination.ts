@@ -1,12 +1,13 @@
 /**
  * Shared Private Shelf write journal and add-only record transactions.
  *
- * The Desktop main process and the isolated Collector Native Messaging test Host are
+ * The Desktop main process and the product Collector Native Messaging Host are
  * separate OS processes that may address the same configured Private Shelf. The
  * Reviewer uses the shared journal with a strict v2 record for deterministic
- * recovery; existing Host v1 records remain readable. Host saves are limited to isolated E2E mode.
+ * recovery; existing Host v1 records remain readable. The product Collector Host writes
+ * through the same journal.
  *
- * Product Reviewer writes and the isolated E2E Host share this mechanism:
+ * Product Reviewer writes and the product Collector Host share this mechanism:
  *
  * - exclusion is keyed by the Shelf's stable folder-marker UUID (D068), not by a
  *   machine path, so the same Shelf is protected after the folder is moved/renamed;
@@ -20,7 +21,8 @@
  * - a durable per-request journal provides the idempotency key and the receipt.
  *
  * Product Reviewer writes supply this transaction only after resolving the saved
- * Shelf binding and confirming its typed marker. Production Host saving remains disabled.
+ * Shelf binding and confirming its typed marker; the product Host resolves the
+ * Desktop-written binding the same way before calling the v1 quote writer.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
@@ -1008,6 +1010,43 @@ interface ShelfRecordFileHit {
   readonly value: unknown;
 }
 
+/** Parsed record files of one Shelf directory, keyed by entity ID (one scan, many lookups). */
+type ShelfRecordIndex = ReadonlyMap<string, readonly ShelfRecordFileHit[]>;
+
+async function buildShelfRecordIndex(
+  layout: ShelfWriteLayout,
+  directory: string,
+  kind: "book" | "annotation"
+): Promise<ShelfRecordIndex> {
+  const format = await loadFormatCore();
+  const index = new Map<string, ShelfRecordFileHit[]>();
+  for (const file of await listShelfRecordFiles(layout.root, directory)) {
+    try {
+      const info = await lstat(file);
+      if (!info.isFile() || info.isSymbolicLink()) continue;
+      const bytes = await readFile(file);
+      const parsed = format.parseShelfEntity(kind, bytes.toString("utf8"));
+      if (!parsed.valid) continue;
+      const id = (parsed.value as { readonly id?: unknown }).id;
+      if (typeof id !== "string") continue;
+      const hit: ShelfRecordFileHit = Object.freeze({
+        file,
+        serialized: serializeShelfRecord(parsed.value),
+        rawDigest: createHash("sha256").update(bytes).digest("hex"),
+        value: parsed.value
+      });
+      const hits = index.get(id);
+      if (hits === undefined) index.set(id, [hit]); else hits.push(hit);
+    } catch {
+      // Unknown or malformed Shelf records remain untouched; an expected record
+      // that cannot be parsed is treated as missing and fails closed at the caller.
+    }
+  }
+  return index;
+}
+
+const NO_RECORD_HITS: readonly ShelfRecordFileHit[] = Object.freeze([]);
+
 /** Locate records by parsed entity identity, preserving imported YAML/nested Shelf files. */
 async function shelfRecordFilesById(
   layout: ShelfWriteLayout,
@@ -1015,27 +1054,8 @@ async function shelfRecordFilesById(
   id: string,
   kind: "book" | "annotation"
 ): Promise<readonly ShelfRecordFileHit[]> {
-  const format = await loadFormatCore();
-  const matches: ShelfRecordFileHit[] = [];
-  for (const file of await listShelfRecordFiles(layout.root, directory)) {
-    try {
-      const info = await lstat(file);
-      if (!info.isFile() || info.isSymbolicLink()) continue;
-      const bytes = await readFile(file);
-      const parsed = format.parseShelfEntity(kind, bytes.toString("utf8"));
-      if (!parsed.valid || (parsed.value as { readonly id?: unknown }).id !== id) continue;
-      matches.push(Object.freeze({
-        file,
-        serialized: serializeShelfRecord(parsed.value),
-        rawDigest: createHash("sha256").update(bytes).digest("hex"),
-        value: parsed.value
-      }));
-    } catch {
-      // Unknown or malformed Shelf records remain untouched; an expected record
-      // that cannot be parsed is treated as missing and fails closed at the caller.
-    }
-  }
-  return Object.freeze(matches);
+  const index = await buildShelfRecordIndex(layout, directory, kind);
+  return Object.freeze([...(index.get(id) ?? NO_RECORD_HITS)]);
 }
 
 async function shelfRecordExists(layout: ShelfWriteLayout, directory: string, id: string): Promise<boolean> {
@@ -1084,6 +1104,14 @@ export interface ShelfQuoteWriteRequest {
    * Leaving this undefined preserves the original behavior byte for byte.
    */
   readonly externalLock?: ShelfWriteExternalLock;
+  /**
+   * Called exactly once, after all pure request validation (shape, `get.date`, planned
+   * Book/Annotation schema, journal digest conflict, committed-receipt verification) and
+   * immediately before the first journal or Shelf-record mutation. It is not called when
+   * the request is rejected up front or answered by an `already-committed` receipt.
+   * The native wrapper publishes the writer recovery marker here.
+   */
+  readonly beforeMutation?: (requestId: string) => Promise<void>;
 }
 
 /** Minimal view of an externally held cross-process lock. */
@@ -1138,7 +1166,7 @@ export interface ShelfRecordWriteTransactionRequest extends ResolveShelfWriteLay
   readonly prepare: (existing: ShelfWriteJournalRecord | undefined) => Promise<ShelfRecordWritePlan>;
   /** Called immediately before the first journal or Shelf-record mutation. */
   readonly beforeMutation?: (requestId: string) => Promise<void>;
-  /** Called only after a committed receipt has been persisted and reverified. */
+  /** Called only after the committed receipt has been written to the journal (not re-read). */
   readonly afterReceipt?: (receipt: ShelfQuoteWriteReceipt) => Promise<void>;
   readonly beforeAnnotationPublish?: () => void | Promise<void>;
   readonly now?: () => number;
@@ -1614,6 +1642,12 @@ export async function commitShelfQuote(request: ShelfQuoteWriteRequest): Promise
     : undefined;
   // The guard is the file lease, or the caller's external OS lock when one is held.
   const guard: ShelfWriteExternalLock = request.externalLock ?? lease!;
+  let mutationAnnounced = false;
+  const announceMutation = async (): Promise<void> => {
+    if (mutationAnnounced) return;
+    mutationAnnounced = true;
+    await request.beforeMutation?.(request.requestId);
+  };
 
   try {
     const journal = await readJournalRecord(layout, request.requestId);
@@ -1656,6 +1690,7 @@ export async function commitShelfQuote(request: ShelfQuoteWriteRequest): Promise
       books
     );
     if (match.kind === "conflict") {
+      await announceMutation();
       await writeJournalRecord(layout, {
         version: SHELF_WRITE_JOURNAL_VERSION,
         kind: "shelf-write-request",
@@ -1706,6 +1741,7 @@ export async function commitShelfQuote(request: ShelfQuoteWriteRequest): Promise
     const annotationDigest = `sha256:${createHash("sha256").update(serializedAnnotation, "utf8").digest("hex")}`;
 
     if (journal === undefined || journal.state !== "staged") {
+      await announceMutation();
       await writeJournalRecord(layout, {
         version: SHELF_WRITE_JOURNAL_VERSION,
         kind: "shelf-write-request",
@@ -1724,6 +1760,8 @@ export async function commitShelfQuote(request: ShelfQuoteWriteRequest): Promise
     } else if (journal.annotationDigest !== annotationDigest || journal.requestDigest !== requestDigest) {
       fail("shelf-write-request-mismatch", "The staged request no longer matches its recorded content.");
     }
+    // Validation is complete; the first Shelf-record publish below is a mutation.
+    await announceMutation();
 
     if (!bookReused) {
       await guard.assertHeld();
@@ -1805,6 +1843,10 @@ export async function inspectShelfWriteJournal(options: {
 }): Promise<readonly ShelfWriteJournalEntry[]> {
   const layout = await resolveShelfWriteLayout(options);
   const directory = path.join(layout.coordinationDirectory, "requests");
+  // One scan of each record directory per assessment, shared by every journal entry.
+  // The index is built lazily so an empty journal costs nothing.
+  let annotationIndex: ShelfRecordIndex | undefined;
+  let bookIndex: ShelfRecordIndex | undefined;
   let names: string[];
   try {
     names = await readdir(directory);
@@ -1824,10 +1866,10 @@ export async function inspectShelfWriteJournal(options: {
     if (!REQUEST_ID_PATTERN.test(requestId)) continue;
     const record = await readJournalRecord(layout, requestId);
     if (record === undefined) continue;
-    const [annotationFiles, bookFiles] = await Promise.all([
-      shelfRecordFilesById(layout, layout.annotationsDirectory, record.annotationId, "annotation"),
-      shelfRecordFilesById(layout, layout.booksDirectory, record.bookId, "book")
-    ]);
+    annotationIndex ??= await buildShelfRecordIndex(layout, layout.annotationsDirectory, "annotation");
+    bookIndex ??= await buildShelfRecordIndex(layout, layout.booksDirectory, "book");
+    const annotationFiles = annotationIndex.get(record.annotationId) ?? NO_RECORD_HITS;
+    const bookFiles = bookIndex.get(record.bookId) ?? NO_RECORD_HITS;
     const annotationPresent = annotationFiles.length > 0;
     const bookPresent = bookFiles.length > 0;
     const onDisk = annotationFiles.length === 1 ? annotationFiles[0]!.rawDigest : undefined;

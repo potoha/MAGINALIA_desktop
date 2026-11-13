@@ -18,7 +18,7 @@ import { safeFacts } from "./collector-host-fixture.test-helper";
 
 function withAce(
   facts: PathSecurityFacts,
-  ace: { type: "allow" | "deny" | "allow-object"; sid: string; mask: number; inheritOnly?: boolean },
+  ace: { type: "allow" | "deny" | "allow-object" | "other"; sid: string; mask: number; inheritOnly?: boolean },
 ): PathSecurityFacts {
   if (!facts.exists) return facts;
   return { ...facts, aces: [...facts.aces, { inheritOnly: false, ...ace }] };
@@ -53,6 +53,17 @@ describe("Collector ownership / ACL policy (fakes)", () => {
     }
     expect(evaluatePathSecurity(withAce(dir, { type: "allow-object", sid: "", mask: 0x2 }), "directory"))
       .toEqual({ ok: false, violation: "unsupported-ace" });
+  });
+
+  it("fails closed on an unclassifiable (other) ACE, whose rights the addon reports as mask 0", () => {
+    const dir = safeFacts(true);
+    for (const mask of [0, 0x2, 0x1f01ff]) {
+      expect(evaluatePathSecurity(withAce(dir, { type: "other", sid: "S-1-1-0", mask }), "directory"))
+        .toEqual({ ok: false, violation: "unsupported-ace" });
+    }
+    // Inherit-only entries do not apply to this entry and stay ignored.
+    expect(evaluatePathSecurity(withAce(dir, { type: "other", sid: "S-1-1-0", mask: 0, inheritOnly: true }), "directory"))
+      .toEqual({ ok: true });
   });
 
   it("ignores read-only grants, deny entries and inherit-only templates", () => {

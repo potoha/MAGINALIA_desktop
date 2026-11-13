@@ -14,8 +14,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, link, lstat, readFile, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { Worker } from "node:worker_threads";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
+
+vi.mock("./shelf-write-core.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./shelf-write-core.js")>();
+  return { ...actual, listShelfRecordFiles: vi.fn(actual.listShelfRecordFiles) };
+});
 import {
   acquireShelfMutex,
   closeShelfMutexHandles,
@@ -40,6 +46,7 @@ import {
   inspectShelfWriteJournal,
   type ShelfQuoteWriteRequest
 } from "./shelf-write-coordination.js";
+import { listShelfRecordFiles } from "./shelf-write-core.js";
 import { LibraryService } from "./library-service.js";
 
 /**
@@ -787,6 +794,255 @@ mutexSuite("recovery marker file safety", () => {
     expect(state.pending).toBe(true);
     expect(state.record?.requestId).toBe("req-original");
   });
+});
+
+mutexSuite("request validation happens before the recovery marker (D071)", () => {
+  function coordinationDirectory(fixture: Awaited<ReturnType<typeof createFixture>>): string {
+    return path.join(fixture.coordinationRoot, "shelves", fixture.shelfId.toLowerCase());
+  }
+
+  async function journalNames(fixture: Awaited<ReturnType<typeof createFixture>>): Promise<string[]> {
+    return (await readdir(fixture.journalDirectory).catch(() => [])).sort();
+  }
+
+  async function markerNames(fixture: Awaited<ReturnType<typeof createFixture>>): Promise<string[]> {
+    return (await readdir(coordinationDirectory(fixture)).catch(() => []))
+      .filter((name) => name.includes(SHELF_WRITER_RECOVERY_STATE_FILENAME));
+  }
+
+  test.each([
+    ["blank quote", { quote: "   " }],
+    ["non-http URL", { url: "file:///etc/passwd" }],
+    ["month out of range", { getDate: "202613011200" }],
+    ["minute out of range", { getDate: "202610301260" }],
+    ["malformed getDate", { getDate: "2026-10-30" }],
+    ["empty author", { authors: [""] }],
+    ["unknown comment field", { commentField: "other" as never }]
+  ])("a rejected request (%s) leaves no marker and no journal record", async (_label, overrides) => {
+    const fixture = await createFixture("validate-first");
+    await expect(commitShelfQuoteWithNativeLock(request(fixture, overrides as Partial<ShelfQuoteWriteRequest>), { acquireTimeoutMs: 2_000 }))
+      .rejects.toMatchObject({ code: "shelf-write-invalid-request" });
+    expect(await markerNames(fixture)).toEqual([]);
+    expect(await journalNames(fixture)).toEqual([]);
+    expect(await readdir(fixture.booksDirectory)).toEqual([]);
+    expect(await readdir(fixture.annotationsDirectory)).toEqual([]);
+  });
+
+  test("resending a request ID with different content is rejected without a marker or journal change", async () => {
+    const fixture = await createFixture("validate-digest");
+    const first = request(fixture);
+    const receipt = await commitShelfQuoteWithNativeLock(first, { acquireTimeoutMs: 2_000 });
+    expect(receipt.state).toBe("committed");
+    const journalFile = path.join(fixture.journalDirectory, `${first.requestId}.json`);
+    const before = await readFile(journalFile, "utf8");
+
+    await expect(commitShelfQuoteWithNativeLock({ ...first, quote: "別の本文。" }, { acquireTimeoutMs: 2_000 }))
+      .rejects.toMatchObject({ code: "shelf-write-request-mismatch" });
+
+    expect(await readFile(journalFile, "utf8")).toBe(before);
+    expect(await markerNames(fixture)).toEqual([]);
+    expect((await readdir(fixture.annotationsDirectory)).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+    // The original request still replays as already-committed.
+    expect((await commitShelfQuoteWithNativeLock(first, { acquireTimeoutMs: 2_000 })).state).toBe("already-committed");
+  });
+
+  test("an already-committed replay leaves no marker", async () => {
+    const fixture = await createFixture("validate-replay");
+    const first = request(fixture);
+    await commitShelfQuoteWithNativeLock(first, { acquireTimeoutMs: 2_000 });
+    const replay = await commitShelfQuoteWithNativeLock(first, { acquireTimeoutMs: 2_000 });
+    expect(replay.state).toBe("already-committed");
+    expect(await markerNames(fixture)).toEqual([]);
+  });
+
+  test("a real in-flight failure still leaves the marker, written before the journal and Book", async () => {
+    const fixture = await createFixture("validate-inflight");
+    const interrupted = request(fixture, {
+      faults: { beforeAnnotationPublish: () => { throw new Error("injected in-flight failure"); } }
+    });
+    await expect(commitShelfQuoteWithNativeLock(interrupted, { acquireTimeoutMs: 2_000 }))
+      .rejects.toThrow("injected in-flight failure");
+    const marker = await inspectShelfWriterRecoveryState(coordinationDirectory(fixture));
+    expect(marker.pending).toBe(true);
+    expect(marker.record?.requestId).toBe(interrupted.requestId);
+    expect(await journalNames(fixture)).toEqual([`${interrupted.requestId}.json`]);
+    expect((await readdir(fixture.booksDirectory)).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+  });
+
+  async function leaveInterrupted(fixture: Awaited<ReturnType<typeof createFixture>>): Promise<ShelfQuoteWriteRequest> {
+    const interrupted = request(fixture, {
+      faults: { beforeAnnotationPublish: () => { throw new Error("injected in-flight failure"); } }
+    });
+    await expect(commitShelfQuoteWithNativeLock(interrupted, { acquireTimeoutMs: 2_000 })).rejects.toThrow();
+    return interrupted;
+  }
+
+  test("a request rejected by validation leaves the existing marker and journal byte for byte unchanged", async () => {
+    const fixture = await createFixture("validate-preserve");
+    const interrupted = await leaveInterrupted(fixture);
+    const markerFile = path.join(coordinationDirectory(fixture), SHELF_WRITER_RECOVERY_STATE_FILENAME);
+    const journalFile = path.join(fixture.journalDirectory, `${interrupted.requestId}.json`);
+    const markerBefore = await readFile(markerFile, "utf8");
+    const journalBefore = await readFile(journalFile, "utf8");
+    const retry = { ...interrupted };
+    delete (retry as { faults?: unknown }).faults;
+    // Same request ID (the recovery gate passes) with different content: digest conflict.
+    await expect(commitShelfQuoteWithNativeLock({ ...retry, quote: "別の本文。" }, { acquireTimeoutMs: 2_000 }))
+      .rejects.toMatchObject({ code: "shelf-write-request-mismatch" });
+    // Same request ID with an invalid getDate: shape validation.
+    await expect(commitShelfQuoteWithNativeLock({ ...retry, getDate: "202613011200" }, { acquireTimeoutMs: 2_000 }))
+      .rejects.toMatchObject({ code: "shelf-write-invalid-request" });
+    expect(await readFile(markerFile, "utf8")).toBe(markerBefore);
+    expect(await readFile(journalFile, "utf8")).toBe(journalBefore);
+    expect(await journalNames(fixture)).toEqual([`${interrupted.requestId}.json`]);
+  });
+
+  test("a marker over a fully committed journal is preserved when a new request is rejected by validation", async () => {
+    const fixture = await createFixture("validate-committed-marker");
+    await commitShelfQuoteWithNativeLock(request(fixture), { acquireTimeoutMs: 2_000 });
+    const marker = {
+      version: 1, state: "write-in-progress", pid: 4242, requestId: "req-left-over-1", startedAt: new Date().toISOString()
+    };
+    const markerFile = path.join(coordinationDirectory(fixture), SHELF_WRITER_RECOVERY_STATE_FILENAME);
+    await writeFile(markerFile, `${JSON.stringify(marker, null, 2)}\n`, "utf8");
+    const markerBefore = await readFile(markerFile, "utf8");
+    const journalBefore = await journalNames(fixture);
+    await expect(commitShelfQuoteWithNativeLock(request(fixture, { getDate: "202613011200" }), { acquireTimeoutMs: 2_000 }))
+      .rejects.toMatchObject({ code: "shelf-write-invalid-request" });
+    expect(await readFile(markerFile, "utf8")).toBe(markerBefore);
+    expect(await journalNames(fixture)).toEqual(journalBefore);
+  });
+
+  test("a corrupt marker plus an invalid request fails closed (#92) and the marker is untouched", async () => {
+    const fixture = await createFixture("validate-corrupt-marker");
+    await commitShelfQuoteWithNativeLock(request(fixture), { acquireTimeoutMs: 2_000 });
+    const markerFile = path.join(coordinationDirectory(fixture), SHELF_WRITER_RECOVERY_STATE_FILENAME);
+    await writeFile(markerFile, "{ not json", "utf8");
+    await expect(commitShelfQuoteWithNativeLock(request(fixture, { getDate: "202613011200" }), { acquireTimeoutMs: 2_000 }))
+      .rejects.toMatchObject({ code: "shelf-write-recovery-state-invalid" });
+    expect(await readFile(markerFile, "utf8")).toBe("{ not json");
+  });
+
+  test("commitShelfQuote writes nothing when beforeMutation throws", async () => {
+    const fixture = await createFixture("before-mutation-throws");
+    await expect(commitShelfQuote(request(fixture, { beforeMutation: async () => { throw new Error("marker unavailable"); } })))
+      .rejects.toThrow("marker unavailable");
+    expect(await journalNames(fixture)).toEqual([]);
+    expect(await readdir(fixture.booksDirectory)).toEqual([]);
+    expect(await readdir(fixture.annotationsDirectory)).toEqual([]);
+  });
+
+  test("an abandoned mutex with a staged request and no marker keeps its evidence when the retry fails before any mutation", async () => {
+    const fixture = await createFixture("abandoned-no-marker");
+    const staged = await leaveInterrupted(fixture);
+    const markerFile = path.join(coordinationDirectory(fixture), SHELF_WRITER_RECOVERY_STATE_FILENAME);
+    // The crash left no marker: only the abandoned mutex reveals the interrupted write.
+    await rm(markerFile);
+    expect((await inspectShelfWriterRecoveryState(coordinationDirectory(fixture))).pending).toBe(false);
+    // Make the mutex abandoned: another thread acquires it and exits without releasing.
+    const probe = await acquireShelfMutex({ shelfId: fixture.shelfId, acquireTimeoutMs: 500 });
+    probe.release();
+    const binary = path.join(process.cwd(), "native", "shelf-mutex", "build", "Release", "shelf_mutex.node");
+    // A killed process leaves the kernel mutex abandoned (a worker thread would not).
+    const name = resolveShelfMutexName(fixture.shelfId);
+    const child = spawn(process.execPath, ["-e",
+      `const a=require(${JSON.stringify(binary)});const h=a.createMutex(${JSON.stringify(name)});`
+      + "console.log(JSON.stringify(a.acquire(h,1000)));setInterval(()=>{},1000)"]);
+    const acquired = await new Promise<{ acquired: boolean }>((resolve, reject) => {
+      child.stdout.once("data", (chunk: Buffer) => resolve(JSON.parse(chunk.toString()) as { acquired: boolean }));
+      child.once("error", reject);
+    });
+    expect(acquired.acquired).toBe(true);
+    await new Promise<void>((resolve) => { child.once("exit", () => resolve()); child.kill(); });
+
+    // Resend the same request ID with different content: the gate passes, validation fails.
+    const retry = { ...staged };
+    delete (retry as { faults?: unknown }).faults;
+    const reported: string[] = [];
+    await expect(commitShelfQuoteWithNativeLock({ ...retry, quote: "別の本文。" }, {
+      acquireTimeoutMs: 2_000,
+      onRecovery: (assessment, info) => { reported.push(`${info.trigger}:${assessment.interruptedRequestIds.join(",")}`); }
+    })).rejects.toMatchObject({ code: "shelf-write-request-mismatch" });
+    expect(reported).toEqual([`abandoned:${staged.requestId}`]);
+    // The evidence was re-recorded and the mutex stays held, so no later writer slips past.
+    const marker = await inspectShelfWriterRecoveryState(coordinationDirectory(fixture));
+    expect(marker.pending).toBe(true);
+    expect(marker.record?.requestId).toBe(staged.requestId);
+    await expect(acquireShelfMutex({ shelfId: fixture.shelfId, acquireTimeoutMs: 200 }))
+      .rejects.toMatchObject({ code: "shelf-write-busy" });
+  });
+});
+
+mutexSuite("recovery assessment scans the Shelf once", () => {
+  const BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  function suffix(index: number): string {
+    let rest = index;
+    let out = "";
+    for (let i = 0; i < 6; i += 1) { out = BASE32[rest % 32]! + out; rest = Math.floor(rest / 32); }
+    return out;
+  }
+
+  async function buildSyntheticShelf(entries: number, annotations: number): Promise<Awaited<ReturnType<typeof createFixture>>> {
+    const fixture = await createFixture(`scan-${entries}`);
+    const template = request(fixture);
+    await commitShelfQuote(template);
+    const bookFile = (await readdir(fixture.booksDirectory))[0]!;
+    const annotationFile = (await readdir(fixture.annotationsDirectory))[0]!;
+    const book = JSON.parse(await readFile(path.join(fixture.booksDirectory, bookFile), "utf8")) as Record<string, unknown>;
+    const annotation = JSON.parse(await readFile(path.join(fixture.annotationsDirectory, annotationFile), "utf8")) as Record<string, unknown>;
+    const journalFile = path.join(fixture.journalDirectory, `${template.requestId}.json`);
+    const journal = JSON.parse(await readFile(journalFile, "utf8")) as Record<string, unknown>;
+    const prefix = String(book.id).slice("book:".length, "book:".length + 20);
+    const idFor = (kind: "book" | "ann", index: number): string => `${kind}:${prefix}${suffix(index)}`;
+    // Replace the real records with synthetic ones so every ID is distinct and well formed.
+    await rm(path.join(fixture.booksDirectory, bookFile));
+    await rm(path.join(fixture.annotationsDirectory, annotationFile));
+    await rm(journalFile);
+    for (let index = 0; index < Math.max(entries, annotations); index += 1) {
+      const bookId = idFor("book", index);
+      const annotationId = idFor("ann", index);
+      if (index < entries) {
+        await writeFile(path.join(fixture.booksDirectory, `${index}.json`), `${JSON.stringify({ ...book, id: bookId, url: `https://example.test/${index}` }, null, 2)}\n`, "utf8");
+      }
+      if (index < annotations) {
+        const body = `${JSON.stringify({ ...annotation, id: annotationId, source: { ...(annotation.source as object), id: bookId } }, null, 2)}\n`;
+        await writeFile(path.join(fixture.annotationsDirectory, `${index}.json`), body, "utf8");
+        if (index < entries) {
+          const requestId = `req-synthetic-${String(index).padStart(5, "0")}`;
+          await writeFile(path.join(fixture.journalDirectory, `${requestId}.json`), `${JSON.stringify({
+            ...journal,
+            requestId,
+            bookId,
+            annotationId,
+            annotationDigest: `sha256:${createHash("sha256").update(body).digest("hex")}`
+          }, null, 2)}\n`, "utf8");
+        }
+      }
+    }
+    return fixture;
+  }
+
+  /** Counts every call that reaches `listShelfRecordFiles`, whichever code path makes it. */
+  async function assess(fixture: Awaited<ReturnType<typeof createFixture>>): Promise<{ scans: number; committed: number }> {
+    const lister = vi.mocked(listShelfRecordFiles);
+    lister.mockClear();
+    const assessment = await assessShelfWriteRecoveryState({
+      shelfRoot: fixture.shelfRoot,
+      expectedShelfId: fixture.shelfId,
+      coordinationRoot: fixture.coordinationRoot
+    });
+    return { scans: lister.mock.calls.length, committed: assessment.committedRequestIds.length };
+  }
+
+  test("directory scans do not grow with the journal size", async () => {
+    const small = await assess(await buildSyntheticShelf(20, 40));
+    const large = await assess(await buildSyntheticShelf(300, 600));
+    expect(small.committed).toBe(20);
+    expect(large.committed).toBe(300);
+    // One Book scan and one Annotation scan per assessment, whatever the journal size.
+    expect(small.scans).toBe(2);
+    expect(large.scans).toBe(2);
+  }, 180_000);
 });
 
 afterEach(async () => {
