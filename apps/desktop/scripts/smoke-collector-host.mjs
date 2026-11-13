@@ -1,5 +1,5 @@
 /**
- * Smoke test for the built standalone Collector Host (`npm run dist:collector-host`
+ * Smoke test for the built Collector Host payload (`npm run package:windows:collector-host`
  * first). It runs the single executable directly, without installing or registering
  * anything, sends framed requests on stdin and checks the framed responses.
  *
