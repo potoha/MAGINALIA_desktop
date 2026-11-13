@@ -1,6 +1,8 @@
 import { mkdirSync, statSync } from "node:fs";
 
-export const MAGINALIA_APPLICATION_NAME = "MAGINALIA α2 wild berry" as const;
+import { PRODUCT_DISPLAY_NAME } from "./branding";
+
+export const MAGINALIA_APPLICATION_NAME = PRODUCT_DISPLAY_NAME;
 
 export interface ElectronApplicationIdentityAdapter {
   getName(): string;

@@ -1,3 +1,5 @@
+import { PRODUCT_DISPLAY_NAME, PRODUCT_NAME, RELEASE_CODENAME, brandAccessibleName } from "./branding";
+
 export type BrandProgressValue = number | null;
 
 export interface BrandProgressState {
@@ -9,7 +11,14 @@ export interface BrandProgressState {
 export interface BrandProgressImages {
   readonly logoDataUrl: string | null;
   readonly markerDataUrl: string | null;
+  /** Jost Bold woff2 as a data URL. When null or unloadable the system font stack is used. */
+  readonly fontDataUrl?: string | null;
 }
+
+/** Family name the bundled Jost Bold is registered under inside the splash document. */
+export const BRAND_FONT_FAMILY = "MAGINALIA Jost Bold";
+/** System fallback used when the bundled font is missing or fails to load. */
+export const BRAND_FALLBACK_FONT_STACK = '"Yu Gothic UI", Meiryo, system-ui, sans-serif';
 
 export function normalizeBrandProgress(progress: BrandProgressValue): BrandProgressValue {
   if (progress === null || !Number.isFinite(progress)) return null;
@@ -18,7 +27,7 @@ export function normalizeBrandProgress(progress: BrandProgressValue): BrandProgr
 
 export function createBrandProgressState(message: string, progress: BrandProgressValue): BrandProgressState {
   return Object.freeze({
-    message: message.trim() || "MAGINALIA α2 wild berry を準備しています",
+    message: message.trim() || `${PRODUCT_DISPLAY_NAME} を準備しています`,
     progress: normalizeBrandProgress(progress),
   });
 }
@@ -28,23 +37,28 @@ export function createBrandProgressState(message: string, progress: BrandProgres
  * embedded in a future installer WebView. Dynamic text is always set through
  * textContent by the view; it is never interpreted as markup.
  */
-export function renderBrandProgressHtml(images: BrandProgressImages): string {
+export function renderBrandProgressHtml(images: BrandProgressImages, version: string): string {
+  const accessibleName = brandAccessibleName(version);
   const logo = images.logoDataUrl === null
     ? ""
-    : `<img id="brand-image" class="brand-image" src="${escapeAttribute(images.logoDataUrl)}" alt="MAGINALIA α2 wild berry">`;
+    : `<img id="brand-image" class="brand-image" src="${escapeAttribute(images.logoDataUrl)}" alt="${escapeAttribute(accessibleName)}">`;
+  const fontFace = images.fontDataUrl
+    ? `@font-face { font-family: "${BRAND_FONT_FAMILY}"; font-weight: 700; font-style: normal; font-display: swap; src: url('${escapeAttribute(images.fontDataUrl)}') format("woff2"); }`
+    : "";
   const markerStyle = images.markerDataUrl === null
     ? ""
     : `--marker-image: url('${escapeAttribute(images.markerDataUrl)}');`;
-  const initialState = createBrandProgressState("MAGINALIA α2 wild berry を起動しています", 0);
+  const initialState = createBrandProgressState(`${PRODUCT_DISPLAY_NAME} を起動しています`, 0);
 
   return `<!doctype html>
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
-  <title>MAGINALIA α2 wild berry</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; font-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+  <title>${escapeHtml(PRODUCT_DISPLAY_NAME)}</title>
   <style>
+    ${fontFace}
     :root {
       color-scheme: light;
       --ink: #29292b;
@@ -52,7 +66,16 @@ export function renderBrandProgressHtml(images: BrandProgressImages): string {
       --muted: #74716a;
       --marker-color: #baff13;
       --motion: 180ms;
-      font-family: "Yu Gothic UI", Meiryo, system-ui, sans-serif;
+      --brand-font: "${BRAND_FONT_FAMILY}", ${BRAND_FALLBACK_FONT_STACK};
+      /* Splash text layout. Percentages are of the art width W (cqw of the .brand container);
+         line positions are measured from the bottom edge of the art. Tune these only. */
+      --text-left: 17.8cqw;
+      --line1-top: 4.5cqw;
+      --line2-top: 10cqw;
+      --text-size: 5cqw;
+      --text-area-height: 13cqw;
+      --text-color: #1a1a1a;
+      font-family: ${BRAND_FALLBACK_FONT_STACK};
       color: var(--ink);
       background: var(--paper);
       font-synthesis: none;
@@ -66,8 +89,18 @@ export function renderBrandProgressHtml(images: BrandProgressImages): string {
       padding: 24px 30px 28px;
       text-align: center;
     }
-    .brand { min-height: 130px; display: grid; place-items: center; }
-    .brand-image { display: block; width: 100%; max-width: 500px; max-height: 142px; object-fit: contain; }
+    .brand { container-type: inline-size; width: 100%; }
+    .brand-art { display: block; width: 100%; }
+    .brand-art[hidden] { display: none; }
+    .brand-image { display: block; width: 100%; height: auto; }
+    .brand-text { position: relative; height: var(--text-area-height); color: var(--text-color); text-align: left; }
+    .brand-line {
+      position: absolute; left: var(--text-left); margin: 0; transform: translateY(-50%);
+      font-family: var(--brand-font); font-weight: 700; font-size: var(--text-size);
+      line-height: 1; white-space: nowrap; letter-spacing: 0;
+    }
+    .brand-line-1 { top: var(--line1-top); }
+    .brand-line-2 { top: var(--line2-top); }
     .brand-fallback { display: none; color: var(--ink); font-size: clamp(28px, 7vw, 40px); font-weight: 650; letter-spacing: 0.04em; }
     .brand-fallback small { display: block; margin-top: 8px; color: var(--muted); font-size: 14px; font-weight: 500; letter-spacing: 0.18em; }
     .brand-fallback::after {
@@ -105,8 +138,6 @@ export function renderBrandProgressHtml(images: BrandProgressImages): string {
     @keyframes marker-sweep { from { transform: translateX(-42%); } to { transform: translateX(110%); } }
     @media (max-width: 440px) {
       main { width: calc(100vw - 28px); padding: 16px 14px 18px; }
-      .brand { min-height: 112px; }
-      .brand-image { max-height: 116px; }
       .message-text { font-size: 15px; }
     }
     @media (prefers-reduced-motion: reduce) {
@@ -119,19 +150,25 @@ export function renderBrandProgressHtml(images: BrandProgressImages): string {
 </head>
 <body>
   <main id="brand-progress" role="dialog" aria-labelledby="brand-title" aria-describedby="startup-message" style="${markerStyle}">
-    <h1 id="brand-title" class="visually-hidden">MAGINALIA α2 wild berry</h1>
+    <h1 id="brand-title" class="visually-hidden">${escapeHtml(accessibleName)}</h1>
     <div class="brand">
-      ${logo}
-      <div id="brand-fallback" class="brand-fallback" aria-hidden="true">MAGINALIA <small>α2 wild berry</small></div>
+      <div id="brand-art" class="brand-art"${images.logoDataUrl === null ? " hidden" : ""}>
+        ${logo}
+        <div class="brand-text" aria-hidden="true">
+          <p class="brand-line brand-line-1" id="brand-codename">${escapeHtml(RELEASE_CODENAME)}</p>
+          <p class="brand-line brand-line-2" id="brand-version">${escapeHtml(version)}</p>
+        </div>
+      </div>
+      <div id="brand-fallback" class="brand-fallback" aria-hidden="true">${escapeHtml(PRODUCT_NAME)} <small>${escapeHtml(RELEASE_CODENAME)} ${escapeHtml(version)}</small></div>
     </div>
     <div class="message-stage">
       <span class="message-paint" aria-hidden="true"></span>
       <p id="startup-message" class="message-text" role="status" aria-live="polite">${escapeHtml(initialState.message)}</p>
     </div>
-    <div id="startup-progress" class="progress-track" role="progressbar" aria-label="MAGINALIA α2 wild berry の起動状況" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+    <div id="startup-progress" class="progress-track" role="progressbar" aria-label="${escapeAttribute(PRODUCT_DISPLAY_NAME)} の起動状況" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
       <span class="progress-stroke" aria-hidden="true"></span>
     </div>
-    <div class="footer"><span>wild berry</span><span id="progress-caption">0%</span></div>
+    <div class="footer"><span>${escapeHtml(PRODUCT_NAME)}</span><span id="progress-caption">0%</span></div>
   </main>
   <script>
     (() => {
@@ -142,10 +179,11 @@ export function renderBrandProgressHtml(images: BrandProgressImages): string {
       const progressStroke = document.querySelector(".progress-stroke");
       const caption = document.getElementById("progress-caption");
       const brandImage = document.getElementById("brand-image");
+      const brandArt = document.getElementById("brand-art");
       const fallback = document.getElementById("brand-fallback");
       if (brandImage) {
         brandImage.addEventListener("error", () => {
-          brandImage.hidden = true;
+          brandArt.hidden = true;
           fallback.style.display = "block";
         }, { once: true });
       } else {
@@ -155,7 +193,7 @@ export function renderBrandProgressHtml(images: BrandProgressImages): string {
         const value = state.progress === null || !Number.isFinite(state.progress)
           ? null
           : Math.max(0, Math.min(1, state.progress));
-        message.textContent = state.message || "MAGINALIA α2 wild berry を準備しています";
+        message.textContent = state.message || ${JSON.stringify(`${PRODUCT_DISPLAY_NAME} を準備しています`)};
         root.classList.toggle("is-indeterminate", value === null);
         if (value === null) {
           messagePaint.style.removeProperty("clip-path");

@@ -25,6 +25,6 @@ export function findApplicationIconPath(
   roots: readonly string[],
   fileExists: BrandAssetExists = existsSync,
 ): string | null {
-  const fileName = platform === "win32" ? "maginalia.ico" : "icon.v2.png";
+  const fileName = platform === "win32" ? "maginalia.ico" : "logo.png";
   return findBrandAssetPath(fileName, roots, fileExists);
 }

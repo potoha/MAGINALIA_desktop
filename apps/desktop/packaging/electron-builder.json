@@ -1,6 +1,6 @@
 {
   "appId": "org.maginalia.desktop.alpha1",
-  "productName": "MAGINALIA α2 wild berry",
+  "productName": "MAGINALIA Alpha2 Wild Berry",
   "asar": true,
   "directories": {
     "app": "packaging/.stage/app",
@@ -36,7 +36,7 @@
     "uninstallerIcon": "packaging/.stage/app/dist/branding/maginalia.ico",
     "createStartMenuShortcut": true,
     "createDesktopShortcut": false,
-    "shortcutName": "MAGINALIA α2 wild berry",
+    "shortcutName": "MAGINALIA Alpha2 Wild Berry",
     "deleteAppDataOnUninstall": false,
     "runAfterFinish": true,
     "language": 1041,

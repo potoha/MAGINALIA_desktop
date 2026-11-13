@@ -43,7 +43,7 @@ remain manual acceptance steps.
 
 ## Upgrade over α1
 
-Release name: "MAGINALIA α2 wild berry" (Desktop version 0.2.0). Statically
+Release name: "MAGINALIA Alpha2 Wild Berry" (Desktop version 0.2.0). Statically
 compared with tag `v0.1.0-alpha.1`. These are unchanged:
 
 - `appId` `org.maginalia.desktop.alpha1`. electron-builder derives `APP_GUID`
@@ -59,8 +59,8 @@ compared with tag `v0.1.0-alpha.1`. These are unchanged:
 - electron-builder 26.15.3 and Electron 44.3.0.
 
 These change with the release name: `productName` and `shortcutName`
-(`MAGINALIA α2 wild berry`), the executable name derived from `productName`
-(`MAGINALIA α2 wild berry.exe`) and the version.
+(`MAGINALIA Alpha2 Wild Berry`), the executable name derived from `productName`
+(`MAGINALIA Alpha2 Wild Berry.exe`) and the version.
 
 ### Install directory and shortcuts (static analysis, installer not run)
 
@@ -77,7 +77,7 @@ These change with the release name: `productName` and `shortcutName`
   created by `installer-shortcut.nsh`). `installer-shortcut.nsh` therefore
   deletes `MAGINALIA desktop α1.lnk` on the Desktop only when its target is
   `<INSTDIR>\MAGINALIA desktop α1.exe`, checked with Windows PowerShell and
-  `WScript.Shell`, and then creates `MAGINALIA α2 wild berry.lnk`. If the target
+  `WScript.Shell`, and then creates `MAGINALIA Alpha2 Wild Berry.lnk`. If the target
   differs or the check fails, nothing is deleted.
 - Not verified on a machine: the above is derived from the electron-builder
   template and from compiling both α1 and α2 installers (stubbed payload) and
@@ -114,3 +114,31 @@ installed α1 profile.
 - `build-windows-runtime.mjs` calls `tar.exe`. Under Git Bash this resolves to
   GNU tar, which treats `D:` as a remote host. Run `dist:windows` from
   PowerShell or cmd so that `System32\tar.exe` is used.
+
+## Branding source of truth and splash text
+
+- `apps/desktop/src/branding.ts` owns `PRODUCT_NAME` (`MAGINALIA`),
+  `RELEASE_CODENAME` (`Alpha2 Wild Berry`) and `PRODUCT_DISPLAY_NAME`
+  (`MAGINALIA Alpha2 Wild Berry`, ASCII-only on purpose). The version comes
+  from `app.getVersion()`. `windows-distribution-metadata.test.ts` asserts that
+  `productName` and `nsis.shortcutName` in `electron-builder.json` equal
+  `PRODUCT_DISPLAY_NAME`.
+- The installer also retires a stale `MAGINALIA α2 wild berry.lnk` from a
+  pre-release build, only when it points at that old-named executable inside
+  the install directory (same rule as the α1 shortcut).
+- Artwork: `assets/logo.png` (compact "[ ]*" mark: application icon source,
+  favicon, workbench header mark) and `assets/splash.png` (text-free wordmark:
+  splash, first-run screen, marker-stroke source). `build-brand-assets.mjs`
+  derives `dist/branding/maginalia.ico` (transparent, square, 6% margin) and
+  `dist/branding/logo-mark.png` (128 px) from them.
+- Splash text is rendered over the text-free art in Jost Bold (OFL-1.1, bundled
+  in `apps/desktop/assets/fonts/jost/` with `PROVENANCE.txt`; embedded as a data
+  URL; no network). Layout variables in `brand-progress.ts`: `--text-left`
+  (17.8cqw), `--line1-top` (4.5cqw), `--line2-top` (10cqw), `--text-size`
+  (5cqw), measured from the art's left/bottom edge in units of the art width.
+
+### TODO: NSIS installer images
+
+NSIS header (150x57) and sidebar (164x314) BMP images are not generated yet.
+When the artwork arrives, generate them at build time with the bundled Jost
+Bold font (do not commit hand-exported BMPs without provenance).
