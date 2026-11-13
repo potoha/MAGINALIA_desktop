@@ -679,8 +679,8 @@ function evaluatePreconditions(deps: CollectorIntegrationApplyDependencies, requ
   if (first.state === "policy-blocked") return { kind: "refuse", reason: "policy-blocked" };
   if (!first.inspectionComplete) return { kind: "refuse", reason: "inspection-incomplete" };
   if (first.state === "ready") return { kind: "noop" };
-  if (!RUN_FROM[action].includes(first.state)) return { kind: "refuse", reason: "wrong-state" };
   if (first.reasons.includes("program-folder-unsafe")) return { kind: "refuse", reason: "program-folder-unsafe" };
+  if (!RUN_FROM[action].includes(first.state)) return { kind: "refuse", reason: "wrong-state" };
   if (first.reasons.includes("reparse-point-found")) return { kind: "refuse", reason: "reparse-point-found" };
   if (first.payload.status !== "valid") return { kind: "refuse", reason: "payload-unavailable" };
   if (first.state === "foreign-registration" && !("confirmReplaceForeign" in request && request.confirmReplaceForeign === true)) {
