@@ -8,13 +8,13 @@
   "required": ["version", "payloadId", "host", "extension", "protocol"],
   "properties": {
     "version": { "const": 1 },
-    "payloadId": { "type": "string", "pattern": "^\d+\.\d+\.\d+\+[0-9a-f]{7}$", "description": "<desktop version>+<short commit>" },
+    "payloadId": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+\\+[0-9a-f]{7}$", "description": "<desktop version>+<short commit>" },
     "host": {
       "type": "object",
       "additionalProperties": false,
       "required": ["version", "files"],
       "properties": {
-        "version": { "type": "string", "pattern": "^\d+\.\d+\.\d+$" },
+        "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
         "files": {
           "type": "object",
           "additionalProperties": false,
@@ -31,7 +31,7 @@
       "additionalProperties": false,
       "required": ["version", "id", "zipSha256", "files"],
       "properties": {
-        "version": { "type": "string", "pattern": "^\d+\.\d+\.\d+$" },
+        "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
         "id": { "type": "string", "pattern": "^[a-p]{32}$" },
         "zipSha256": { "$ref": "#/$defs/sha256" },
         "files": {
@@ -39,7 +39,7 @@
           "required": ["manifest.json"],
           "minProperties": 1,
           "maxProperties": 64,
-          "propertyNames": { "pattern": "^[^/\\:\u0000-\u001f]+$", "maxLength": 128 },
+          "propertyNames": { "pattern": "^[^/\\\\:\\u0000-\\u001f]+$", "maxLength": 128 },
           "additionalProperties": { "$ref": "#/$defs/sha256" }
         }
       }

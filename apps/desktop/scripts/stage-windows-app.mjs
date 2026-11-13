@@ -30,8 +30,7 @@ process.stdout.write(`Windows integration addon staged: sha256=${windowsIntegrat
 // Collector wizard integration (WP-4): Host payload + pinned Collector extension + descriptor, verified before staging.
 // `--collector-zip <absolute path>` is a build-time flag for a release that is not published yet; it is still checked against the pinned SHA-256.
 const collector = await stageCollectorPayload({ desktopRoot, runtimeRoot, localZip: parseCollectorZipFlag(process.argv.slice(2)), shelfMutexSha256: shelfMutex.sha256 });
-process.stdout.write(`Collector payload staged: ${collector.descriptor.payloadId} extension ${collector.descriptor.extension.version} (${collector.descriptor.extension.id}) zip=${collector.source} sha256=${collector.descriptor.extension.zipSha256}
-`);
+process.stdout.write(`Collector payload staged: ${collector.descriptor.payloadId} extension ${collector.descriptor.extension.version} (${collector.descriptor.extension.id}) zip=${collector.source} sha256=${collector.descriptor.extension.zipSha256}\n`);
 await rm(stageRoot, { recursive: true, force: true });
 await mkdir(vendorRoot, { recursive: true });
 

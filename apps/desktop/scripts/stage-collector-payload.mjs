@@ -38,7 +38,7 @@ export async function readHostExtensionId(desktopRoot) {
   return id;
 }
 
-export async function stageCollectorPayload({ desktopRoot, runtimeRoot, localZip, shelfMutexSha256 }) {
+export async function stageCollectorPayload({ desktopRoot, runtimeRoot, localZip, shelfMutexSha256, commit: knownCommit, fetchImpl }) {
   const packagingRoot = path.join(desktopRoot, "packaging");
   const pin = readCollectorPin(JSON.parse(await readFile(path.join(packagingRoot, "runtime-versions.json"), "utf8")));
   const hostPayload = path.join(desktopRoot, "release", "collector-host", "payload");
@@ -53,11 +53,11 @@ export async function stageCollectorPayload({ desktopRoot, runtimeRoot, localZip
     throw new Error("The Host shelf_mutex.node differs from the staged Shelf mutex addon; rebuild the Host payload after build:native.");
   }
 
-  const zip = await loadCollectorZip(pin, { localZip });
+  const zip = await loadCollectorZip(pin, { localZip, fetchImpl });
   const extension = verifyCollectorExtension(zip.bytes, pin, { hostExtensionId: await readHostExtensionId(desktopRoot) });
 
   const desktopPackage = JSON.parse(await readFile(path.join(desktopRoot, "package.json"), "utf8"));
-  const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: desktopRoot }).toString("utf8").trim();
+  const commit = knownCommit ?? execFileSync("git", ["rev-parse", "HEAD"], { cwd: desktopRoot }).toString("utf8").trim();
   const descriptor = buildDescriptor({
     desktopVersion: desktopPackage.version,
     commit,

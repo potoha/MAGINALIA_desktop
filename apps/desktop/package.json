@@ -56,7 +56,6 @@
     "verify:packaged-windows-integration": "node scripts/verify-packaged-windows-integration.mjs",
     "verify:packaged-collector-payload": "node scripts/verify-packaged-collector-payload.mjs",
     "package:windows:collector-host": "npm run build:main && node scripts/build-collector-host.mjs",
-    "test:collector-payload": "node --test test/collector-payload.test.mjs",
     "dist:windows": "npm run package:windows:runtime && npm run build:native && npm run package:windows:collector-host && npm run package:windows:stage && npm run package:windows:installer",
     "smoke:collector-host": "node scripts/smoke-collector-host.mjs",
     "smoke:h5": "npm run build && node test/h5-smoke.mjs",
