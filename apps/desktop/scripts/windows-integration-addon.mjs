@@ -16,7 +16,7 @@
  */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 
 export const ADDON_FILE_NAME = "windows_integration.node";
@@ -25,6 +25,7 @@ export const ADDON_RESOURCE_DIRECTORY = "windows-integration";
 export const PRODUCT_JS_EXPORTS = Object.freeze([
   "apiVersion",
   "getKnownFolderPath",
+  "inspectCollectorHostRegistration",
   "readRegistryValue",
   "readRegistryValueNames",
   "registerCollectorHost",
@@ -158,7 +159,8 @@ export async function stageWindowsIntegrationAddon({ desktopRoot, repositoryRoot
   const destinationDirectory = path.join(runtimeRoot, ADDON_RESOURCE_DIRECTORY);
   await rm(destinationDirectory, { recursive: true, force: true });
   await mkdir(destinationDirectory, { recursive: true });
-  await copyFile(source, path.join(destinationDirectory, ADDON_FILE_NAME));
+  // Write the exact bytes that were verified above (never re-read the source path).
+  await writeFile(path.join(destinationDirectory, ADDON_FILE_NAME), bytes);
   const commit = await run("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot });
   const status = await run("git", ["status", "--porcelain", "--", "apps/desktop/native"], { cwd: repositoryRoot });
   const provenance = {

@@ -52,6 +52,7 @@
     "package:windows:installer": "electron-builder --win nsis --x64 --config packaging/electron-builder.json",
     "package:windows:dir": "electron-builder --win dir --x64 --config packaging/electron-builder.json",
     "verify:packaged-shelf-mutex": "node scripts/verify-packaged-shelf-mutex.mjs",
+    "test:windows-integration-registry": "npm run build:native && node scripts/test-windows-integration-registry.mjs",
     "verify:packaged-windows-integration": "node scripts/verify-packaged-windows-integration.mjs",
     "dist:windows": "npm run package:windows:runtime && npm run build:native && npm run package:windows:stage && npm run package:windows:installer",
     "dist:collector-host": "npm run build:main && node scripts/build-collector-host.mjs",

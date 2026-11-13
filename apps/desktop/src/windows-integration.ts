@@ -17,7 +17,6 @@
  *   exactly the `node-gyp` output relative to this compiled module. No environment
  *   variable, working directory or argv participates (a source-scan test enforces it).
  */
-import { createRequire } from "node:module";
 import { lstatSync } from "node:fs";
 import path from "node:path";
 
@@ -48,6 +47,8 @@ export type RegistryValue =
   | { readonly type: "dword"; readonly value: number }
   | { readonly type: "other"; readonly value: null };
 
+/** The single native ownership verdict for the fixed host key (see the addon's InspectExisting). */
+export type HostRegistrationOwnership = "absent" | "ours" | "foreign";
 export type RegisterOutcome = "ok" | "foreign" | "access-denied" | "failed";
 export type UnregisterOutcome = "ok" | "not-registered" | "foreign" | "access-denied" | "failed";
 
@@ -58,14 +59,23 @@ export type WindowsIntegrationErrorCode =
   | "windows-integration-access-denied"
   | "windows-integration-failed";
 
+/**
+ * `message` is a fixed sentence and never carries a path. `detail` (native message, load
+ * attempts with candidate paths) may contain profile paths, so it is a NON-ENUMERABLE
+ * property: it is not copied by JSON.stringify, object spread or structured logging of the
+ * error. Do not forward `detail` to the renderer or to logs; it is for local diagnostics only.
+ */
 export class WindowsIntegrationError extends Error {
+  public readonly detail?: string;
+
   public constructor(
     public readonly code: WindowsIntegrationErrorCode,
     message: string,
-    public readonly detail?: string,
+    detail?: string,
   ) {
     super(message);
     this.name = "WindowsIntegrationError";
+    Object.defineProperty(this, "detail", { value: detail, enumerable: false, writable: false });
   }
 }
 
@@ -79,6 +89,7 @@ export interface WindowsIntegrationNative {
   getKnownFolderPath(id: string): unknown;
   readRegistryValue(hive: string, subkey: string, name: string, view: string): unknown;
   readRegistryValueNames(hive: string, subkey: string, view: string): unknown;
+  inspectCollectorHostRegistration(): unknown;
   registerCollectorHost(): unknown;
   unregisterCollectorHost(): unknown;
   replaceForeignCollectorHostRegistration(): unknown;
@@ -88,6 +99,7 @@ export interface WindowsIntegrationNative {
 export const WINDOWS_INTEGRATION_NATIVE_EXPORTS: readonly string[] = Object.freeze([
   "apiVersion",
   "getKnownFolderPath",
+  "inspectCollectorHostRegistration",
   "readRegistryValue",
   "readRegistryValueNames",
   "registerCollectorHost",
@@ -102,6 +114,14 @@ export interface WindowsIntegration {
   readRegistryValue(hive: RegistryHive, subkey: string, name: string, view: RegistryView): RegistryValue | null;
   /** Read-only. Value names directly under a key; `null` when the key does not exist. */
   readRegistryValueNames(hive: RegistryHive, subkey: string, view: RegistryView): readonly string[] | null;
+  /**
+   * No arguments, read-only. Ownership of the fixed key, decided in ONE place (the addon):
+   * `absent` (no key, no default value, or an EMPTY default value, so a cleaner-damaged key is
+   * repairable), `ours` (REG_SZ equal to our manifest path, case-insensitive ordinal), or
+   * `foreign` (anything else, including other types, trailing-slash or `\\?\` variants, oversized
+   * values and registry link keys). No path normalisation is attempted.
+   */
+  inspectCollectorHostRegistration(): HostRegistrationOwnership;
   /** No arguments. Writes the fixed HKCU key to the fixed manifest path. Never overwrites a foreign value. */
   registerCollectorHost(): RegisterOutcome;
   /** No arguments. Deletes the fixed key only when its default value is our manifest path. */
@@ -163,6 +183,7 @@ function interpretStatus<T extends string>(raw: unknown, allowed: readonly T[], 
   return status as T;
 }
 
+const INSPECT_STATUSES = ["absent", "ours", "foreign", "access-denied", "failed"] as const;
 const REGISTER_STATUSES = ["ok", "foreign", "access-denied", "failed"] as const;
 const UNREGISTER_STATUSES = ["ok", "not-registered", "foreign", "access-denied", "failed"] as const;
 
@@ -212,6 +233,14 @@ export function createWindowsIntegration(native: WindowsIntegrationNative): Wind
         fail("windows-integration-failed", "The Windows integration addon returned unexpected registry value names.");
       }
       return Object.freeze([...(raw as string[])]);
+    },
+
+    inspectCollectorHostRegistration(this: void): HostRegistrationOwnership {
+      if (arguments.length > 0) fail("windows-integration-invalid-argument", "inspectCollectorHostRegistration takes no arguments.");
+      const status = interpretStatus(guarded(() => native.inspectCollectorHostRegistration()), INSPECT_STATUSES, "inspect");
+      if (status === "access-denied") fail("windows-integration-access-denied", "Windows denied access to the registry key.");
+      if (status === "failed") fail("windows-integration-failed", "The registration key could not be inspected.");
+      return status;
     },
 
     // These three are declared without parameters and refuse any argument at runtime, so
@@ -279,6 +308,11 @@ export function resolveWindowsIntegrationAddonCandidates(
 function isRegularFileInside(root: string, candidate: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
   if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return false;
+  return isRegularFile(candidate);
+}
+
+/** A real file, not a link, junction target stand-in or directory. */
+function isRegularFile(candidate: string): boolean {
   try {
     const info = lstatSync(candidate);
     return info.isFile() && !info.isSymbolicLink();
@@ -287,11 +321,22 @@ function isRegularFileInside(root: string, candidate: string): boolean {
   }
 }
 
+/** Load exactly this file as a native addon; `require` could substitute `.node.js` or `.json`. */
+function loadWithDlopen(candidate: string): unknown {
+  const holder: { exports: unknown } = { exports: {} };
+  process.dlopen(holder as NodeJS.Module, candidate);
+  return holder.exports;
+}
+
 export interface WindowsIntegrationLoaderDeps {
-  /** Loads one `.node` file. Defaults to `createRequire`. */
+  /** Loads one `.node` file. Defaults to `process.dlopen` on the exact path (no `require` extension completion). */
   readonly requireNative?: (candidate: string) => unknown;
-  /** Checks a packaged candidate is a real file inside resources. Defaults to an `lstat` check. */
-  readonly isTrustedPackagedFile?: (resources: string, candidate: string) => boolean;
+  /**
+   * Checks a candidate is a regular file (never a link). Packaged mode additionally requires it
+   * to lie inside `resources`; development mode passes the candidate's own directory as root.
+   * Defaults to an `lstat` check.
+   */
+  readonly isTrustedFile?: (root: string, candidate: string) => boolean;
 }
 
 /** Load and wrap the addon from the resolved candidates. Throws `windows-integration-unavailable`. */
@@ -300,12 +345,13 @@ export function loadWindowsIntegrationFrom(
   resourcesPath: string | undefined,
   deps: WindowsIntegrationLoaderDeps = {},
 ): WindowsIntegration {
-  const load = deps.requireNative ?? ((candidate: string) => createRequire(candidate)(candidate));
-  const trusted = deps.isTrustedPackagedFile ?? isRegularFileInside;
+  const load = deps.requireNative ?? loadWithDlopen;
+  const trusted = deps.isTrustedFile ?? isRegularFileInside;
   const attempts: string[] = [];
   for (const candidate of resolution.candidates) {
-    if (resolution.mode === "packaged" && !trusted(resourcesPath ?? "", candidate)) {
-      attempts.push(`${candidate}: not a trusted file inside the packaged resources directory`);
+    const root = resolution.mode === "packaged" ? resourcesPath ?? "" : path.dirname(candidate);
+    if (!trusted(root, candidate)) {
+      attempts.push(`${candidate}: not a regular file at the fixed location (${resolution.mode})`);
       continue;
     }
     try {

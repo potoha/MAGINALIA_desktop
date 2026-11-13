@@ -9,8 +9,11 @@
  *   `replaceForeignCollectorHostRegistration` of the product binary are never called.
  * - Register/unregister are exercised natively only through the separate test-seam
  *   build (`windows_integration_test.node`), which targets a private temp subkey under
- *   `HKCU\Software\MAGINALIA-Tests\<random>` that is removed afterwards. The seam is
- *   proven absent from the product binary below.
+ *   `HKCU\Software\MAGINALIA-Tests\<random>` that is removed afterwards. That suite WRITES
+ *   to the real HKCU (private subkey only), so it is OPT-IN: it runs only when
+ *   `MAGINALIA_RUN_REGISTRY_SEAM_TESTS=1` (see `npm run test:windows-integration-registry`).
+ *   A normal `npm test` and CI never write the registry. The seam is proven absent from the
+ *   product binary by default-on, read-only tests below.
  * - When the addon binaries are absent (no C++ toolchain) or the host is not Windows, the
  *   native suites are skipped; `npm run build:native` is the evidence path.
  */
@@ -49,6 +52,8 @@ const productAddonPath = path.join(buildDirectory, "windows_integration.node");
 const testAddonPath = path.join(buildDirectory, "windows_integration_test.node");
 const nativeAvailable = process.platform === "win32" && existsSync(productAddonPath) && existsSync(testAddonPath);
 const nativeDescribe = nativeAvailable ? describe : describe.skip;
+const registrySeamEnabled = nativeAvailable && process.env["MAGINALIA_RUN_REGISTRY_SEAM_TESTS"] === "1";
+const registrySeamDescribe = registrySeamEnabled ? describe : describe.skip;
 
 interface AddonScript {
   readonly PRODUCT_JS_EXPORTS: readonly string[];
@@ -73,6 +78,7 @@ interface FakeNativeOptions {
   readonly names?: Record<string, string[] | null>;
   readonly folders?: Record<string, unknown>;
   readonly registerResult?: unknown;
+  readonly inspectResult?: unknown;
   readonly throwWith?: { readonly code?: string; readonly message: string };
 }
 
@@ -102,6 +108,11 @@ function fakeNative(options: FakeNativeOptions = {}) {
       const found = (options.names ?? {})[`${String(args[0])}|${String(args[2])}|${String(args[1])}`];
       return found === undefined ? null : found;
     },
+    inspectCollectorHostRegistration: (...args: unknown[]) => {
+      calls.push({ name: "inspectCollectorHostRegistration", args });
+      maybeThrow();
+      return options.inspectResult ?? { status: "absent", errorCode: 0 };
+    },
     registerCollectorHost: (...args: unknown[]) => {
       calls.push({ name: "registerCollectorHost", args });
       maybeThrow();
@@ -126,6 +137,7 @@ describe("wrapper: surface and argument validation", () => {
     const wrapper = createWindowsIntegration(fakeNative().native);
     expect(Object.keys(wrapper).sort()).toEqual([
       "getKnownFolderPath",
+      "inspectCollectorHostRegistration",
       "readRegistryValue",
       "readRegistryValueNames",
       "registerCollectorHost",
@@ -201,6 +213,42 @@ describe("wrapper: surface and argument validation", () => {
     expect(wrapper.readRegistryValueNames("HKLM", "S", "64")).toEqual(["1", "2"]);
     expect(wrapper.readRegistryValueNames("HKLM", "NOPE", "64")).toBeNull();
     expect(() => wrapper.readRegistryValueNames("HKLM", "BAD", "64")).toThrow(WindowsIntegrationError);
+  });
+
+  it("inspectCollectorHostRegistration takes no arguments and relays only the native verdict", () => {
+    for (const status of ["absent", "ours", "foreign"] as const) {
+      const { native, calls } = fakeNative({ inspectResult: { status, errorCode: 0 } });
+      const wrapper = createWindowsIntegration(native);
+      expect(wrapper.inspectCollectorHostRegistration()).toBe(status);
+      expect(calls[0]?.args).toEqual([]);
+      expect(() => (wrapper as unknown as Record<string, (...a: unknown[]) => unknown>)["inspectCollectorHostRegistration"]?.("x")).toThrow(/no arguments/u);
+    }
+    expect(() => createWindowsIntegration(fakeNative({ inspectResult: { status: "access-denied", errorCode: 5 } }).native).inspectCollectorHostRegistration())
+      .toThrow(expect.objectContaining({ code: "windows-integration-access-denied" }));
+    expect(() => createWindowsIntegration(fakeNative({ inspectResult: { status: "failed", errorCode: 1 } }).native).inspectCollectorHostRegistration())
+      .toThrow(expect.objectContaining({ code: "windows-integration-failed" }));
+    expect(() => createWindowsIntegration(fakeNative({ inspectResult: { status: "value" } }).native).inspectCollectorHostRegistration()).toThrow(WindowsIntegrationError);
+  });
+
+  it("keeps absolute paths out of the error message and out of serialised output", () => {
+    const secret = "C:\\Users\\山田太郎\\AppData\\Local\\secret.node";
+    const wrapper = createWindowsIntegration(fakeNative({ throwWith: { code: "registry-read-failed", message: `failed near ${secret}` } }).native);
+    let thrown: unknown;
+    try { wrapper.readRegistryValue("HKCU", "S", "n", "64"); } catch (error: unknown) { thrown = error; }
+    expect(thrown).toBeInstanceOf(WindowsIntegrationError);
+    const error = thrown as WindowsIntegrationError;
+    expect(error.message).not.toMatch(/[A-Za-z]:\\/u);
+    expect(error.detail).toContain(secret);              // available for local diagnostics only
+    expect(JSON.stringify(error)).not.toContain("山田");   // detail is not enumerable
+    expect(JSON.stringify({ ...error })).not.toContain("山田");
+    expect(Object.keys(error)).not.toContain("detail");
+
+    try {
+      loadWindowsIntegrationFrom({ mode: "development", candidates: [secret] }, undefined, { isTrustedFile: () => true, requireNative: () => { throw new Error(`cannot open ${secret}`); } });
+    } catch (loadError: unknown) {
+      expect((loadError as Error).message).not.toMatch(/[A-Za-z]:\\/u);
+      expect(JSON.stringify(loadError)).not.toContain("山田");
+    }
   });
 
   it("maps register/unregister results and rejects unknown statuses", () => {
@@ -281,7 +329,7 @@ describe("loader: addon location is code, not configuration", () => {
   it("loads a complete addon, and reports unavailable for missing, broken or partial ones", () => {
     const complete = fakeNative().native;
     const resolution = { mode: "development", candidates: ["C:\\x\\windows_integration.node"] } as const;
-    expect(typeof loadWindowsIntegrationFrom(resolution, undefined, { requireNative: () => complete }).registerCollectorHost).toBe("function");
+    expect(typeof loadWindowsIntegrationFrom(resolution, undefined, { isTrustedFile: () => true, requireNative: () => complete }).registerCollectorHost).toBe("function");
 
     const unavailable = (deps: Parameters<typeof loadWindowsIntegrationFrom>[2]) => {
       try {
@@ -293,22 +341,33 @@ describe("loader: addon location is code, not configuration", () => {
         return (error as WindowsIntegrationError).detail ?? "";
       }
     };
-    expect(unavailable({ requireNative: () => { throw new Error("module not found"); } })).toMatch(/module not found/u);
-    expect(unavailable({ requireNative: () => ({ apiVersion: 1, getKnownFolderPath: () => "" }) })).toMatch(/missing .*registerCollectorHost/u);
-    expect(unavailable({ requireNative: () => null })).toMatch(/not a Windows integration addon/u);
+    const trusted = { isTrustedFile: () => true };
+    expect(unavailable({ ...trusted, requireNative: () => { throw new Error("module not found"); } })).toMatch(/module not found/u);
+    expect(unavailable({ ...trusted, requireNative: () => ({ apiVersion: 1, getKnownFolderPath: () => "" }) })).toMatch(/missing .*registerCollectorHost/u);
+    expect(unavailable({ ...trusted, requireNative: () => null })).toMatch(/not a Windows integration addon/u);
+    // Development mode also requires a regular file at the exact path (no link, no missing file).
+    let loaded = false;
+    expect(unavailable({ requireNative: () => { loaded = true; return complete; } })).toMatch(/not a regular file/u);
+    expect(loaded).toBe(false);
     expect(() => loadWindowsIntegrationFrom({ mode: "development", candidates: [] }, undefined)).toThrow(WindowsIntegrationError);
   });
 
   it("packaged mode refuses an untrusted candidate without loading it", () => {
     let loaded = false;
     const packaged = { mode: "packaged", candidates: [path.join(resources, "windows-integration", "windows_integration.node")] } as const;
-    expect(() => loadWindowsIntegrationFrom(packaged, resources, {
-      isTrustedPackagedFile: () => false,
-      requireNative: () => { loaded = true; return fakeNative().native; },
-    })).toThrow(expect.objectContaining({ code: "windows-integration-unavailable", detail: expect.stringMatching(/not a trusted file/u) }));
+    let thrown: unknown;
+    try {
+      loadWindowsIntegrationFrom(packaged, resources, {
+        isTrustedFile: () => false,
+        requireNative: () => { loaded = true; return fakeNative().native; },
+      });
+    } catch (error: unknown) { thrown = error; }
+    expect(thrown).toBeInstanceOf(WindowsIntegrationError);
+    expect((thrown as WindowsIntegrationError).code).toBe("windows-integration-unavailable");
+    expect((thrown as WindowsIntegrationError).detail).toMatch(/not a regular file/u);
     expect(loaded).toBe(false);
     expect(typeof loadWindowsIntegrationFrom(packaged, resources, {
-      isTrustedPackagedFile: () => true,
+      isTrustedFile: () => true,
       requireNative: () => fakeNative().native,
     }).unregisterCollectorHost).toBe("function");
   });
@@ -337,6 +396,18 @@ describe("source scan: no environment, cwd, argv or Electron path reads", () => 
     expect(productWrites.length).toBe(2);
     for (const write of productWrites) expect(write[2]).toContain("HostKeyPath()");
     expect(productSource).not.toContain("RegDeleteTreeW");
+
+    // Known folders are computed, not verified (a fresh profile has no `Programs` folder yet).
+    expect(source).toContain("KF_FLAG_DONT_VERIFY");
+    expect(source).not.toContain("KF_FLAG_DEFAULT");
+
+    // Every RegOpenKeyExW is read-only: KEY_QUERY_VALUE family only, no write/delete/create bits.
+    const opens = [...source.matchAll(/\bRegOpenKeyExW\(([^;]*?);/gu)];
+    expect(opens.length).toBeGreaterThan(0);
+    for (const open of opens) {
+      expect(open[1]).toContain("KEY_QUERY_VALUE");
+      expect(open[1]).not.toMatch(/KEY_SET_VALUE|KEY_WRITE|KEY_ALL_ACCESS|KEY_CREATE|DELETE|WRITE_DAC|WRITE_OWNER/u);
+    }
   });
 });
 
@@ -349,13 +420,14 @@ describe("product adapter over a fake native module", () => {
     return createCollectorRegistryAdapterOver(createWindowsIntegration(fakeNative(options).native));
   }
 
-  it("reads the registration default value and classifies absent, string and other types", () => {
-    const key = `HKCU|64|${COLLECTOR_HOST_REGISTRY_SUBKEY}|`;
-    expect(adapterFor({}).readCollectorHostRegistration()).toEqual({ state: "absent" });
-    expect(adapterFor({ values: { [key]: { type: "sz", value: "C:\\x\\m.json" } } }).readCollectorHostRegistration()).toEqual({ state: "value", value: "C:\\x\\m.json" });
-    expect(adapterFor({ values: { [key]: { type: "sz", value: "" } } }).readCollectorHostRegistration()).toEqual({ state: "absent" });
-    expect(adapterFor({ values: { [key]: { type: "dword", value: 1 } } }).readCollectorHostRegistration()).toEqual({ state: "unexpected-type" });
-    expect(adapterFor({ values: { [key]: { type: "expand-sz", value: "%X%" } } }).readCollectorHostRegistration()).toEqual({ state: "unexpected-type" });
+  it("relays the native ownership verdict without re-classifying it in JavaScript", () => {
+    for (const status of ["absent", "ours", "foreign"] as const) {
+      expect(adapterFor({ inspectResult: { status, errorCode: 0 } }).readCollectorHostRegistration()).toBe(status);
+    }
+    // The adapter never reads the key's value itself (no JS case folding or empty-string rule).
+    const { native, calls } = fakeNative({ inspectResult: { status: "ours", errorCode: 0 } });
+    createCollectorRegistryAdapterOver(createWindowsIntegration(native)).readCollectorHostRegistration();
+    expect(calls.map((call) => call.name)).toEqual(["inspectCollectorHostRegistration"]);
   });
 
   it("collects policy facts per hive, with list entries in numeric order", () => {
@@ -421,23 +493,26 @@ describe("product adapter over a fake native module", () => {
 });
 
 describe("FakeCollectorRegistryAdapter (test helper)", () => {
-  it("registers the fixed manifest path, never overwrites a foreign value, and unregisters value-matched", () => {
+  it("models the addon's ownership classes: register never overwrites foreign, unregister is value-matched", () => {
     const fake = new FakeCollectorRegistryAdapter();
-    const expected = collectorManifestPathFor(fake.knownFolders.UserProgramFiles);
-    expect(expected).toBe("C:\\Users\\tester\\AppData\\Local\\Programs\\MAGINALIA Collector\\org.maginalia.collector.json");
+    expect(collectorManifestPathFor(fake.knownFolders.UserProgramFiles)).toBe("C:\\Users\\tester\\AppData\\Local\\Programs\\MAGINALIA Collector\\org.maginalia.collector.json");
+    expect(fake.readCollectorHostRegistration()).toBe("absent");
     expect(fake.unregisterCollectorHost()).toBe("not-registered");
     expect(fake.registerCollectorHost()).toBe("ok");
-    expect(fake.readCollectorHostRegistration()).toEqual({ state: "value", value: expected });
+    expect(fake.readCollectorHostRegistration()).toBe("ours");
     expect(fake.registerCollectorHost()).toBe("ok");
 
-    fake.registration = { state: "value", value: "C:\\Program Files\\Standalone\\host.json" };
+    fake.registration = "foreign";
     expect(fake.registerCollectorHost()).toBe("foreign");
     expect(fake.unregisterCollectorHost()).toBe("foreign");
-    expect(fake.readCollectorHostRegistration()).toEqual({ state: "value", value: "C:\\Program Files\\Standalone\\host.json" });
+    expect(fake.readCollectorHostRegistration()).toBe("foreign");
     expect(fake.replaceForeignCollectorHostRegistration()).toBe("ok");
-    expect(fake.readCollectorHostRegistration()).toEqual({ state: "value", value: expected });
+    expect(fake.readCollectorHostRegistration()).toBe("ours");
     expect(fake.unregisterCollectorHost()).toBe("ok");
-    expect(fake.readCollectorHostRegistration()).toEqual({ state: "absent" });
+    expect(fake.readCollectorHostRegistration()).toBe("absent");
+    // An empty or valueless default is `absent` in the addon too, so register repairs it.
+    fake.registration = "absent";
+    expect(fake.registerCollectorHost()).toBe("ok");
   });
 
   it("supports fault injection and forced outcomes for state-machine tests", () => {
@@ -447,7 +522,7 @@ describe("FakeCollectorRegistryAdapter (test helper)", () => {
     expect(fake.readChromePolicies().hkcu).toEqual(EMPTY_CHROME_POLICIES_FOR_HIVE("HKCU"));
     fake.nextRegisterOutcome = "access-denied";
     expect(fake.registerCollectorHost()).toBe("access-denied");
-    expect(fake.readCollectorHostRegistration()).toEqual({ state: "absent" });
+    expect(fake.readCollectorHostRegistration()).toBe("absent");
     expect(fake.calls).toContain("registerCollectorHost");
   });
 });
@@ -502,7 +577,7 @@ nativeDescribe("native product addon: read-only", () => {
   it("can read the real registration key (read only) through the adapter", () => {
     const adapter = createCollectorRegistryAdapterOver(integration);
     const registration = adapter.readCollectorHostRegistration();
-    expect(["absent", "value", "unexpected-type"]).toContain(registration.state);
+    expect(["absent", "ours", "foreign"]).toContain(registration);
     expect(adapter.readChromePolicies().hklm.hive).toBe("HKLM");
     expect(Array.isArray(adapter.readChromeAppPaths())).toBe(true);
     const progId = adapter.readDefaultBrowserProgId();
@@ -510,14 +585,16 @@ nativeDescribe("native product addon: read-only", () => {
   });
 });
 
-// ----- Native: register/unregister through the test-seam build only -------------------------
+// ----- Native: register/unregister through the test-seam build only (OPT-IN) ---------------
 
-nativeDescribe("native test-seam build: register/unregister in a private temp subkey", () => {
+registrySeamDescribe("native test-seam build: register/unregister in a private temp subkey (opt-in)", () => {
   const requireNative = createRequire(import.meta.url);
   const seam = requireNative(testAddonPath) as WindowsIntegrationNative & {
     testSetRoot(root: string): string;
-    testSeedValue(value: string): { status: string };
+    testSeedValue(kind: string, value: string): { status: string };
+    testSeedSubkey(): { status: string };
     testCleanup(): { status: string };
+    inspectCollectorHostRegistration(): { status: string };
   };
   const reader = createWindowsIntegration(requireNative(productAddonPath) as WindowsIntegrationNative);
   const rootKey = `Software\\MAGINALIA-Tests\\${randomUUID()}`;
@@ -525,6 +602,7 @@ nativeDescribe("native test-seam build: register/unregister in a private temp su
   const manifest = collectorManifestPathFor(reader.getKnownFolderPath("UserProgramFiles"));
   const realKeyBefore = reader.readRegistryValue("HKCU", COLLECTOR_HOST_REGISTRY_SUBKEY, "", "64");
   const readHost = () => reader.readRegistryValue("HKCU", hostKey, "", "64");
+  const verdict = () => (seam.inspectCollectorHostRegistration() as { status: string }).status;
 
   afterAll(() => {
     seam.testCleanup();
@@ -539,6 +617,7 @@ nativeDescribe("native test-seam build: register/unregister in a private temp su
     expect(seam.registerCollectorHost()).toMatchObject({ status: "failed" });
     expect(seam.unregisterCollectorHost()).toMatchObject({ status: "failed" });
     expect(seam.replaceForeignCollectorHostRegistration()).toMatchObject({ status: "failed" });
+    expect(seam.inspectCollectorHostRegistration()).toMatchObject({ status: "failed" });
     for (const bad of [
       "Software\\Google\\Chrome",
       "Software\\MAGINALIA-Tests\\",
@@ -552,22 +631,39 @@ nativeDescribe("native test-seam build: register/unregister in a private temp su
     expect(reader.readRegistryValue("HKCU", COLLECTOR_HOST_REGISTRY_SUBKEY, "", "64")).toEqual(realKeyBefore);
   });
 
-  it("registers the fixed manifest path, is idempotent, and is value-matched on unregister", () => {
+  it("treats a missing key, a valueless key and an empty REG_SZ default as absent, and register repairs it", () => {
     expect(seam.testSetRoot(rootKey)).toBe(hostKey);
     expect(readHost()).toBeNull();
+    expect(verdict()).toBe("absent");
     expect(seam.unregisterCollectorHost()).toMatchObject({ status: "not-registered" });
+    expect(seam.testSeedValue("no-default", "")).toMatchObject({ status: "ok" });
+    expect(verdict()).toBe("absent");
+    expect(seam.testSeedValue("empty-sz", "")).toMatchObject({ status: "ok" });
+    expect(readHost()).toEqual({ type: "sz", value: "" });
+    expect(verdict()).toBe("absent");
+    expect(seam.unregisterCollectorHost()).toMatchObject({ status: "not-registered" });
+    expect(readHost()).toEqual({ type: "sz", value: "" });   // an empty-default key is left alone
+    expect(seam.registerCollectorHost()).toMatchObject({ status: "ok" });
+    expect(readHost()).toEqual({ type: "sz", value: manifest });
+    expect(verdict()).toBe("ours");
+    expect(seam.unregisterCollectorHost()).toMatchObject({ status: "ok" });
+    expect(readHost()).toBeNull();
+  });
 
+  it("registers the fixed manifest path, is idempotent, and is value-matched on unregister", () => {
     expect(seam.registerCollectorHost()).toMatchObject({ status: "ok", errorCode: 0 });
     expect(readHost()).toEqual({ type: "sz", value: manifest });
     expect(seam.registerCollectorHost()).toMatchObject({ status: "ok" });
     expect(readHost()).toEqual({ type: "sz", value: manifest });
 
     // A foreign registration is never overwritten by register, and unregister leaves it.
-    expect(seam.testSeedValue("C:\\Program Files\\Standalone Host\\host.json")).toMatchObject({ status: "ok" });
+    const foreign = "C:\\Program Files\\Standalone Host\\host.json";
+    expect(seam.testSeedValue("sz", foreign)).toMatchObject({ status: "ok" });
+    expect(verdict()).toBe("foreign");
     expect(seam.registerCollectorHost()).toMatchObject({ status: "foreign" });
-    expect(readHost()).toEqual({ type: "sz", value: "C:\\Program Files\\Standalone Host\\host.json" });
+    expect(readHost()).toEqual({ type: "sz", value: foreign });
     expect(seam.unregisterCollectorHost()).toMatchObject({ status: "foreign" });
-    expect(readHost()).toEqual({ type: "sz", value: "C:\\Program Files\\Standalone Host\\host.json" });
+    expect(readHost()).toEqual({ type: "sz", value: foreign });
 
     // Only the explicit replace entry point overwrites it; then unregister removes our key.
     expect(seam.replaceForeignCollectorHostRegistration()).toMatchObject({ status: "ok" });
@@ -577,12 +673,49 @@ nativeDescribe("native test-seam build: register/unregister in a private temp su
     expect(seam.unregisterCollectorHost()).toMatchObject({ status: "not-registered" });
   });
 
-  it("matches the manifest path case-insensitively, as Windows paths are", () => {
-    expect(seam.testSeedValue(manifest.toUpperCase())).toMatchObject({ status: "ok" });
-    expect(seam.registerCollectorHost()).toMatchObject({ status: "ok" });
-    expect(seam.testSeedValue(manifest.toLowerCase())).toMatchObject({ status: "ok" });
+  it("classifies type, path-variant and size variants as foreign and never deletes them", () => {
+    const variants: ReadonlyArray<readonly [string, string, string]> = [
+      ["REG_EXPAND_SZ", "expand-sz", manifest],
+      ["DWORD", "dword", ""],
+      ["binary", "binary", ""],
+      ["trailing backslash", "sz", `${manifest}\\`],
+      ["trailing slash", "sz", `${manifest}/`],
+      ["extended-length prefix", "sz", `\\\\?\\${manifest}`],
+      ["leading space", "sz", ` ${manifest}`],
+      ["parent directory", "sz", path.win32.dirname(manifest)],
+      ["long value (20000 chars)", "sz", `C:\\${"a".repeat(20000)}`],
+      ["oversized value (100000 chars)", "sz", `C:\\${"a".repeat(100000)}`],
+    ];
+    for (const [label, kind, text] of variants) {
+      expect(seam.testSeedValue(kind, text), label).toMatchObject({ status: "ok" });
+      expect(verdict(), label).toBe("foreign");
+      expect(seam.unregisterCollectorHost(), label).toMatchObject({ status: "foreign" });
+      expect(seam.registerCollectorHost(), label).toMatchObject({ status: "foreign" });
+    }
+    expect(seam.replaceForeignCollectorHostRegistration()).toMatchObject({ status: "ok" });
+    expect(verdict()).toBe("ours");
+  });
+
+  it("matches the manifest path case-insensitively and does not fold dotted capital I", () => {
+    expect(seam.testSeedValue("sz", manifest.toUpperCase())).toMatchObject({ status: "ok" });
+    expect(verdict()).toBe("ours");
+    expect(seam.testSeedValue("sz", manifest.toLowerCase())).toMatchObject({ status: "ok" });
+    expect(verdict()).toBe("ours");
+    // U+0130 (dotted capital I) is not the same character as "i" in an ordinal comparison.
+    expect(seam.testSeedValue("sz", manifest.replace("i", "\u0130"))).toMatchObject({ status: "ok" });
+    expect(verdict()).toBe("foreign");
+    expect(seam.testSeedValue("sz", manifest.toLowerCase())).toMatchObject({ status: "ok" });
     expect(seam.unregisterCollectorHost()).toMatchObject({ status: "ok" });
     expect(readHost()).toBeNull();
+  });
+
+  it("reports a key with subkeys as a plain failure, not access-denied, and keeps it", () => {
+    expect(seam.registerCollectorHost()).toMatchObject({ status: "ok" });
+    expect(seam.testSeedSubkey()).toMatchObject({ status: "ok" });
+    const result = seam.unregisterCollectorHost() as { status: string; errorCode: number };
+    expect(result.status).toBe("failed");
+    expect(result.errorCode).toBe(145);          // ERROR_DIR_NOT_EMPTY
+    expect(readHost()).toEqual({ type: "sz", value: manifest });
   });
 });
 

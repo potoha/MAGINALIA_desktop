@@ -12,8 +12,8 @@
  * Chrome candidate validation, ...) belongs to the state machine, not here.
  */
 import {
-  COLLECTOR_HOST_REGISTRY_SUBKEY,
   loadWindowsIntegration,
+  type HostRegistrationOwnership,
   type KnownFolderId,
   type RegisterOutcome,
   type RegistryHive,
@@ -21,12 +21,12 @@ import {
   type WindowsIntegration,
 } from "./windows-integration.js";
 
-/** What the fixed host key's default value currently is. */
-export type CollectorHostRegistration =
-  | { readonly state: "absent" }
-  | { readonly state: "value"; readonly value: string }
-  /** A default value exists but is not a plain REG_SZ string (never ours). */
-  | { readonly state: "unexpected-type" };
+/**
+ * Ownership of the fixed host key, decided by the addon in ONE place (no JS re-classification):
+ * `absent` (no key, no default value, or an empty default value: repairable by `register`),
+ * `ours` (default equals our manifest path), `foreign` (anything else).
+ */
+export type CollectorHostRegistration = HostRegistrationOwnership;
 
 /**
  * Chrome policy facts for one hive (`SOFTWARE\Policies\Google\Chrome`). `null` means the
@@ -56,7 +56,7 @@ export interface ChromeAppPathValue {
 export interface CollectorRegistryAdapter {
   /** `SHGetKnownFolderPath` for the fixed folder set; a local-drive absolute path. */
   getKnownFolderPath(id: KnownFolderId): string;
-  /** Default value of `HKCU\Software\Google\Chrome\NativeMessagingHosts\org.maginalia.collector`. */
+  /** Ownership of `HKCU\Software\Google\Chrome\NativeMessagingHosts\org.maginalia.collector`. */
   readCollectorHostRegistration(): CollectorHostRegistration;
   /** No arguments; fixed key and value. Never overwrites a foreign registration. */
   registerCollectorHost(): RegisterOutcome;
@@ -125,12 +125,7 @@ export function createCollectorRegistryAdapterOver(integration: WindowsIntegrati
   return Object.freeze({
     getKnownFolderPath: (id: KnownFolderId) => integration.getKnownFolderPath(id),
 
-    readCollectorHostRegistration(): CollectorHostRegistration {
-      const value = integration.readRegistryValue("HKCU", COLLECTOR_HOST_REGISTRY_SUBKEY, "", "64");
-      if (value === null) return { state: "absent" };
-      if (value.type === "sz") return value.value.length === 0 ? { state: "absent" } : { state: "value", value: value.value };
-      return { state: "unexpected-type" };
-    },
+    readCollectorHostRegistration: () => integration.inspectCollectorHostRegistration(),
 
     registerCollectorHost: () => integration.registerCollectorHost(),
     unregisterCollectorHost: () => integration.unregisterCollectorHost(),

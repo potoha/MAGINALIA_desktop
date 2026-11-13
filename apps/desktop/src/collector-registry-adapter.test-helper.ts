@@ -47,8 +47,12 @@ export class FakeCollectorRegistryAdapter implements CollectorRegistryAdapter {
     ProgramFiles: "C:\\Program Files",
     ProgramFilesX86: "C:\\Program Files (x86)",
   };
-  /** The fixed key's default value. */
-  public registration: CollectorHostRegistration = { state: "absent" };
+  /**
+   * Ownership of the fixed key, exactly the classes the addon produces. The addon treats a key
+   * with no default value or an EMPTY default value as `absent`; tests model that by setting
+   * `"absent"`. Case folding and path variants are decided natively and are not simulated here.
+   */
+  public registration: CollectorHostRegistration = "absent";
   public policies: ChromePolicySnapshot = {
     hkcu: EMPTY_CHROME_POLICIES_FOR_HIVE("HKCU"),
     hklm: EMPTY_CHROME_POLICIES_FOR_HIVE("HKLM"),
@@ -91,11 +95,8 @@ export class FakeCollectorRegistryAdapter implements CollectorRegistryAdapter {
       this.nextRegisterOutcome = undefined;
       return forced;
     }
-    const foreign = this.registration.state === "unexpected-type"
-      || (this.registration.state === "value"
-        && this.registration.value.toLowerCase() !== this.manifestPath.toLowerCase());
-    if (foreign && !replaceForeign) return "foreign";
-    this.registration = { state: "value", value: this.manifestPath };
+    if (this.registration === "foreign" && !replaceForeign) return "foreign";
+    this.registration = "ours";
     return "ok";
   }
 
@@ -116,10 +117,9 @@ export class FakeCollectorRegistryAdapter implements CollectorRegistryAdapter {
       this.nextUnregisterOutcome = undefined;
       return forced;
     }
-    if (this.registration.state === "absent") return "not-registered";
-    if (this.registration.state === "unexpected-type"
-      || this.registration.value.toLowerCase() !== this.manifestPath.toLowerCase()) return "foreign";
-    this.registration = { state: "absent" };
+    if (this.registration === "absent") return "not-registered";
+    if (this.registration === "foreign") return "foreign";
+    this.registration = "absent";
     return "ok";
   }
 

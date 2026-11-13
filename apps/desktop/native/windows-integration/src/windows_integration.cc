@@ -15,6 +15,8 @@
  * - `registerCollectorHost`, `unregisterCollectorHost` and
  *   `replaceForeignCollectorHostRegistration` read NO arguments (they never call
  *   `napi_get_cb_info`), so a caller cannot influence them.
+ * - `inspectCollectorHostRegistration` (no arguments, read-only) is the single ownership
+ *   verdict: absent | ours | foreign (see InspectExisting for the exact rules).
  * - `unregisterCollectorHost` deletes the key only when its default value is a REG_SZ
  *   equal to our manifest path (case-insensitive ordinal), otherwise it reports `foreign`.
  * - Nothing here reads environment variables, the working directory or argv.
@@ -140,9 +142,15 @@ bool IsLocalDrivePath(const std::wstring& path) {
 }
 
 // Returns false when the folder is unavailable or not a local drive path.
+//
+// KF_FLAG_DONT_VERIFY: the path is COMPUTED, not required to exist. On a fresh profile (or an
+// "all users" install) `%LOCALAPPDATA%\Programs` may not exist yet; with the default flag
+// SHGetKnownFolderPath would fail and register/unregister could not even compute the manifest
+// path. Creating the `Programs` parent and the program folder is the job of the integration
+// state machine (WP-5b), never of this addon. The local-drive check below still applies.
 bool ResolveKnownFolder(const KNOWNFOLDERID& id, std::wstring* out) {
   PWSTR raw = nullptr;
-  const HRESULT result = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, nullptr, &raw);
+  const HRESULT result = SHGetKnownFolderPath(id, KF_FLAG_DONT_VERIFY, nullptr, &raw);
   if (FAILED(result) || raw == nullptr) {
     if (raw != nullptr) CoTaskMemFree(raw);
     return false;
@@ -376,20 +384,59 @@ const char* StatusFor(LONG error) {
   return error == ERROR_ACCESS_DENIED ? "access-denied" : "failed";
 }
 
-// What the constant key currently holds, as far as ownership is concerned.
+// What the constant key currently holds, as far as ownership is concerned. This is the ONE
+// place that classifies ownership; the JS layers only relay the result.
+//
+// Rules (documented decision):
+//  - key missing, key without a default value, or a default value that is an EMPTY REG_SZ
+//    -> kAbsent. A key damaged by a cleaner is therefore repairable: `register` writes over it.
+//  - default is a REG_SZ equal (ordinal, case-insensitive via CompareStringOrdinal) to our
+//    manifest path -> kOurs. Anything else (other path, trailing slash, `\\?\` prefix, REG_EXPAND_SZ,
+//    DWORD, binary, an oversized value, a REG_LINK key) -> kForeign. No normalisation is attempted.
 enum class Existing { kAbsent, kOurs, kForeign, kError };
+
+// A registry link key stores its target in a REG_LINK value named SymbolicLinkValue.
+bool IsLinkKey(HKEY key) {
+  DWORD type = 0;
+  DWORD size = 0;
+  const LONG status = RegQueryValueExW(key, L"SymbolicLinkValue", nullptr, &type, nullptr, &size);
+  return status == ERROR_SUCCESS && type == REG_LINK;
+}
+
+// The fixed key is opened with REG_OPTION_OPEN_LINK so a symbolic link is seen, not followed.
+LONG OpenFixedKeyReadOnly(HKEY* key) {
+  return RegOpenKeyExW(HKEY_CURRENT_USER, HostKeyPath(), REG_OPTION_OPEN_LINK,
+                       KEY_QUERY_VALUE | KEY_WOW64_64KEY, key);
+}
 
 Existing InspectExisting(const std::wstring& ours, LONG* error) {
   HKEY key = nullptr;
-  const LONG opened = RegOpenKeyExW(HKEY_CURRENT_USER, HostKeyPath(), 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key);
+  const LONG opened = OpenFixedKeyReadOnly(&key);
   if (opened == ERROR_FILE_NOT_FOUND || opened == ERROR_PATH_NOT_FOUND) return Existing::kAbsent;
   if (opened != ERROR_SUCCESS) { *error = opened; return Existing::kError; }
+  if (IsLinkKey(key)) { RegCloseKey(key); return Existing::kForeign; }
   const ReadValue value = ReadOpenValue(key, std::wstring());
   RegCloseKey(key);
+  if (value.kind == ValueKind::kError && value.error == ERROR_MORE_DATA) return Existing::kForeign;
   if (value.kind == ValueKind::kError) { *error = value.error; return Existing::kError; }
-  if (value.kind == ValueKind::kMissing) return Existing::kAbsent;  // key without a default value
+  if (value.kind == ValueKind::kMissing) return Existing::kAbsent;
+  if (value.kind == ValueKind::kString && value.text.empty()) return Existing::kAbsent;
   if (value.kind == ValueKind::kString && PathsEqual(value.text, ours)) return Existing::kOurs;
   return Existing::kForeign;
+}
+
+// Read-only, no arguments: the single ownership verdict for the fixed key.
+napi_value InspectCollectorHostRegistrationFn(napi_env env, napi_callback_info) {
+  if (!HostKeyConfigured()) return MakeResult(env, "failed", ERROR_NOT_READY);
+  std::wstring manifest;
+  if (!ComputeManifestPath(&manifest)) return MakeResult(env, "failed", ERROR_PATH_NOT_FOUND);
+  LONG error = ERROR_SUCCESS;
+  switch (InspectExisting(manifest, &error)) {
+    case Existing::kAbsent: return MakeResult(env, "absent", ERROR_SUCCESS);
+    case Existing::kOurs: return MakeResult(env, "ours", ERROR_SUCCESS);
+    case Existing::kForeign: return MakeResult(env, "foreign", ERROR_SUCCESS);
+    default: return MakeResult(env, StatusFor(error), error);
+  }
 }
 
 napi_value WriteRegistration(napi_env env, bool replaceForeign) {
@@ -431,6 +478,20 @@ napi_value UnregisterCollectorHostFn(napi_env env, napi_callback_info) {
   if (existing == Existing::kError) return MakeResult(env, StatusFor(error), error);
   if (existing == Existing::kAbsent) return MakeResult(env, "not-registered", ERROR_SUCCESS);
   if (existing == Existing::kForeign) return MakeResult(env, "foreign", ERROR_SUCCESS);
+  // RegDeleteKeyExW refuses a key that has subkeys with ERROR_ACCESS_DENIED, which would be
+  // misreported as a permission problem. Check first and report a plain failure. Other named
+  // values under the key are deleted together with it (the key is ours, by value match).
+  {
+    HKEY key = nullptr;
+    error = OpenFixedKeyReadOnly(&key);
+    if (error != ERROR_SUCCESS) return MakeResult(env, StatusFor(error), error);
+    DWORD subkeys = 0;
+    error = RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, &subkeys, nullptr, nullptr, nullptr,
+                             nullptr, nullptr, nullptr, nullptr);
+    RegCloseKey(key);
+    if (error != ERROR_SUCCESS) return MakeResult(env, StatusFor(error), error);
+    if (subkeys > 0) return MakeResult(env, "failed", ERROR_DIR_NOT_EMPTY);
+  }
   error = RegDeleteKeyExW(HKEY_CURRENT_USER, HostKeyPath(), KEY_WOW64_64KEY, 0);
   if (error == ERROR_FILE_NOT_FOUND) return MakeResult(env, "not-registered", ERROR_SUCCESS);
   if (error != ERROR_SUCCESS) return MakeResult(env, StatusFor(error), error);
@@ -461,24 +522,51 @@ napi_value TestSetRootFn(napi_env env, napi_callback_info info) {
   return MakeString(env, g_testHostKeyPath);
 }
 
-// Seeds a "foreign" default value into the private test key.
+// Seeds the default value of the private test key: (kind, text). kind is one of
+// "sz" | "expand-sz" | "dword" | "binary" | "empty-sz" | "no-default" (key only, no default value).
 napi_value TestSeedValueFn(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value argv[2] = {nullptr, nullptr};
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  std::string kind;
   std::wstring value;
-  if (!HostKeyConfigured() || argc != 1 || !GetString(env, argv[0], &value)) {
-    ThrowError(env, "invalid-argument", "testSeedValue requires testSetRoot first and one string.");
+  if (!HostKeyConfigured() || argc != 2 || !GetUtf8(env, argv[0], &kind) || !GetString(env, argv[1], &value)) {
+    ThrowError(env, "invalid-argument", "testSeedValue requires testSetRoot first and (kind, text).");
     return nullptr;
   }
   HKEY key = nullptr;
   LONG error = RegCreateKeyExW(HKEY_CURRENT_USER, HostKeyPath(), 0, nullptr, REG_OPTION_NON_VOLATILE,
                                KEY_SET_VALUE | KEY_WOW64_64KEY, nullptr, &key, nullptr);
   if (error == ERROR_SUCCESS) {
-    error = RegSetValueExW(key, nullptr, 0, REG_SZ, reinterpret_cast<const BYTE*>(value.c_str()),
-                           static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+    if (kind == "sz" || kind == "expand-sz") {
+      error = RegSetValueExW(key, nullptr, 0, kind == "sz" ? REG_SZ : REG_EXPAND_SZ,
+                             reinterpret_cast<const BYTE*>(value.c_str()),
+                             static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+    } else if (kind == "empty-sz") {
+      const wchar_t terminator = L'\0';
+      error = RegSetValueExW(key, nullptr, 0, REG_SZ, reinterpret_cast<const BYTE*>(&terminator), sizeof terminator);
+    } else if (kind == "dword") {
+      const DWORD one = 1;
+      error = RegSetValueExW(key, nullptr, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&one), sizeof one);
+    } else if (kind == "binary") {
+      const BYTE bytes[2] = {1, 2};
+      error = RegSetValueExW(key, nullptr, 0, REG_BINARY, bytes, sizeof bytes);
+    } else if (kind != "no-default") {
+      error = ERROR_INVALID_PARAMETER;
+    }
     RegCloseKey(key);
   }
+  return MakeResult(env, error == ERROR_SUCCESS ? "ok" : "failed", error);
+}
+
+// Adds a child subkey under the private test key (to test the has-subkeys unregister path).
+napi_value TestSeedSubkeyFn(napi_env env, napi_callback_info) {
+  if (!HostKeyConfigured()) return MakeResult(env, "failed", ERROR_NOT_READY);
+  const std::wstring child = std::wstring(HostKeyPath()) + L"\\child";
+  HKEY key = nullptr;
+  const LONG error = RegCreateKeyExW(HKEY_CURRENT_USER, child.c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
+                                     KEY_SET_VALUE | KEY_WOW64_64KEY, nullptr, &key, nullptr);
+  if (error == ERROR_SUCCESS) RegCloseKey(key);
   return MakeResult(env, error == ERROR_SUCCESS ? "ok" : "failed", error);
 }
 
@@ -501,12 +589,14 @@ napi_value Init(napi_env env, napi_value exports) {
       {"getKnownFolderPath", nullptr, GetKnownFolderPathFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"readRegistryValue", nullptr, ReadRegistryValueFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"readRegistryValueNames", nullptr, ReadRegistryValueNamesFn, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"inspectCollectorHostRegistration", nullptr, InspectCollectorHostRegistrationFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"registerCollectorHost", nullptr, RegisterCollectorHostFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"unregisterCollectorHost", nullptr, UnregisterCollectorHostFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"replaceForeignCollectorHostRegistration", nullptr, ReplaceForeignCollectorHostRegistrationFn, nullptr, nullptr, nullptr, napi_default, nullptr},
 #ifdef MAGINALIA_WI_TEST_SEAM
       {"testSetRoot", nullptr, TestSetRootFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"testSeedValue", nullptr, TestSeedValueFn, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"testSeedSubkey", nullptr, TestSeedSubkeyFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"testCleanup", nullptr, TestCleanupFn, nullptr, nullptr, nullptr, napi_default, nullptr},
 #endif
   };
