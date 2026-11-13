@@ -43,21 +43,46 @@ remain manual acceptance steps.
 
 ## Upgrade over α1
 
-Statically compared with tag `v0.1.0-alpha.1`. These are unchanged:
+Release name: "MAGINALIA α2 wild berry" (Desktop version 0.2.0). Statically
+compared with tag `v0.1.0-alpha.1`. These are unchanged:
 
-- `appId` `org.maginalia.desktop.alpha1`;
-- `productName` and shortcut name `MAGINALIA desktop α1`;
-- `nsis.perMachine: false` and `deleteAppDataOnUninstall: false`;
-- the staged app manifest name (`@maginalia/desktop`);
-- `application-identity.ts`, which pins the profile Electron selected before
-  `setName`;
+- `appId` `org.maginalia.desktop.alpha1`. electron-builder derives `APP_GUID`
+  (`8ba6d801-d7a1-5c90-8a01-7a051a834c58`) and the NSIS install and uninstall
+  registry keys from it; the generated value is identical for α1 and α2;
+- `nsis.perMachine: false`, `deleteAppDataOnUninstall: false` and
+  `allowToChangeInstallationDirectory: false`;
+- the staged app manifest name (`@maginalia/desktop`), which decides the
+  packaged default userData directory (`%APPDATA%\Electron`);
+- `establishApplicationIdentity`, which captures the profile Electron selected
+  before `setName` and pins it afterwards, so the display-name change cannot
+  move userData (`application-identity.test.ts` pins this);
 - electron-builder 26.15.3 and Electron 44.3.0.
 
-An install over α1 therefore resolves the same userData directory and keeps
-it. The packaged default userData comes from the staged manifest `name` (see
-below), so that name must not change. `appId` and `productName` also drive
-the NSIS install identity, the install directory, the executable name and the
-shortcut. Keep both unchanged for an in-place upgrade over α1.
+These change with the release name: `productName` and `shortcutName`
+(`MAGINALIA α2 wild berry`), the executable name derived from `productName`
+(`MAGINALIA α2 wild berry.exe`) and the version.
+
+### Install directory and shortcuts (static analysis, installer not run)
+
+- A fresh install goes to `%LOCALAPPDATA%\Programs\<productName>`. An upgrade
+  over α1 does not: the NSIS template reads `InstallLocation` from the
+  `APP_GUID` registry key and reuses it, so α2 installs into the existing
+  α1 folder (`...\Programs\MAGINALIA desktop α1`). The folder name therefore
+  stays α1 after an upgrade, which is cosmetic.
+- electron-builder runs the α1 uninstaller first (`--updated`, user data is
+  kept). Because the executable name changes, `--keep-shortcuts` is not passed,
+  so the α1 uninstaller deletes the α1 Start Menu shortcut and the installer
+  creates the new one.
+- The α1 uninstaller does not remove the optional Desktop shortcut (it is
+  created by `installer-shortcut.nsh`). `installer-shortcut.nsh` therefore
+  deletes `MAGINALIA desktop α1.lnk` on the Desktop only when its target is
+  `<INSTDIR>\MAGINALIA desktop α1.exe`, checked with Windows PowerShell and
+  `WScript.Shell`, and then creates `MAGINALIA α2 wild berry.lnk`. If the target
+  differs or the check fails, nothing is deleted.
+- Not verified on a machine: the above is derived from the electron-builder
+  template and from compiling both α1 and α2 installers (stubbed payload) and
+  comparing the generated defines. The PowerShell fragment was run on its own
+  against a temporary shortcut.
 
 ## Local verification record (2026-11-13)
 
@@ -68,7 +93,7 @@ with Node 24.14.0, electron-builder 26.15.3 and Electron 44.3.0. The build ran
 | Item | Value |
 | --- | --- |
 | Installer | `MAGINALIA-desktop-0.1.0-Setup.exe`, 412,333,681 bytes, SHA-256 `607ef07bf7491ff4cf0535b710eb3730a0040bfa72524e6720db6179cc1a6e30` |
-| Version | `0.1.0`, unchanged; the α2 version number awaits an owner decision |
+| Version | `0.1.0` at the time of this record; the α2 release is now 0.2.0 |
 | Addon | `shelf_mutex.node`, 157,184 bytes, SHA-256 `74701bdb8759628b2f2a5e3a9d84050344eea4af57ee9ab12050b77d5e68f431`, N-API 8, `/MT`, no VC++ runtime imports |
 | `verify-packaged-shelf-mutex` on the `win-unpacked` tree NSIS wrapped | PASS: packaged mode, single candidate `shelf-mutex\shelf_mutex.node`, acquire and release OK under ELECTRON_RUN_AS_NODE (Electron 44.3.0, Node 24.20.0) |
 | `e2e-isolation-smoke` against the packaged `win-unpacked` executable | PASS 4/4 (see `desktop-e2e-isolation.md`) |

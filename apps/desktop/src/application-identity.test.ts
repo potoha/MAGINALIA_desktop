@@ -1,12 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { establishApplicationIdentity, MAGINALIA_APPLICATION_NAME } from "./application-identity";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 describe("Electron application identity", () => {
-  it("uses the branded desktop α1 name", () => {
-    expect(MAGINALIA_APPLICATION_NAME).toBe("MAGINALIA desktop α1");
+  it("uses the branded α2 wild berry name", () => {
+    expect(MAGINALIA_APPLICATION_NAME).toBe("MAGINALIA α2 wild berry");
   });
 
   it("sets a stable product name before stores are resolved and retains the existing profile path", () => {
@@ -51,5 +51,45 @@ describe("Electron application identity", () => {
     } finally {
       rmSync(profileParent, { recursive: true, force: true });
     }
+  });
+
+  it("keeps the α1 userData directory when the application name changes, even if Electron derives defaults from the name", () => {
+    const profileParent = mkdtempSync(join(tmpdir(), "maginalia-pin-profile-"));
+    const roaming = join(profileParent, "Roaming");
+    const alpha1UserData = join(roaming, "Electron");
+    let name = "Electron";
+    let override: string | undefined;
+    const application = {
+      getName: () => name,
+      // Electron's default userData is <appData>/<name> until it is overridden.
+      getPath: (_key: "userData") => override ?? join(roaming, name),
+      setName: (next: string) => { name = next; },
+      setPath: (_key: "userData", next: string) => { override = next; },
+    };
+    try {
+      const identity = establishApplicationIdentity(application);
+      expect(identity.applicationName).toBe("MAGINALIA α2 wild berry");
+      expect(identity.userDataPath).toBe(alpha1UserData);
+      expect(join(roaming, "MAGINALIA α2 wild berry")).not.toBe(alpha1UserData);
+    } finally {
+      rmSync(profileParent, { recursive: true, force: true });
+    }
+  });
+
+  it("pins the installer identity and staged manifest name that userData and upgrades derive from", () => {
+    const desktopRoot = resolve(import.meta.dirname, "..");
+    const builder = JSON.parse(readFileSync(join(desktopRoot, "packaging", "electron-builder.json"), "utf8")) as {
+      appId: string;
+      nsis: { perMachine: boolean; deleteAppDataOnUninstall: boolean; allowToChangeInstallationDirectory: boolean };
+    };
+    const stageScript = readFileSync(join(desktopRoot, "scripts", "stage-windows-app.mjs"), "utf8");
+    const desktopPackage = JSON.parse(readFileSync(join(desktopRoot, "package.json"), "utf8")) as { name: string };
+
+    expect(builder.appId).toBe("org.maginalia.desktop.alpha1");
+    expect(builder.nsis).toMatchObject({ perMachine: false, deleteAppDataOnUninstall: false, allowToChangeInstallationDirectory: false });
+    // The packaged default userData (%APPDATA%\Electron) is derived from the staged manifest name.
+    expect(desktopPackage.name).toBe("@maginalia/desktop");
+    expect(stageScript).toContain("name: desktopPackage.name");
+    expect(stageScript).not.toContain("productName");
   });
 });

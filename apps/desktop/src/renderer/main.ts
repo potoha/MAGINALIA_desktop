@@ -153,7 +153,7 @@ app.innerHTML = `
     <header class="toolbar" id="workbench-toolbar">
       <div class="brand">
         <img class="brand-wordmark" src="${brandHeaderUrl}" alt="" aria-hidden="true">
-        <h1 id="title" class="visually-hidden">MAGINALIA desktop α1 — Before Kaldi</h1>
+        <h1 id="title" class="visually-hidden">MAGINALIA α2 wild berry</h1>
       </div>
       <button id="workdesk-home" class="workbench-home-action" data-workbench-command="maginalia.workdesk.return" type="button" title="Return to your Workdesk" aria-label="Back to Workdesk" aria-pressed="false" disabled>← Workdesk</button>
     </header>
@@ -459,7 +459,7 @@ if (firstRunMode) {
   setup.style.setProperty("--brand-marker-image", `url("${brandMarkerUrl}")`);
   setup.innerHTML = `
     <div class="first-run-card">
-      <img class="first-run-wordmark" src="${brandHeaderUrl}" alt="MAGINALIA — Before Kaldi">
+      <img class="first-run-wordmark" src="${brandHeaderUrl}" alt="MAGINALIA α2 wild berry">
       <h1 id="first-run-title" tabindex="-1">MAGINALIAを使う準備</h1>
       <p class="first-run-intro">作業場所と引用棚を確認します。選んだ場所にあるファイルや記録は、上書きしません。</p>
       <form id="first-run-form">
