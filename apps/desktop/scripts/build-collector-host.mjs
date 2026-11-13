@@ -31,6 +31,8 @@ const stage = path.join(output, "stage");
 const payload = path.join(output, "payload");
 
 export const HOST_VERSION = "0.1.0";
+/** Version reported by `host_info` (injected into the bundle); matches Desktop 0.2.0. */
+const PAYLOAD_VERSION = "0.2.0";
 export const HOST_NAME = "org.maginalia.collector";
 export const EXECUTABLE = "MAGINALIA-Collector-Host.exe";
 export const ADDON = "shelf_mutex.node";
@@ -87,6 +89,8 @@ export async function bundle(entry, fileName) {
     root: desktop,
     logLevel: "warn",
     plugins: [inlineFormatSchemas()],
+    // The payload version is the Host version that `host_info` reports.
+    define: { __COLLECTOR_HOST_VERSION__: JSON.stringify(PAYLOAD_VERSION) },
     resolve: { alias: { "@maginalia/writing-core": path.join(repository, "packages", "writing-core", "src", "index.ts") } },
     ssr: { noExternal: true, target: "node" },
     build: {

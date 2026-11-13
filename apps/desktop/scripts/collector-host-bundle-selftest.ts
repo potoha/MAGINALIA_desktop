@@ -12,7 +12,7 @@ import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node
 import os from "node:os";
 import * as path from "node:path";
 import { validateShelfEntity } from "@maginalia/format";
-import { COLLECTOR_ALLOWED_ORIGIN, handleCollectorProductRequest } from "../src/collector-native-host-product";
+import { COLLECTOR_ALLOWED_ORIGINS, handleCollectorProductRequest } from "../src/collector-native-host-product";
 import { readCollectorShelfConfiguration } from "../src/collector-shelf-configuration";
 import { createShelfBindingFromConfirmedSelection, persistShelfBinding } from "../src/shelf-binding";
 import { createShelfBindingFileStore, resolveShelfBindingStoragePaths } from "../src/shelf-binding-store";
@@ -52,12 +52,12 @@ async function main(): Promise<void> {
       readConfiguration: () => readCollectorShelfConfiguration({ resolveLocalAppDataPath: () => localAppData, inspectPathSecurity: inspectNativePathSecurity }),
       writeQuote: commitShelfQuoteWithNativeLock,
     };
-    const shelfStatus = await handleCollectorProductRequest({ protocol, operation: "configured_shelf" }, COLLECTOR_ALLOWED_ORIGIN, dependencies);
+    const shelfStatus = await handleCollectorProductRequest({ protocol, operation: "configured_shelf" }, COLLECTOR_ALLOWED_ORIGINS[0], dependencies);
     check(shelfStatus.ok === true, `configured_shelf ${JSON.stringify(shelfStatus)}`);
     const save = { protocol, operation: "save_web_quote", requestId: "00000000-0000-4000-8000-0000000000f1", quote: "Bundle self-test quotation", url: "https://example.com/", getDate: "202611130000", title: "Self-test" };
-    const first = await handleCollectorProductRequest(save, COLLECTOR_ALLOWED_ORIGIN, dependencies);
+    const first = await handleCollectorProductRequest(save, COLLECTOR_ALLOWED_ORIGINS[0], dependencies);
     check(first.ok === true && (first.receipt as { state?: string }).state === "committed", `first save ${JSON.stringify(first)}`);
-    const again = await handleCollectorProductRequest(save, COLLECTOR_ALLOWED_ORIGIN, dependencies);
+    const again = await handleCollectorProductRequest(save, COLLECTOR_ALLOWED_ORIGINS[0], dependencies);
     check(again.ok === true && (again.receipt as { state?: string }).state === "already-committed", "idempotent resend");
     const annotations = await readdir(path.join(shelf, "annotations"));
     check(annotations.length === 1, "one annotation");

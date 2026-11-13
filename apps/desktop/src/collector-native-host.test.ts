@@ -64,6 +64,9 @@ describe("experimental request validation", () => {
         .toMatchObject({ ok: true, operations: ["health", "configured_shelf"], writesEnabled: false });
       expect(await handleExperimentalRequest(request, file, origin, { MAGINALIA_COLLECTOR_TEST_ONLY: "1" }, writer))
         .toMatchObject({ ok: false, error: "unsupported_operation" });
+      // host_info and its contact record exist only in the production Host.
+      expect(await handleExperimentalRequest({ protocol, operation: "host_info", extensionVersion: "0.3.0" }, file, origin, { MAGINALIA_COLLECTOR_TEST_ONLY: "1" }, writer))
+        .toEqual({ protocol, ok: false, error: "unsupported_operation" });
     } finally { await rm(temp, { recursive: true, force: true }); }
   });
 

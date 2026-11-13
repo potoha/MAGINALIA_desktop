@@ -82,7 +82,7 @@ try {
     assert.equal(values.length, 3);
     assert.equal(values[0].ok, true);
     if (!bound) {
-      assert.deepEqual(values[0], { protocol, ok: true, experimental: true, operations: ["health", "configured_shelf"], writesEnabled: false });
+      assert.deepEqual(values[0], { protocol, ok: true, experimental: true, operations: ["health", "configured_shelf", "host_info"], writesEnabled: false });
       assert.deepEqual(values[1], { protocol, ok: false, error: "shelf_unconfigured" });
       assert.deepEqual(values[2], { protocol, ok: false, error: "shelf_unconfigured" });
     }
@@ -105,7 +105,7 @@ try {
     await copyFile(executable, copy);
     const values = await run([origin], [frame({ protocol, operation: "health" }), frame({ protocol, operation: "configured_shelf" })], process.env, copy);
     assert.deepEqual(values, [
-      { protocol, ok: true, experimental: true, operations: ["health", "configured_shelf"], writesEnabled: false },
+      { protocol, ok: true, experimental: true, operations: ["health", "configured_shelf", "host_info"], writesEnabled: false },
       { protocol, ok: false, error: "configuration_unavailable" }
     ]);
   });

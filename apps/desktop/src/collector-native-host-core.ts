@@ -8,7 +8,7 @@
  *   variables, cwd or descriptor files.
  *
  * The protocol is `maginalia.collector.experimental.v1`, with operations `health`,
- * `configured_shelf` and `save_web_quote`. Requests are limited to 64 KiB and
+ * `configured_shelf`, `save_web_quote` and (production Host only) `host_info`. Requests are limited to 64 KiB and
  * responses to 1 MiB. stdout carries only length-prefixed frames, and nothing here
  * writes diagnostics.
  */
@@ -35,22 +35,52 @@ export function protocolError(code: string): RecordValue {
   return { protocol: COLLECTOR_PROTOCOL, ok: false, error: code };
 }
 
+declare const __COLLECTOR_HOST_VERSION__: string | undefined;
+
+/**
+ * Host version reported by `host_info` and the contact record. The Host SEA build
+ * (`scripts/build-collector-host.mjs`) replaces `__COLLECTOR_HOST_VERSION__` with the
+ * payload version at bundle time; every other build uses the default.
+ */
+export const COLLECTOR_HOST_VERSION: string = typeof __COLLECTOR_HOST_VERSION__ === "string"
+  ? __COLLECTOR_HOST_VERSION__
+  : "0.2.0";
+/** Oldest Collector extension version this Host supports (compile-time constant). */
+export const COLLECTOR_MINIMUM_EXTENSION_VERSION = "0.2.0";
+
+/** Strict semver-like `major.minor.patch` with an optional short pre-release; no build metadata. */
+export const COLLECTOR_VERSION_PATTERN = /^[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}(?:-[0-9A-Za-z][0-9A-Za-z.-]{0,15})?$/u;
+export const COLLECTOR_VERSION_MAX_LENGTH = 32;
+
+export function isCollectorVersionString(value: unknown): value is string {
+  return typeof value === "string" && value.length <= COLLECTOR_VERSION_MAX_LENGTH && COLLECTOR_VERSION_PATTERN.test(value);
+}
+
 export const COLLECTOR_READ_OPERATIONS = Object.freeze(["health", "configured_shelf"] as const);
 export const COLLECTOR_WRITE_OPERATIONS = Object.freeze(["health", "configured_shelf", "save_web_quote"] as const);
 
-export function healthResponse(writesEnabled: boolean): RecordValue {
+/**
+ * `advertiseHostInfo` is true only for the production Host, the only Host that answers
+ * `host_info`. `host_info` is appended, so the existing prefix of each list is unchanged.
+ */
+export function healthResponse(writesEnabled: boolean, advertiseHostInfo = false): RecordValue {
+  const operations: string[] = writesEnabled ? [...COLLECTOR_WRITE_OPERATIONS] : [...COLLECTOR_READ_OPERATIONS];
+  if (advertiseHostInfo) operations.push("host_info");
+  return { protocol: COLLECTOR_PROTOCOL, ok: true, experimental: true, operations, writesEnabled };
+}
+
+export function hostInfoResponse(): RecordValue {
   return {
     protocol: COLLECTOR_PROTOCOL,
     ok: true,
-    experimental: true,
-    operations: writesEnabled ? [...COLLECTOR_WRITE_OPERATIONS] : [...COLLECTOR_READ_OPERATIONS],
-    writesEnabled,
+    host: { version: COLLECTOR_HOST_VERSION, minimumExtensionVersion: COLLECTOR_MINIMUM_EXTENSION_VERSION },
   };
 }
 
 export type CollectorRequestKind =
   | { readonly kind: "health" }
   | { readonly kind: "configured_shelf" }
+  | { readonly kind: "host_info"; readonly extensionVersion: string }
   | { readonly kind: "save_web_quote"; readonly value: RecordValue }
   | { readonly kind: "error"; readonly response: RecordValue };
 
@@ -64,6 +94,12 @@ export function classifyCollectorRequest(value: unknown): CollectorRequestKind {
   }
   if (value.operation === "health") return { kind: "health" };
   if (value.operation === "configured_shelf") return { kind: "configured_shelf" };
+  if (value.operation === "host_info") {
+    if (!hasExactKeys(value, ["protocol", "operation", "extensionVersion"]) || !isCollectorVersionString(value.extensionVersion)) {
+      return { kind: "error", response: protocolError("invalid_request") };
+    }
+    return { kind: "host_info", extensionVersion: value.extensionVersion };
+  }
   if (value.operation === "save_web_quote") return { kind: "save_web_quote", value };
   return { kind: "error", response: protocolError("unsupported_operation") };
 }
