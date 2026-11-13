@@ -8,6 +8,7 @@
  * `createNativePrivateDirectory` (owner-only protected DACL); tests pass a `mkdir` stand-in.
  */
 import { createHash } from "node:crypto";
+import type { Stats } from "node:fs";
 import { lstat, mkdir, open, readdir, rename, rmdir, unlink } from "node:fs/promises";
 import * as path from "node:path";
 import { createNodeCollectorIntegrationFileSystem } from "./collector-integration-fs.js";
@@ -42,7 +43,7 @@ async function guarded<T>(action: () => Promise<T>): Promise<T> {
   }
 }
 
-async function lstatOrNull(target: string): Promise<Awaited<ReturnType<typeof lstat>> | null> {
+async function lstatOrNull(target: string): Promise<Stats | null> {
   try {
     return await lstat(target);
   } catch (error: unknown) {

@@ -7,16 +7,25 @@
  * passes none explicitly (the child inherits the process environment, as it does from Chrome).
  * The spawn function is injectable so the framing is tested without a real child.
  */
-import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn as nodeSpawn } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
 import { COLLECTOR_PROTOCOL } from "./collector-payload.js";
 import type { HostSelfCheckRequest, HostSelfCheckResult } from "./collector-integration-apply-types.js";
 
 export const HOST_SELF_CHECK_TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
-export type HostSpawn = (executable: string, args: readonly string[]) => ChildProcessWithoutNullStreams;
+/** The slice of a child process the runner uses (a fake in tests). */
+export interface HostChild {
+  readonly stdin: Writable;
+  readonly stdout: Readable;
+  on(event: "error" | "close", listener: () => void): unknown;
+  kill(): unknown;
+}
 
-const defaultSpawn: HostSpawn = (executable, args) => nodeSpawn(executable, [...args], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true, shell: false });
+export type HostSpawn = (executable: string, args: readonly string[]) => HostChild;
+
+const defaultSpawn: HostSpawn = (executable, args) => nodeSpawn(executable, [...args], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true, shell: false }) as unknown as HostChild;
 
 export function encodeHealthFrame(): Buffer {
   const body = Buffer.from(JSON.stringify({ protocol: COLLECTOR_PROTOCOL, operation: "health" }), "utf8");
@@ -54,7 +63,7 @@ export function createNodeHostSelfCheckRunner(options: { readonly spawn?: HostSp
   const timeoutMs = options.timeoutMs ?? HOST_SELF_CHECK_TIMEOUT_MS;
   return (request) => new Promise<HostSelfCheckResult>((resolve) => {
     let settled = false;
-    let child: ChildProcessWithoutNullStreams | undefined;
+    let child: HostChild | undefined;
     const timer = setTimeout(() => finish({ status: "failed" }), timeoutMs);
     const finish = (value: HostSelfCheckResult): void => {
       if (settled) return;

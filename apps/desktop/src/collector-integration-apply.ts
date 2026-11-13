@@ -231,6 +231,27 @@ async function ensureProgramFolder(context: Context): Promise<void> {
   requireSafeDirectory(context, paths.programFolder);
 }
 
+/**
+ * Before the first write: none of our fixed names may be a link. (The inspection reports a
+ * linked directory as "missing", so this closes the gap and keeps the refusal write-free.)
+ */
+async function refuseLinkedNames(context: Context): Promise<void> {
+  const { fileSystem } = context.deps;
+  const { paths } = context;
+  const names = [
+    paths.manifestPath,
+    join(paths.programFolder, COLLECTOR_STATE_FILE_NAME),
+    paths.extensionFolder,
+    join(paths.programFolder, COLLECTOR_EXTENSION_STAGING_NAME),
+    join(paths.programFolder, COLLECTOR_EXTENSION_PREVIOUS_NAME),
+    ...COLLECTOR_HOST_SLOTS.map((slot) => slotFolder(paths, slot)),
+  ];
+  for (const name of names) {
+    const entry = await fileSystem.stat(name);
+    if (entry !== null && entry.isReparsePoint) throw new Abort("reparse-point-found");
+  }
+}
+
 /** `%LOCALAPPDATA%\MAGINALIA\integration`: the Host never creates it (design 4.6). Non-fatal when unsafe. */
 async function ensureIntegrationDirectory(context: Context): Promise<void> {
   const { deps, paths } = context;
@@ -716,6 +737,7 @@ async function converge(
   try {
     await guard(context, initialRegistration, { folderExists: false });
     await ensureProgramFolder(context);
+    await refuseLinkedNames(context);
     wrote = true;
     await ensureIntegrationDirectory(context);
     await guard(context, initialRegistration, { folderExists: true });
@@ -751,7 +773,7 @@ async function converge(
     reason = reasonForError(error);
   }
   if (reason === null) return result(deps, request.action, "applied", null, context.warnings, selfCheck);
-  const refusedBeforeWrite = !wrote && (reason === "e2e-isolation" || reason === "policy-blocked" || reason === "registration-changed" || reason === "program-folder-unsafe" || reason === "inspection-incomplete");
+  const refusedBeforeWrite = !wrote && (reason === "e2e-isolation" || reason === "policy-blocked" || reason === "registration-changed" || reason === "program-folder-unsafe" || reason === "inspection-incomplete" || reason === "reparse-point-found");
   return result(deps, request.action, refusedBeforeWrite ? "refused" : "failed", reason, context.warnings, selfCheck);
 }
 

@@ -553,7 +553,7 @@ describe("Host slots (design 8.3)", () => {
     const fixture = createApplyFixture();
     fixture.fileSystem.addDirectory(p(fixture, "host-a"), { reparse: true });
     const result = await run(fixture, { action: "setup" });
-    expect(result).toMatchObject({ outcome: "failed", reason: "reparse-point-found" });
+    expect(result).toMatchObject({ outcome: "refused", reason: "reparse-point-found" });
     expect(writesTo(fixture).filter((entry) => entry.includes("host-a"))).toEqual([]);
     expect(fixture.fileSystem.has(p(fixture, "org.maginalia.collector.json"))).toBe(false);
   });
@@ -769,7 +769,7 @@ describe("extension folder (design 4.5, 6.4)", () => {
     const fixture = await outdated(createApplyFixture());
     fixture.fileSystem.addDirectory(p(fixture, "extension.next"), { reparse: true });
     const result = await run(fixture, { action: "refresh" });
-    expect(result).toMatchObject({ outcome: "failed", reason: "reparse-point-found" });
+    expect(result).toMatchObject({ outcome: "refused", reason: "reparse-point-found" });
   });
 
   it("a locked extension.prev after a successful swap is a warning", async () => {
