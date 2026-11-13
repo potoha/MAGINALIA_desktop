@@ -80,7 +80,7 @@ function inlineFormatSchemas() {
   };
 }
 
-async function bundle(entry, fileName) {
+export async function bundle(entry, fileName) {
   const { build } = await import("vite");
   await build({
     configFile: false,
@@ -152,8 +152,89 @@ async function nsis() {
   return toolset.getMakeNsisPath(null);
 }
 
+/**
+ * The SEA embeds the exact Node.js build that runs this script, so its authoritative
+ * LICENSE (shipped next to node.exe in the official distribution) must ship too.
+ * There is deliberately no fallback or download.
+ */
+export function nodeLicensePath() {
+  return path.join(path.dirname(process.execPath), "LICENSE");
+}
+
+async function readNodeLicense() {
+  try {
+    return await readFile(nodeLicensePath());
+  } catch {
+    throw new Error(
+      `The Node.js LICENSE of the building runtime was not found at ${nodeLicensePath()}. `
+      + "Build with a Node.js distribution that ships LICENSE next to node.exe (for example the official win-x64 zip).",
+    );
+  }
+}
+
+const LICENSE_FILE_NAMES = ["LICENSE", "LICENSE.md", "LICENSE.txt", "LICENCE", "LICENCE.md", "license", "license.md"];
+
+/**
+ * npm packages compiled into the bundle, from the bundler's `//#region` source
+ * markers. Workspace packages (`packages/*`) are this repository's own code and are
+ * covered by its LICENSE. Each package must declare a license and ship a license file.
+ */
+export async function collectBundledPackageLicenses(bundleFile) {
+  const code = await readFile(bundleFile, "utf8");
+  const roots = new Set();
+  for (const match of code.matchAll(/^\/\/#region (.+)$/gmu)) {
+    const source = match[1].trim().replace(/\\/gu, "/");
+    const marker = source.lastIndexOf("node_modules/");
+    if (marker < 0) continue;
+    const rest = source.slice(marker + "node_modules/".length).split("/");
+    const name = rest[0].startsWith("@") ? `${rest[0]}/${rest[1]}` : rest[0];
+    roots.add(path.resolve(desktop, source.slice(0, marker + "node_modules/".length), name));
+  }
+  const packages = [];
+  for (const root of [...roots].sort()) {
+    const manifest = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+    let licenseText;
+    for (const candidate of LICENSE_FILE_NAMES) {
+      licenseText = await readFile(path.join(root, candidate), "utf8").catch(() => undefined);
+      if (licenseText !== undefined) break;
+    }
+    if (typeof manifest.license !== "string" || licenseText === undefined) {
+      throw new Error(`Bundled package ${manifest.name} has no declared license or license file.`);
+    }
+    packages.push({ name: manifest.name, version: manifest.version, license: manifest.license, text: licenseText.replace(/\r\n/gu, "\n").trim() });
+  }
+  const unique = new Map(packages.map((entry) => [`${entry.name}@${entry.version}`, entry]));
+  return [...unique.values()].sort((a, b) => a.name.localeCompare(b.name, "en"));
+}
+
+async function writeNotice(nodeLicenseSha256, bundled) {
+  const base = (await readFile(path.join(repository, "NOTICE"), "utf8")).replace(/\r\n/gu, "\n").trimEnd();
+  const sections = [
+    base,
+    "",
+    "=".repeat(78),
+    "Third-party components included in MAGINALIA Collector Host",
+    "=".repeat(78),
+    "",
+    `Node.js ${process.version} (win-${process.arch}) is embedded in MAGINALIA-Collector-Host.exe`,
+    "as a single executable application. Its license, including the licenses of the",
+    "third-party components bundled with Node.js, is in NODE-LICENSE.txt",
+    `(SHA-256 ${nodeLicenseSha256}).`,
+    "",
+    "The following npm packages are compiled into MAGINALIA-Collector-Host.exe:",
+    "",
+    ...bundled.map((entry) => `- ${entry.name} ${entry.version} (${entry.license})`),
+  ];
+  for (const entry of bundled) {
+    sections.push("", "-".repeat(78), `${entry.name} ${entry.version} - ${entry.license}`, "-".repeat(78), "", entry.text);
+  }
+  await writeFile(path.join(payload, "NOTICE.txt"), `${sections.join("\n")}\n`);
+}
+
 async function main() {
   if (process.platform !== "win32" || process.arch !== "x64") throw new Error("The Collector Host is built on Windows x64 only.");
+  const nodeLicense = await readNodeLicense();
+  const nodeLicenseSha256 = sha256(nodeLicense);
   for (const required of [
     path.join(repository, "packages", "format", "dist", "index.js"),
     path.join(repository, "packages", "repository-core", "dist", "index.js"),
@@ -184,7 +265,9 @@ async function main() {
     allowed_origins: [origin],
   }, null, 2)}\n`);
   await copyFile(path.join(repository, "LICENSE"), path.join(payload, "LICENSE.txt"));
-  await copyFile(path.join(repository, "NOTICE"), path.join(payload, "NOTICE.txt"));
+  await writeFile(path.join(payload, "NODE-LICENSE.txt"), nodeLicense);
+  const bundled = await collectBundledPackageLicenses(bundleFile);
+  await writeNotice(nodeLicenseSha256, bundled);
 
   const makensis = await nsis();
   const nsisVersion = run(makensis.path, ["/VERSION"], { env: { ...process.env, ...(makensis.env ?? {}) } });
@@ -201,6 +284,8 @@ async function main() {
     `built at: ${new Date().toISOString()}`,
     `node (SEA base, ${process.arch}): ${process.version}`,
     `n-api: ${process.versions.napi}; v8: ${process.versions.v8}`,
+    `node license: NODE-LICENSE.txt = LICENSE next to the building node.exe (${process.version}), SHA-256 ${nodeLicenseSha256}`,
+    `bundled npm packages: ${bundled.map((entry) => `${entry.name}@${entry.version} (${entry.license})`).join(", ")}`,
     `postject: ${require("postject/package.json").version}`,
     `vite: ${require("vite/package.json").version}`,
     `node-gyp: ${require("node-gyp/package.json").version}`,
@@ -229,4 +314,4 @@ async function main() {
   process.stdout.write(`${sums.join("\n")}\n`);
 }
 
-await main();
+if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();
