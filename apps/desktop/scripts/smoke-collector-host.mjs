@@ -74,12 +74,19 @@ const check = async (name, body) => { await body(); results.push(`PASS ${name}`)
 try {
   await check("health/configured_shelf/save fail closed without a binding (chunked frames)", async () => {
     const health = frame({ protocol, operation: "health" });
-    const values = await run([origin, "--parent-window=0"], [
+    // The product Host cannot be redirected, so with a Desktop-written binding present a
+    // `save_web_quote` request would WRITE into the bound Shelf (and its journal under the
+    // real %LOCALAPPDATA%\MAGINALIA). Only send it when there is no binding (fail-closed
+    // check); otherwise stay read-only.
+    const requests = [
       health.subarray(0, 2), health.subarray(2),
-      frame({ protocol, operation: "configured_shelf" }),
-      frame({ protocol, operation: "save_web_quote", requestId: "00000000-0000-4000-8000-0000000000e1", quote: "smoke", url: "https://example.com/", getDate: "202611130000" })
-    ]);
-    assert.equal(values.length, 3);
+      frame({ protocol, operation: "configured_shelf" })
+    ];
+    if (!bound) {
+      requests.push(frame({ protocol, operation: "save_web_quote", requestId: "00000000-0000-4000-8000-0000000000e1", quote: "smoke", url: "https://example.com/", getDate: "202611130000" }));
+    }
+    const values = await run([origin, "--parent-window=0"], requests);
+    assert.equal(values.length, bound ? 2 : 3);
     assert.equal(values[0].ok, true);
     if (!bound) {
       assert.deepEqual(values[0], { protocol, ok: true, experimental: true, operations: ["health", "configured_shelf"], writesEnabled: false });
