@@ -3,14 +3,15 @@
  *
  * Desktop #86 design memo, sections 1 to 4:
  *
- * - The caller is authorized only when Chrome's caller-origin argument equals the
- *   compiled constant {@link COLLECTOR_ALLOWED_ORIGIN} exactly.
+ * - The caller is authorized only when Chrome's caller-origin argument is
+ *   exactly a member of the compiled list {@link COLLECTOR_ALLOWED_ORIGINS}.
  * - The configuration is the Desktop-written #87 Shelf binding, read through
  *   `readCollectorShelfConfiguration`. Paths come only from the native LocalAppData
  *   known folder. This entry reads no environment variable, cwd or descriptor file;
  *   it has no test gate and no recovery probe (those stay in `collector-native-host.ts`).
- * - The protocol is unchanged (`maginalia.collector.experimental.v1`: `health`,
- *   `configured_shelf`, `save_web_quote`) and uses the shared core.
+ * - The protocol is `maginalia.collector.experimental.v1` (`health`, `configured_shelf`,
+ *   `save_web_quote`, and the additive `host_info`, which also records the fixed,
+ *   data-free contact record in `collector-contact-record.ts`) and uses the shared core.
  *   `health.writesEnabled` and the advertised `save_web_quote` operation are present
  *   only while the binding is fully valid.
  * - Writes go through the unchanged `commitShelfQuoteWithNativeLock` (D071 mutex,
@@ -20,11 +21,14 @@
  * - Responses carry no paths, quote text or diagnostics. Nothing is logged, and
  *   stdout carries frames only.
  */
+import { createCollectorContactRecorder, type CollectorContactRecorder } from "./collector-contact-record.js";
 import { readCollectorShelfConfiguration, type CollectorShelfConfigurationResult } from "./collector-shelf-configuration.js";
 import {
+  COLLECTOR_HOST_VERSION,
   COLLECTOR_PROTOCOL,
   classifyCollectorRequest,
   healthResponse,
+  hostInfoResponse,
   isValidSaveWebQuoteRequest,
   optionalQuoteFields,
   protocolError,
@@ -45,16 +49,25 @@ import {
 export const COLLECTOR_HOST_NAME = "org.maginalia.collector";
 /** Fixed Collector extension ID, derived from the public key committed to its manifest. */
 export const COLLECTOR_EXTENSION_ID = "blgmoddncpknfnikdfnjelmdmphfgknf";
-export const COLLECTOR_ALLOWED_ORIGIN = `chrome-extension://${COLLECTOR_EXTENSION_ID}/`;
+/**
+ * Compiled list of allowed caller origins (exact membership, no normalization). A Web
+ * Store ID is added here later; the manifest generator uses the same list. No
+ * environment, cwd or descriptor input reaches it.
+ */
+export const COLLECTOR_ALLOWED_ORIGINS = Object.freeze([
+  `chrome-extension://${COLLECTOR_EXTENSION_ID}/`,
+] as const);
 
 export interface CollectorProductHostDependencies {
   readonly readConfiguration: () => Promise<CollectorShelfConfigurationResult>;
   readonly writeQuote: typeof commitShelfQuoteWithNativeLock;
+  /** Best-effort contact record for `host_info`; absent in tests that do not exercise it. */
+  readonly recordContact?: CollectorContactRecorder;
 }
 
 /** Exact comparison only: no prefix, case folding or trailing-slash normalization. */
 export function isAllowedCollectorOrigin(origin: unknown): boolean {
-  return typeof origin === "string" && origin === COLLECTOR_ALLOWED_ORIGIN;
+  return typeof origin === "string" && COLLECTOR_ALLOWED_ORIGINS.some((allowed) => allowed === origin);
 }
 
 function isMutexBusy(error: unknown): boolean {
@@ -108,7 +121,19 @@ export async function handleCollectorProductRequest(
   const request = classifyCollectorRequest(value);
   if (request.kind === "error") return request.response;
   if (request.kind === "health") {
-    return healthResponse((await dependencies.readConfiguration()).kind === "valid");
+    return healthResponse((await dependencies.readConfiguration()).kind === "valid", true);
+  }
+  if (request.kind === "host_info") {
+    try {
+      await dependencies.recordContact?.({
+        protocol: COLLECTOR_PROTOCOL,
+        hostVersion: COLLECTOR_HOST_VERSION,
+        extensionVersion: request.extensionVersion,
+      });
+    } catch {
+      // The contact record is best-effort and never changes the response.
+    }
+    return hostInfoResponse();
   }
   if (request.kind === "configured_shelf") {
     const configuration = await dependencies.readConfiguration();
@@ -130,6 +155,10 @@ export function createCollectorProductHostDependencies(): CollectorProductHostDe
       inspectPathSecurity: inspectNativePathSecurity,
     }),
     writeQuote: commitShelfQuoteWithNativeLock,
+    recordContact: createCollectorContactRecorder({
+      resolveLocalAppDataPath: getNativeLocalAppDataPath,
+      inspectPathSecurity: inspectNativePathSecurity,
+    }),
   });
 }
 
