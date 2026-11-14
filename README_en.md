@@ -94,7 +94,7 @@ Historical implementation and design sources include `potoha/MAGINALIA_IDE`, `po
 
 - MAGINALIA 0.2.0 and later: [GNU Affero General Public License v3.0 or later](LICENSE) (AGPL-3.0-or-later).
 - MAGINALIA 0.1.x and earlier: MIT License ([LICENSE-MIT-0.1.txt](LICENSE-MIT-0.1.txt)). The license of 0.1.x does not change.
-- The copyright holder may offer a separate commercial license to organizations that cannot use the software under the AGPL terms. Contact: <contact email>
+- The copyright holder may offer a separate commercial license to organizations that cannot use the software under the AGPL terms. Contact: [GitHub Issues](https://github.com/potoha/MAGINALIA_desktop/issues)
 - See [TRADEMARKS.md](TRADEMARKS.md) for how the "MAGINALIA" name and logo may be used.
 - If you would like to contribute, please read [CONTRIBUTING.md](CONTRIBUTING.md).
 

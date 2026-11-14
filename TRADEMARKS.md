@@ -26,7 +26,7 @@ AGPL-3.0-or-later はソフトウェアの著作権についてのライセン�
 
 ## 許可の相談
 
-<連絡先メール> へご連絡ください。
+[GitHub Issues](https://github.com/potoha/MAGINALIA_desktop/issues) へご連絡ください。
 
 ---
 
@@ -38,4 +38,4 @@ The AGPL-3.0-or-later license covers the software's copyright and does not grant
 - No permission needed: redistributing unmodified official builds under the official name; accurate factual references (e.g. "compatible with MAGINALIA", "a fork of MAGINALIA"); reviews, articles, papers, and teaching.
 - Permission needed: using the marks as the name, domain, or logo of a modified version, a fork, or a service; implying official status, affiliation, or endorsement; using the marks as brand for paid support, hosting, or training services.
 - If you publish a modified version or fork, give it a different name and logo. Attribution such as "Based on MAGINALIA" is welcome.
-- Contact: <contact email>
+- Contact: [GitHub Issues](https://github.com/potoha/MAGINALIA_desktop/issues)
