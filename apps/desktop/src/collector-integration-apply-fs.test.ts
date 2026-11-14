@@ -218,13 +218,13 @@ describe("end to end on a temp root (real files, fake registry)", () => {
     await writeFile(path.join(f.programFolder, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME), "tampered");
     expect((await apply(f, { action: "repair" })).state).toBe("ready");
     expect(await readFile(path.join(f.programFolder, "host-b", COLLECTOR_HOST_EXECUTABLE_NAME), "utf8")).toBe("host-executable-bytes");
-    expect(await exists(path.join(f.programFolder, "host-a"))).toBe(false);
+    expect(await exists(path.join(f.programFolder, "host-a"))).toBe(true); // the previous slot stays until the next update (design 6.3)
 
     await writeFile(path.join(f.hostSource, COLLECTOR_HOST_EXECUTABLE_NAME), "host-executable-bytes-v2");
     f.payload = applyDescriptor({ payloadId: "1.3.0+def5678", hostVersion: "1.3.0", host: { ...HOST_SOURCE_FILES, [COLLECTOR_HOST_EXECUTABLE_NAME]: "host-executable-bytes-v2" } });
     const refreshed = await apply(f, { action: "refresh" });
     expect(refreshed).toMatchObject({ outcome: "applied", state: "ready" });
-    expect(await exists(path.join(f.programFolder, "host-b"))).toBe(false);
+    expect(await exists(path.join(f.programFolder, "host-b"))).toBe(true);
     expect(await readFile(path.join(f.programFolder, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME), "utf8")).toBe("host-executable-bytes-v2");
 
     const removed = await apply(f, { action: "remove" });

@@ -28,8 +28,8 @@
  *  7. guard re-check (point of no return), then write the manifest (temp + rename) for the new slot
  *  8. registry (setup/repair only), then read back: ownership `ours`
  *  9. `integration-state.json` (temp + rename)
- * 10. prune the previous slot and `extension.prev` (a locked file is a warning, never an error)
- * 11. Host self-check
+ * 10. Host self-check. The previous slot is NOT pruned: it stays complete until the next update
+ *     writes it (design 6.3), so a Chrome that still runs the old Host keeps working.
  *
  * Remove: value-matched unregister first (a foreign value is left alone), then fixed names only:
  * manifest, slots (fixed file names), extension folders, state file, then a non-recursive rmdir.
@@ -56,6 +56,7 @@ import {
   isLocalAbsoluteWindowsPath,
   resolveIntegrationPaths,
   slotFolder,
+  collectorManifestSlot,
   type CollectorHostSlot,
   type IntegrationPaths,
 } from "./collector-integration.js";
@@ -620,21 +621,28 @@ async function result(
   return Object.freeze({ action, outcome, reason, warnings: Object.freeze([...warnings]), state, selfCheck, inspection });
 }
 
-async function chooseTargetSlot(context: Context, first: CollectorIntegrationInspection): Promise<CollectorHostSlot> {
-  let active: CollectorHostSlot | null = first.installed.activeSlot;
-  if (active === null) {
-    // No usable state file: fall back to the slot the manifest on disk points at, if any.
-    try {
-      const read = await context.deps.fileSystem.readSmallFile(context.paths.manifestPath, MAX_MANIFEST_BYTES);
-      if (read.kind === "ok") {
-        const manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(read.bytes)) as { path?: unknown };
-        const match = typeof manifest.path === "string" ? /(?:^|[\\/])host-([ab])[\\/]/iu.exec(manifest.path) : null;
-        if (match !== null) active = (match[1] as string).toLowerCase() as CollectorHostSlot;
-      }
-    } catch {
-      active = null;
-    }
+/** Reads the manifest on disk and returns the slot it points at, or `null` when absent/invalid/unrecognized. */
+async function readManifestSlot(context: Context): Promise<CollectorHostSlot | null> {
+  try {
+    const read = await context.deps.fileSystem.readSmallFile(context.paths.manifestPath, MAX_MANIFEST_BYTES);
+    if (read.kind !== "ok") return null;
+    const manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(read.bytes)) as unknown;
+    return collectorManifestSlot(manifest, context.paths.programFolder);
+  } catch {
+    return null;
   }
+}
+
+/**
+ * The slot to write is always the one the manifest on disk does NOT point at: that is the slot
+ * Chrome runs, and it must stay complete (invariant: registration ours and manifest valid => the
+ * pointed slot is hash-complete at every crash point). The state file is only a fallback for a
+ * missing or invalid manifest, because a crash between the manifest switch and the state write
+ * leaves the state file stale while the manifest is already current.
+ */
+async function chooseTargetSlot(context: Context, first: CollectorIntegrationInspection): Promise<CollectorHostSlot> {
+  const pointed = await readManifestSlot(context);
+  const active: CollectorHostSlot | null = pointed ?? first.installed.activeSlot;
   return active === "a" ? "b" : "a";
 }
 
@@ -644,36 +652,6 @@ async function standaloneLeftover(context: Context): Promise<boolean> {
     return entry !== null && entry.kind === "directory";
   } catch {
     return false;
-  }
-}
-
-async function pruneSlot(context: Context, slot: CollectorHostSlot): Promise<void> {
-  const { fileSystem } = context.deps;
-  const directory = slotFolder(context.paths, slot);
-  try {
-    const entry = await fileSystem.stat(directory);
-    if (entry === null) return;
-    if (entry.isReparsePoint || entry.kind !== "directory") {
-      warn(context, "previous-slot-retained");
-      return;
-    }
-    const children = await fileSystem.listDirectory(directory);
-    let clean = true;
-    for (const child of children ?? []) {
-      if (child.isReparsePoint || child.kind !== "file" || !(SLOT_FIXED_NAMES.includes(child.name) || TEMP_NAME_PATTERN.test(child.name))) {
-        clean = false;
-        continue;
-      }
-      try {
-        await fileSystem.removeFile(join(directory, child.name));
-      } catch {
-        clean = false;
-      }
-    }
-    if (clean) await fileSystem.removeEmptyDirectory(directory);
-    else warn(context, "previous-slot-retained");
-  } catch {
-    warn(context, "previous-slot-retained");
   }
 }
 
@@ -742,7 +720,6 @@ async function converge(
     await ensureIntegrationDirectory(context);
     await guard(context, initialRegistration, { folderExists: true });
     const slot = await chooseTargetSlot(context, first);
-    const previousSlot: CollectorHostSlot = slot === "a" ? "b" : "a";
 
     await writeSlot(context, slot, descriptor);
     await swapExtension(context, descriptor);
@@ -764,7 +741,6 @@ async function converge(
     if (registryStep !== "ok") {
       reason = registryStep;
     } else {
-      await pruneSlot(context, previousSlot);
       if (await standaloneLeftover(context)) warn(context, "standalone-leftover");
       selfCheck = (await runSelfCheck(context, slot, descriptor)) ? "ok" : "failed";
       if (selfCheck === "failed") reason = "self-check-failed";

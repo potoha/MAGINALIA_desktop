@@ -397,6 +397,15 @@ export function expectedHostManifest(slot: CollectorHostSlot): Readonly<Record<s
   });
 }
 
+/**
+ * The slot a generated manifest points at, or `null` when the value is not exactly a manifest this
+ * app generates. This is the authority for "which Host slot does Chrome run" (design 3.5, 6.3).
+ */
+export function collectorManifestSlot(value: unknown, programFolder: string): CollectorHostSlot | null {
+  for (const slot of COLLECTOR_HOST_SLOTS) if (manifestMatches(value, slot, programFolder) === "ok") return slot;
+  return null;
+}
+
 function manifestMatches(value: unknown, slot: CollectorHostSlot, programFolder: string): "ok" | "invalid" | "mismatch" {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return "invalid";
   const record = value as Record<string, unknown>;

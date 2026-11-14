@@ -123,7 +123,6 @@ export type CollectorApplyReason =
 
 export type CollectorApplyWarning =
   | "standalone-leftover"
-  | "previous-slot-retained"
   | "previous-extension-retained"
   | "integration-folder-unsafe"
   | "leftovers-remain"

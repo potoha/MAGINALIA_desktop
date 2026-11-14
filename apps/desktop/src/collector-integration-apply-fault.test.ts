@@ -16,7 +16,8 @@ import type { CollectorApplyRequest, CollectorApplyResult } from "./collector-in
 import { expectedHostManifest, inspectCollectorIntegration, parseIntegrationStateFile } from "./collector-integration";
 import { COLLECTOR_HOST_EXECUTABLE_NAME } from "./collector-payload";
 import { HOST_SOURCE_FILES, SOURCE_EXTENSION_FOLDER, SOURCE_HOST_FOLDER, applyDescriptor, createApplyFixture, extensionSourceFiles, type ApplyFixture } from "./collector-integration-apply.test-helper";
-import { fakeKey } from "./collector-integration.test-helper";
+import { fakeKey, sha256 } from "./collector-integration.test-helper";
+import { COLLECTOR_HOST_ADDON_NAME } from "./collector-payload";
 
 const run = (fixture: ApplyFixture, request: CollectorApplyRequest): Promise<CollectorApplyResult> => applyCollectorIntegration(request, fixture.deps);
 const p = (fixture: ApplyFixture, ...parts: string[]): string => path.win32.join(fixture.programFolder, ...parts);
@@ -52,7 +53,32 @@ function allowedRoots(fixture: ApplyFixture): string[] {
   return [fakeKey(fixture.programFolder), fakeKey(fixture.applicationRoot)];
 }
 
-function assertInvariants(fixture: ApplyFixture, before: Map<string, string>, label: string): void {
+/** Contents a Host file may legitimately have at any point: the packaged bytes of either payload. */
+const HOST_BYTES_ACCEPTABLE = [HOST_SOURCE_FILES[COLLECTOR_HOST_EXECUTABLE_NAME] as string, "host-executable-bytes-v2", HOST_SOURCE_FILES[COLLECTOR_HOST_ADDON_NAME] as string];
+
+/**
+ * Design 6.3 invariant, checked at every crash point: registration is ours AND the manifest on
+ * disk is a valid generated one => the slot it points at holds a complete Host (both files present
+ * and the exact packaged bytes). `tolerated` lists contents that were already there before the
+ * scenario started (for example a tampered file that a repair is meant to fix).
+ */
+function assertPointedSlotComplete(fixture: ApplyFixture, label: string, tolerated: readonly string[] = []): void {
+  if (fixture.registry.registration !== "ours") return;
+  const manifestPath = p(fixture, "org.maginalia.collector.json");
+  if (!fixture.fileSystem.has(manifestPath)) return;
+  const manifest = JSON.parse(fixture.fileSystem.text(manifestPath)) as unknown;
+  const slot = ([["a", expectedHostManifest("a")], ["b", expectedHostManifest("b")]] as const).find(([, expected]) => JSON.stringify(expected) === JSON.stringify(manifest))?.[0];
+  if (slot === undefined) return;
+  const acceptable = new Set([...HOST_BYTES_ACCEPTABLE, ...tolerated].map(sha256));
+  for (const name of [COLLECTOR_HOST_EXECUTABLE_NAME, COLLECTOR_HOST_ADDON_NAME]) {
+    const target = p(fixture, `host-${slot}`, name);
+    expect(fixture.fileSystem.has(target), `${label}: pointed slot ${slot} lacks ${name}`).toBe(true);
+    expect(acceptable.has(sha256(fixture.fileSystem.bytes(target))), `${label}: pointed slot ${slot} holds foreign/partial ${name}`).toBe(true);
+  }
+}
+
+function assertInvariants(fixture: ApplyFixture, before: Map<string, string>, label: string, tolerated: readonly string[] = []): void {
+  assertPointedSlotComplete(fixture, label, tolerated);
   // (b) manifest and state under their final names are always complete and valid
   const manifestPath = p(fixture, "org.maginalia.collector.json");
   if (fixture.fileSystem.has(manifestPath)) {
@@ -211,7 +237,7 @@ describe("crash after each write step of a repair", () => {
       const result = await run(fixture, { action: "repair" });
       const label = `repair crash after mutation ${step}`;
       expect(["applied", "failed", "refused"], label).toContain(result.outcome);
-      assertInvariants(fixture, before, label);
+      assertInvariants(fixture, before, label, ["tampered"]);
       await recover(fixture, label);
     }
   });
@@ -242,6 +268,86 @@ describe("crash after each write step of a repair", () => {
     const fixture = await prepare();
     fixture.fileSystem.crashAfter = fixture.fileSystem.mutationCount + 1000; // never reached
     expect((await run(fixture, { action: "repair", confirmReplaceForeign: true })).outcome).toBe("applied");
+  });
+});
+
+describe("a crash inside the repair that follows a crash (design 6.3 invariant at every point)", () => {
+  const recommended = (state: string): CollectorApplyRequest["action"] | null => ({
+    "not-set-up": "setup",
+    "registration-missing": "repair",
+    damaged: "repair",
+    outdated: "refresh",
+  } as Record<string, CollectorApplyRequest["action"]>)[state] ?? null;
+
+  async function crashed(prepare: () => Promise<ApplyFixture>, request: CollectorApplyRequest, step: number): Promise<ApplyFixture> {
+    const fixture = await prepare();
+    fixture.fileSystem.crashAfter = fixture.fileSystem.mutationCount + step;
+    await run(fixture, request);
+    fixture.fileSystem.crashAfter = null;
+    fixture.fileSystem.failAt = null;
+    return fixture;
+  }
+
+  async function nestedCrashes(prepare: () => Promise<ApplyFixture>, request: CollectorApplyRequest, tolerated: readonly string[] = []): Promise<number> {
+    const total = await countMutations(prepare, request);
+    let exercised = 0;
+    for (let first = 0; first < total; first += 1) {
+      const probe = await crashed(prepare, request, first);
+      assertPointedSlotComplete(probe, `first crash ${first}`, tolerated);
+      const action = recommended((await inspectCollectorIntegration(probe.deps)).state);
+      if (action === null) continue;
+      const before = probe.fileSystem.mutationCount;
+      expect((await run(probe, { action })).outcome, `first crash ${first}: ${action}`).toBe("applied");
+      const repairTotal = probe.fileSystem.mutationCount - before;
+      for (let second = 0; second < repairTotal; second += 1) {
+        const fixture = await crashed(prepare, request, first);
+        const label = `crash ${first} then ${action} crash ${second}`;
+        const snapshot = fixture.fileSystem.snapshot();
+        fixture.fileSystem.crashAfter = fixture.fileSystem.mutationCount + second;
+        await run(fixture, { action });
+        assertInvariants(fixture, snapshot, label, tolerated);
+        await recover(fixture, label);
+        exercised += 1;
+      }
+    }
+    return exercised;
+  }
+
+  it("refresh: crash, then crash again at every step of the repair", async () => {
+    expect(await nestedCrashes(async () => outdated(createApplyFixture()), { action: "refresh" })).toBeGreaterThan(100);
+  }, 120_000);
+
+  it("first setup: crash, then crash again at every step of the recovery", async () => {
+    expect(await nestedCrashes(async () => createApplyFixture(), { action: "setup" })).toBeGreaterThan(100);
+  }, 120_000);
+
+  it("the manifest-switched-but-state-stale window never empties the slot Chrome runs", async () => {
+    const prepare = async (): Promise<ApplyFixture> => {
+      const fixture = await outdated(createApplyFixture());
+      const original = fixture.fileSystem.renameFile.bind(fixture.fileSystem);
+      fixture.fileSystem.renameFile = async (from, to, options) => {
+        await original(from, to, options);
+        if (to.endsWith("org.maginalia.collector.json")) fixture.fileSystem.crashAfter = fixture.fileSystem.mutationCount; // died right after the manifest switch
+      };
+      await run(fixture, { action: "refresh" });
+      fixture.fileSystem.renameFile = original;
+      fixture.fileSystem.crashAfter = null;
+      return fixture;
+    };
+    const baseline = await prepare();
+    expect(JSON.parse(baseline.fileSystem.text(p(baseline, "org.maginalia.collector.json")))).toEqual(expectedHostManifest("b"));
+    expect(parseIntegrationStateFile(baseline.fileSystem.text(p(baseline, "integration-state.json")))?.activeSlot).toBe("a");
+    const probe = await prepare();
+    const before = probe.fileSystem.mutationCount;
+    expect((await run(probe, { action: "repair" })).outcome).toBe("applied");
+    const total = probe.fileSystem.mutationCount - before;
+    for (let step = 0; step < total; step += 1) {
+      const fixture = await prepare();
+      fixture.fileSystem.crashAfter = fixture.fileSystem.mutationCount + step;
+      await run(fixture, { action: "repair" });
+      assertPointedSlotComplete(fixture, `stale-state repair crash ${step}`);
+      await recover(fixture, `stale-state repair crash ${step}`);
+    }
   });
 });
 

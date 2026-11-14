@@ -498,12 +498,14 @@ describe("preconditions (refuse, write nothing)", () => {
 });
 
 describe("Host slots (design 8.3)", () => {
-  it("alternates slots on refresh and prunes the previous one", async () => {
+  it("alternates slots on refresh and keeps the previous one until the next update (design 6.3)", async () => {
     const fixture = await outdated(createApplyFixture());
     const result = await run(fixture, { action: "refresh" });
     expect(result).toMatchObject({ outcome: "applied", state: "ready" });
     expect(result.inspection.installed.activeSlot).toBe("b");
-    expect(fixture.fileSystem.has(p(fixture, "host-a"))).toBe(false);
+    // No immediate prune: the previous Host is complete and untouched, so a Chrome that still runs it keeps working.
+    expect(fixture.fileSystem.text(p(fixture, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME))).toBe("host-executable-bytes");
+    expect(fixture.fileSystem.mutations.some((entry) => entry.startsWith("remove-file") && entry.includes("host-a"))).toBe(false);
     expect(fixture.fileSystem.text(p(fixture, "host-b", COLLECTOR_HOST_EXECUTABLE_NAME))).toBe("host-executable-bytes-v2");
   });
 
@@ -514,16 +516,36 @@ describe("Host slots (design 8.3)", () => {
     fixture.payload = applyDescriptor({ payloadId: "1.4.0+aaa0001", hostVersion: "1.4.0", extensionVersion: "0.4.0", host: { ...HOST_SOURCE_FILES, [COLLECTOR_HOST_EXECUTABLE_NAME]: "host-executable-bytes-v3" } });
     const result = await run(fixture, { action: "refresh" });
     expect(result.inspection.installed.activeSlot).toBe("a");
-    expect(fixture.fileSystem.has(p(fixture, "host-b"))).toBe(false);
+    // The slot written two updates ago is only emptied now, by being the next target.
+    expect(fixture.fileSystem.text(p(fixture, "host-b", COLLECTOR_HOST_EXECUTABLE_NAME))).toBe("host-executable-bytes-v2");
+    expect(fixture.fileSystem.text(p(fixture, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME))).toBe("host-executable-bytes-v3");
   });
 
-  it("a locked file in the previous slot is a warning, not an error", async () => {
+  it("a locked file in the previous slot does not matter to a refresh (it is never touched)", async () => {
     const fixture = await outdated(createApplyFixture());
     fixture.fileSystem.lock(p(fixture, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME));
     const result = await run(fixture, { action: "refresh" });
     expect(result).toMatchObject({ outcome: "applied", state: "ready" });
-    expect(result.warnings).toContain("previous-slot-retained");
+    expect(result.warnings).toEqual([]);
     expect(fixture.fileSystem.has(p(fixture, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME))).toBe(true);
+  });
+
+  it("the slot to write follows the manifest on disk, not a stale state file", async () => {
+    const fixture = await outdated(createApplyFixture());
+    expect((await run(fixture, { action: "refresh" })).outcome).toBe("applied"); // manifest -> b, state -> b
+    // Crash window of that refresh: the manifest already points at b, the state file still says a.
+    const state = JSON.parse(fixture.fileSystem.text(p(fixture, "integration-state.json"))) as Record<string, unknown>;
+    fixture.fileSystem.setBytes(p(fixture, "integration-state.json"), `${JSON.stringify({ ...state, activeSlot: "a" }, null, 2)}
+`);
+    const crashed = await inspectCollectorIntegration(fixture.deps);
+    expect(crashed.state).toBe("damaged");
+    expect(crashed.reasons).toContain("manifest-mismatch");
+    fixture.fileSystem.mutations.length = 0;
+    const result = await run(fixture, { action: "repair" });
+    expect(result).toMatchObject({ outcome: "applied", state: "ready" });
+    // The state file says a, so state-first logic would have emptied b: the slot Chrome runs.
+    expect(fixture.fileSystem.mutations.filter((entry) => entry.includes(fakeKey(p(fixture, "host-b"))) && !entry.startsWith("rename-file"))).toEqual([]);
+    expect(result.inspection.installed.activeSlot).toBe("a");
   });
 
   it("a locked file in the target slot leaves the previous state unchanged (file-locked)", async () => {
