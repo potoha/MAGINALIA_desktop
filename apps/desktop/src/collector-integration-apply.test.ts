@@ -562,13 +562,68 @@ describe("Host slots (design 8.3)", () => {
     expect(registryWrites(fixture)).toEqual([]);
   });
 
-  it("clears stale files in the target slot before writing", async () => {
+  it("clears our own stale files (fixed names, private temp names) in the target slot before writing", async () => {
     const fixture = createApplyFixture();
-    fixture.fileSystem.addFile(p(fixture, "host-a", "left-over.dll"), "stale");
+    fixture.fileSystem.addFile(p(fixture, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME), "stale");
+    fixture.fileSystem.addFile(p(fixture, "host-a", `${COLLECTOR_HOST_ADDON_NAME}.0123456789abcdef.tmp`), "stale");
     // no state file, no manifest: slot a is the default target
     const result = await run(fixture, { action: "setup" });
     expect(result.outcome).toBe("applied");
-    expect(fixture.fileSystem.has(p(fixture, "host-a", "left-over.dll"))).toBe(false);
+    expect(fixture.fileSystem.text(p(fixture, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME))).toBe("host-executable-bytes");
+    expect(fixture.fileSystem.has(p(fixture, "host-a", `${COLLECTOR_HOST_ADDON_NAME}.0123456789abcdef.tmp`))).toBe(false);
+  });
+
+  it("never deletes an unknown file: setup refuses before any write (program-folder-unrecognized-content)", async () => {
+    const places = [
+      ["host-a", "left-over.dll"],
+      ["host-b", "notes.txt"],
+      ["extension", "my-notes.txt"],
+      ["extension", "pages", "extra.html"],
+      ["extension.next", "user.txt"],
+      ["extension.prev", "user.txt"],
+    ];
+    for (const place of places) {
+      const fixture = createApplyFixture();
+      fixture.fileSystem.addDirectory(fixture.programFolder);
+      fixture.fileSystem.addFile(p(fixture, ...place), "precious");
+      const before = fixture.fileSystem.snapshot();
+      const result = await run(fixture, { action: "setup" });
+      expect(result, place.join("/")).toMatchObject({ outcome: "refused", reason: "program-folder-unrecognized-content" });
+      expect(fixture.fileSystem.snapshot(), place.join("/")).toEqual(before);
+      expect(registryWrites(fixture)).toEqual([]);
+    }
+  });
+
+  it("refuses an unknown directory in a slot or in the extension folder", async () => {
+    for (const place of [["host-a", "sub"], ["extension", "unknown-dir"]]) {
+      const fixture = createApplyFixture();
+      fixture.fileSystem.addDirectory(p(fixture, ...place));
+      expect((await run(fixture, { action: "setup" })).reason, place.join("/")).toBe("program-folder-unrecognized-content");
+    }
+  });
+
+  it("accepts leftovers of an interrupted setup of the same payload (descriptor files only)", async () => {
+    const fixture = createApplyFixture();
+    fixture.fileSystem.addFile(p(fixture, "extension", "manifest.json"), "partial");
+    fixture.fileSystem.addFile(p(fixture, "extension", "pages", "onboarding.html"), "partial");
+    expect((await run(fixture, { action: "setup" })).outcome).toBe("applied");
+  });
+
+  it("a repair without a valid state file does not trust the folder: an unknown file in the extension folder refuses it", async () => {
+    const fixture = await installed(createApplyFixture());
+    fixture.fileSystem.addFile(p(fixture, "extension", "user-notes.txt"), "precious");
+    await fixture.fileSystem.removeFile(p(fixture, "integration-state.json"));
+    const result = await run(fixture, { action: "repair" });
+    expect(result).toMatchObject({ outcome: "refused", reason: "program-folder-unrecognized-content" });
+    expect(fixture.fileSystem.text(p(fixture, "extension", "user-notes.txt"))).toBe("precious");
+  });
+
+  it("a user file in a slot of an installation that IS ours is still never deleted", async () => {
+    const fixture = await outdated(createApplyFixture());
+    fixture.fileSystem.addFile(p(fixture, "host-b", "user.txt"), "precious");
+    const result = await run(fixture, { action: "refresh" });
+    expect(result).toMatchObject({ outcome: "refused", reason: "program-folder-unrecognized-content" });
+    expect(fixture.fileSystem.text(p(fixture, "host-b", "user.txt"))).toBe("precious");
   });
 
   it("aborts when the target slot is a reparse point and writes nothing through it", async () => {
@@ -584,7 +639,8 @@ describe("Host slots (design 8.3)", () => {
     for (const reparse of [true, false]) {
       const fixture = createApplyFixture();
       fixture.fileSystem.addDirectory(p(fixture, "host-a", "sub"), { reparse });
-      expect((await run(fixture, { action: "setup" })).reason).toBe("reparse-point-found");
+      // a link is `reparse-point-found`; a plain unknown directory is `program-folder-unrecognized-content`
+      expect((await run(fixture, { action: "setup" })).reason).toBe(reparse ? "reparse-point-found" : "program-folder-unrecognized-content");
     }
   });
 

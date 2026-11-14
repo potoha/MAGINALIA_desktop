@@ -31,9 +31,18 @@
  * 10. Host self-check. The previous slot is NOT pruned: it stays complete until the next update
  *     writes it (design 6.3), so a Chrome that still runs the old Host keeps working.
  *
- * Remove: value-matched unregister first (a foreign value is left alone), then fixed names only:
- * manifest, slots (fixed file names), extension folders, state file, then a non-recursive rmdir.
+ * Remove: value-matched unregister first (a foreign value is left alone; this also runs when the
+ * program folder is unsafe, in which case nothing on disk is touched and the outcome is `partial`),
+ * then ONLY names we own: the manifest, the slots' fixed file names (and our private temp names), the
+ * files the packaged descriptor lists in the extension folders, the state file, then a
+ * non-recursive rmdir. Unknown entries (user files, files of an older extension version) stay and
+ * make the outcome `partial`; nothing is deleted by listing a folder and removing what is found.
  * Links and reparse points are skipped, never followed.
+ *
+ * Content safety for setup / repair / refresh: Host slots may only hold our fixed names, and the
+ * extension folders may only hold descriptor files unless ownership is confirmed (registration ours,
+ * valid state file, generated manifest); anything else is refused with
+ * `program-folder-unrecognized-content` before the first write.
  */
 import { createHash } from "node:crypto";
 import * as path from "node:path";
@@ -302,6 +311,68 @@ async function guard(context: Context, expectedRegistration: HostRegistrationOwn
   if (options.folderExists) requireSafeDirectory(context, paths.programFolder);
 }
 
+// ----- Content recognition (design 2.4, 8.3) ------------------------------------------------
+
+/** What a recognized extension tree may contain: the descriptor's files and their parent directories. */
+interface ExtensionLayout {
+  readonly files: ReadonlySet<string>;
+  readonly directories: ReadonlySet<string>;
+}
+
+function extensionLayoutOf(descriptor: CollectorPayloadDescriptor): ExtensionLayout {
+  const files = new Set<string>();
+  const directories = new Set<string>();
+  for (const name of Object.keys(descriptor.extension.files)) {
+    const segments = name.toLowerCase().split("/");
+    files.add(segments.join("/"));
+    for (let index = 1; index < segments.length; index += 1) directories.add(segments.slice(0, index).join("/"));
+  }
+  return { files, directories };
+}
+
+/** A Host slot may hold only the fixed names (and our private temp names). Anything else is not ours to delete. */
+async function requireRecognizedSlotContent(context: Context, slot: CollectorHostSlot): Promise<void> {
+  const children = await context.deps.fileSystem.listDirectory(slotFolder(context.paths, slot));
+  for (const child of children ?? []) {
+    if (child.isReparsePoint || child.kind === "other") throw new Abort("reparse-point-found");
+    if (child.kind !== "file" || !(SLOT_FIXED_NAMES.includes(child.name) || TEMP_NAME_PATTERN.test(child.name))) throw new Abort("program-folder-unrecognized-content");
+  }
+}
+
+/** An extension folder may hold only the files the packaged descriptor lists. */
+async function requireRecognizedExtensionContent(context: Context, directory: string, layout: ExtensionLayout, relative = "", budget: TreeBudget = { entries: 0 }, depth = 0): Promise<void> {
+  if (depth >= MAX_TREE_DEPTH) throw new Abort("program-folder-unrecognized-content");
+  const children = await context.deps.fileSystem.listDirectory(directory);
+  for (const child of children ?? []) {
+    budget.entries += 1;
+    if (budget.entries > MAX_TREE_ENTRIES) throw new Abort("program-folder-unrecognized-content");
+    if (child.isReparsePoint || child.kind === "other") throw new Abort("reparse-point-found");
+    const key = relative === "" ? child.name.toLowerCase() : `${relative}/${child.name.toLowerCase()}`;
+    if (child.kind === "directory") {
+      if (!layout.directories.has(key)) throw new Abort("program-folder-unrecognized-content");
+      await requireRecognizedExtensionContent(context, join(directory, child.name), layout, key, budget, depth + 1);
+    } else if (!layout.files.has(key)) {
+      throw new Abort("program-folder-unrecognized-content");
+    }
+  }
+}
+
+/**
+ * Before the first write: refuse when a folder we are about to reuse or replace holds anything we
+ * cannot account for. Host slots are always checked against the fixed names. The extension
+ * folders are checked against the descriptor unless ownership is CONFIRMED (registration ours,
+ * a valid state file and a generated manifest on disk): only then is the previous extension tree
+ * ours to replace wholesale.
+ */
+async function requireRecognizedContent(context: Context, descriptor: CollectorPayloadDescriptor, ownershipConfirmed: boolean): Promise<void> {
+  for (const slot of COLLECTOR_HOST_SLOTS) await requireRecognizedSlotContent(context, slot);
+  if (ownershipConfirmed) return;
+  const layout = extensionLayoutOf(descriptor);
+  for (const name of [COLLECTOR_EXTENSION_FOLDER_NAME, COLLECTOR_EXTENSION_STAGING_NAME, COLLECTOR_EXTENSION_PREVIOUS_NAME]) {
+    await requireRecognizedExtensionContent(context, join(context.paths.programFolder, name), layout);
+  }
+}
+
 // ----- Tree removal (own folders only; never follows a link) --------------------------------
 
 interface TreeBudget { entries: number }
@@ -412,7 +483,9 @@ async function prepareEmptySlot(context: Context, slot: CollectorHostSlot): Prom
   if (entry.kind !== "directory") throw new Abort("write-failed");
   const children = await fileSystem.listDirectory(directory);
   for (const child of children ?? []) {
-    if (child.isReparsePoint || child.kind !== "file") throw new Abort("reparse-point-found");
+    if (child.isReparsePoint || child.kind === "other") throw new Abort("reparse-point-found");
+    // Re-checked here (the pre-write check can be stale): only our own names are ever deleted.
+    if (child.kind !== "file" || !(SLOT_FIXED_NAMES.includes(child.name) || TEMP_NAME_PATTERN.test(child.name))) throw new Abort("program-folder-unrecognized-content");
     await fileSystem.removeFile(join(directory, child.name));
   }
   return directory;
@@ -670,9 +743,10 @@ function evaluatePreconditions(deps: CollectorIntegrationApplyDependencies, requ
   if (deps.e2eIsolationActive) return { kind: "refuse", reason: "e2e-isolation" };
   const { action } = request;
   if (action === "remove") {
-    // Removal is allowed under a Chrome policy block: it only deletes our own fixed names.
+    // Removal is allowed under a Chrome policy block: it only deletes names we own.
     if (!first.inspectionComplete) return { kind: "refuse", reason: "inspection-incomplete" };
-    if (first.reasons.includes("program-folder-unsafe")) return { kind: "refuse", reason: "program-folder-unsafe" };
+    // An unsafe program folder does not refuse: remove still unregisters (value-matched) and then
+    // reports `partial` without touching the folder.
     return { kind: "run" };
   }
   if (first.state === "policy-blocked") return { kind: "refuse", reason: "policy-blocked" };
@@ -716,6 +790,8 @@ async function converge(
     await guard(context, initialRegistration, { folderExists: false });
     await ensureProgramFolder(context);
     await refuseLinkedNames(context);
+    const confirmed = initialRegistration === "ours" && first.installed.activeSlot !== null && (await readManifestSlot(context)) !== null;
+    await requireRecognizedContent(context, descriptor, confirmed);
     wrote = true;
     await ensureIntegrationDirectory(context);
     await guard(context, initialRegistration, { folderExists: true });
@@ -749,7 +825,7 @@ async function converge(
     reason = reasonForError(error);
   }
   if (reason === null) return result(deps, request.action, "applied", null, context.warnings, selfCheck);
-  const refusedBeforeWrite = !wrote && (reason === "e2e-isolation" || reason === "policy-blocked" || reason === "registration-changed" || reason === "program-folder-unsafe" || reason === "inspection-incomplete" || reason === "reparse-point-found");
+  const refusedBeforeWrite = !wrote && (reason === "e2e-isolation" || reason === "policy-blocked" || reason === "registration-changed" || reason === "program-folder-unsafe" || reason === "inspection-incomplete" || reason === "reparse-point-found" || reason === "program-folder-unrecognized-content");
   return result(deps, request.action, refusedBeforeWrite ? "refused" : "failed", reason, context.warnings, selfCheck);
 }
 
@@ -794,6 +870,75 @@ async function removeSlot(context: Context, slot: CollectorHostSlot, state: { lo
   }
 }
 
+/**
+ * Delete the files a descriptor lists below `directory`, then the directories that become empty.
+ * Never lists-and-deletes: a file the descriptor does not name is never touched, and an ancestor
+ * that is a link (or not a directory) stops the walk so nothing is deleted through it. Anything
+ * left over (user files, unlisted names, a locked file) marks the tally `leftover`.
+ */
+async function removeNamedExtensionFiles(
+  context: Context,
+  directory: string,
+  descriptor: CollectorPayloadDescriptor | null,
+  tally: { locked: boolean; leftover: boolean },
+): Promise<void> {
+  const { fileSystem } = context.deps;
+  try {
+    const root = await fileSystem.stat(directory);
+    if (root === null) return;
+    if (root.isReparsePoint || root.kind !== "directory" || descriptor === null) {
+      tally.leftover = true; // not provably ours by name: it stays
+      return;
+    }
+    const directories = new Map<string, number>();
+    const plain = new Set<string>();
+    const isPlainDirectory = async (target: string): Promise<boolean> => {
+      if (plain.has(target)) return true;
+      const entry = await fileSystem.stat(target);
+      if (entry === null || entry.isReparsePoint || entry.kind !== "directory") return false;
+      plain.add(target);
+      return true;
+    };
+    for (const name of Object.keys(descriptor.extension.files).sort()) {
+      const segments = name.split("/");
+      let current = directory;
+      let reachable = true;
+      for (let index = 0; index < segments.length - 1; index += 1) {
+        current = join(current, segments[index] as string);
+        directories.set(current, index + 1);
+        if (reachable && !(await isPlainDirectory(current))) reachable = false;
+      }
+      if (reachable) await removeFixedFile(context, join(directory, ...segments), tally);
+    }
+    for (const [target] of [...directories].sort((left, right) => right[1] - left[1])) {
+      if (!plain.has(target)) continue;
+      try {
+        await fileSystem.removeEmptyDirectory(target);
+      } catch (error: unknown) {
+        if (error instanceof CollectorFileSystemError && error.code === "locked") tally.locked = true;
+        tally.leftover = true;
+      }
+    }
+    try {
+      await fileSystem.removeEmptyDirectory(directory);
+    } catch (error: unknown) {
+      if (error instanceof CollectorFileSystemError && error.code === "locked") tally.locked = true;
+      tally.leftover = true;
+    }
+  } catch {
+    tally.leftover = true;
+  }
+}
+
+async function packagedDescriptorOrNull(deps: CollectorIntegrationApplyDependencies): Promise<CollectorPayloadDescriptor | null> {
+  try {
+    const parsed = parseCollectorPayloadDescriptor(await deps.readPayloadDescriptor());
+    return parsed.ok ? parsed.descriptor : null;
+  } catch {
+    return null;
+  }
+}
+
 async function remove(
   deps: CollectorIntegrationApplyDependencies,
   first: CollectorIntegrationInspection,
@@ -803,12 +948,9 @@ async function remove(
   const context: Context = { deps, paths, warnings: [] };
   const { fileSystem } = deps;
   const tally = { locked: false, leftover: false };
+  let folderIsSafe = true;
   try {
     const folder = await fileSystem.stat(paths.programFolder);
-    if (folder !== null) {
-      if (folder.isReparsePoint || folder.kind !== "directory") return result(deps, "remove", "refused", "program-folder-unsafe", [], "skipped", first);
-      requireSafeDirectory(context, paths.programFolder);
-    }
     let registration: HostRegistrationOwnership;
     try {
       registration = deps.registry.readCollectorHostRegistration();
@@ -817,7 +959,9 @@ async function remove(
     }
     if (folder === null && registration !== "ours") return result(deps, "remove", "noop", null, [], "skipped", first);
 
-    // 1. Registry first, value-matched by the native layer. A foreign value is left untouched.
+    // 1. Registry first, value-matched by the native layer; a foreign value is left untouched.
+    //    This runs even when the program folder is not safe to touch: removing our registration
+    //    stops Chrome from starting whatever is in that folder, and it deletes nothing on disk.
     if (registration === "foreign") {
       warn(context, "foreign-registration-left");
     } else if (registration === "ours") {
@@ -830,11 +974,30 @@ async function remove(
       if (outcome === "foreign") warn(context, "foreign-registration-left");
       else if (outcome !== "ok" && outcome !== "not-registered") return result(deps, "remove", "failed", "unregister-failed", context.warnings, "skipped");
     }
-  } catch (error: unknown) {
-    return result(deps, "remove", error instanceof Abort ? "refused" : "failed", reasonForError(error), [], "skipped");
+
+    // 2. Only then decide whether the folder may be touched at all.
+    if (folder !== null) {
+      if (folder.isReparsePoint || folder.kind !== "directory") {
+        folderIsSafe = false;
+      } else {
+        try {
+          requireSafeDirectory(context, paths.programFolder);
+        } catch {
+          folderIsSafe = false;
+        }
+      }
+    }
+  } catch {
+    return result(deps, "remove", "failed", "write-failed", [], "skipped");
+  }
+  if (!folderIsSafe) {
+    warn(context, "leftovers-remain");
+    return result(deps, "remove", "partial", "program-folder-unsafe", context.warnings, "skipped");
   }
 
-  // 2. Fixed names inside the program folder only.
+  // 3. Names we own, inside the program folder only. Nothing is deleted by listing a folder and
+  //    removing what is found: unknown names (user files) stay and make the outcome `partial`.
+  const descriptor = await packagedDescriptorOrNull(deps);
   try {
     if ((await fileSystem.stat(paths.programFolder)) !== null) {
       await removeFixedFile(context, paths.manifestPath, tally);
@@ -846,8 +1009,7 @@ async function remove(
       }
       for (const slot of COLLECTOR_HOST_SLOTS) await removeSlot(context, slot, tally);
       for (const name of [COLLECTOR_EXTENSION_FOLDER_NAME, COLLECTOR_EXTENSION_STAGING_NAME, COLLECTOR_EXTENSION_PREVIOUS_NAME]) {
-        const outcome = await removeTreeTolerant(context, join(paths.programFolder, name), tally);
-        if (outcome === "leftover") tally.leftover = true;
+        await removeNamedExtensionFiles(context, join(paths.programFolder, name), descriptor, tally);
       }
       // The state file goes last so that an interrupted removal can still be recognized as ours.
       if (!tally.leftover) {
@@ -867,18 +1029,6 @@ async function remove(
   }
   if (tally.leftover) warn(context, "leftovers-remain");
   return result(deps, "remove", tally.leftover ? "partial" : "applied", tally.locked ? "file-locked" : null, context.warnings, "skipped");
-}
-
-async function removeTreeTolerant(context: Context, directory: string, tally: { locked: boolean; leftover: boolean }): Promise<"removed" | "missing" | "leftover"> {
-  const state = { locked: false };
-  try {
-    const outcome = await removeTree(context, directory, false, state);
-    if (state.locked) tally.locked = true;
-    return outcome;
-  } catch (error: unknown) {
-    if (error instanceof CollectorFileSystemError && error.code === "locked") tally.locked = true;
-    return "leftover";
-  }
 }
 
 // ----- Entry point --------------------------------------------------------------------------

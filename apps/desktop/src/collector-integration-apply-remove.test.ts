@@ -188,20 +188,34 @@ describe("remove (design 3.5, 8.5)", () => {
     expect(fixture.fileSystem.mutations).toEqual([]);
   });
 
-  it("is refused for an unsafe program folder", async () => {
+  it("unregisters (value-matched) but deletes nothing in an unsafe program folder: partial", async () => {
     const fixture = await installed(createApplyFixture());
     fixture.securityFacts.set(fakeKey(fixture.programFolder), { ...safeFacts(true), ownerSid: "S-1-5-21-9-9-9-9" } as never);
     const result = await run(fixture, { action: "remove" });
-    expect(result).toMatchObject({ outcome: "refused", reason: "program-folder-unsafe" });
+    expect(result).toMatchObject({ outcome: "partial", reason: "program-folder-unsafe" });
+    expect(result.warnings).toContain("leftovers-remain");
     expect(fixture.fileSystem.mutations).toEqual([]);
-    expect(fixture.registry.calls).not.toContain("unregisterCollectorHost");
+    expect(fixture.registry.calls).toContain("unregisterCollectorHost");
+    expect(fixture.registry.registration).toBe("absent");
   });
 
-  it("is refused when the program folder itself is a reparse point", async () => {
+  it("unregisters but deletes nothing when the program folder itself is a reparse point: partial", async () => {
     const fixture = await installed(createApplyFixture());
     fixture.fileSystem.setReparse(fixture.programFolder, true);
     const result = await run(fixture, { action: "remove" });
-    expect(result.outcome).toBe("refused");
+    expect(result).toMatchObject({ outcome: "partial", reason: "program-folder-unsafe" });
+    expect(fixture.fileSystem.mutations).toEqual([]);
+    expect(fixture.registry.registration).toBe("absent");
+  });
+
+  it("an unsafe program folder with a FOREIGN registration leaves that registration alone", async () => {
+    const fixture = await installed(createApplyFixture());
+    fixture.registry.registration = "foreign";
+    fixture.securityFacts.set(fakeKey(fixture.programFolder), { ...safeFacts(true), ownerSid: "S-1-5-21-9-9-9-9" } as never);
+    const result = await run(fixture, { action: "remove" });
+    expect(result).toMatchObject({ outcome: "partial", reason: "program-folder-unsafe" });
+    expect(result.warnings).toContain("foreign-registration-left");
+    expect(fixture.registry.registration).toBe("foreign");
     expect(fixture.fileSystem.mutations).toEqual([]);
   });
 
@@ -210,7 +224,7 @@ describe("remove (design 3.5, 8.5)", () => {
     fixture.fileSystem.addFile(p(fixture, "org.maginalia.collector.json.00000000000000aa.tmp"), "x");
     fixture.fileSystem.addFile(p(fixture, "integration-state.json.00000000000000bb.tmp"), "x");
     fixture.fileSystem.addFile(p(fixture, "host-a", `${COLLECTOR_HOST_EXECUTABLE_NAME}.00000000000000cc.tmp`), "x");
-    fixture.fileSystem.addFile(p(fixture, "extension.next", "nested", "file.js"), "x");
+    fixture.fileSystem.addFile(p(fixture, "extension.next", "pages", "onboarding.html"), "x");
     fixture.fileSystem.addFile(p(fixture, "extension.prev", "manifest.json"), "x");
     const result = await run(fixture, { action: "remove" });
     expect(result.outcome).toBe("applied");
@@ -225,11 +239,37 @@ describe("remove (design 3.5, 8.5)", () => {
     expect(fixture.fileSystem.has(p(fixture, "host-b"))).toBe(false);
   });
 
-  it("removes nested extension folders of any previously placed version", async () => {
+  it("deletes only names the descriptor lists: an unlisted file in a matching, correctly owned extension folder stays (partial)", async () => {
     const fixture = await installed(createApplyFixture());
     fixture.fileSystem.addFile(p(fixture, "extension", "old", "deep", "legacy.js"), "x");
-    expect((await run(fixture, { action: "remove" })).outcome).toBe("applied");
-    expect(everythingUnder(fixture)).toEqual([]);
+    fixture.fileSystem.addFile(p(fixture, "extension", "my-notes.txt"), "mine");
+    const result = await run(fixture, { action: "remove" });
+    expect(result.outcome).toBe("partial");
+    expect(result.warnings).toContain("leftovers-remain");
+    expect(fixture.fileSystem.text(p(fixture, "extension", "my-notes.txt"))).toBe("mine");
+    expect(fixture.fileSystem.text(p(fixture, "extension", "old", "deep", "legacy.js"))).toBe("x");
+    // the listed names are gone, the state file stays so that a retry can recognize the folder
+    expect(fixture.fileSystem.has(p(fixture, "extension", "manifest.json"))).toBe(false);
+    expect(fixture.fileSystem.has(p(fixture, "integration-state.json"))).toBe(true);
+    expect(fixture.fileSystem.has(p(fixture, "org.maginalia.collector.json"))).toBe(false);
+  });
+
+  it("without a usable descriptor the extension folder is not provably ours: it stays (partial)", async () => {
+    const fixture = await installed(createApplyFixture());
+    fixture.payload = { broken: true };
+    const result = await run(fixture, { action: "remove" });
+    expect(result.outcome).toBe("partial");
+    expect(fixture.fileSystem.has(p(fixture, "extension", "manifest.json"))).toBe(true);
+    expect(fixture.fileSystem.has(p(fixture, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME))).toBe(false);
+  });
+
+  it("never deletes through a linked directory inside the extension folder", async () => {
+    const fixture = await installed(createApplyFixture());
+    fixture.fileSystem.setReparse(p(fixture, "extension", "pages"), true);
+    const result = await run(fixture, { action: "remove" });
+    expect(result.outcome).toBe("partial");
+    expect(fixture.fileSystem.has(p(fixture, "extension", "pages", "onboarding.html"))).toBe(true);
+    expect(fixture.fileSystem.mutations.some((entry) => entry.includes("onboarding.html"))).toBe(false);
   });
 
   it("leaves an unknown file in the program folder: the safe failure", async () => {

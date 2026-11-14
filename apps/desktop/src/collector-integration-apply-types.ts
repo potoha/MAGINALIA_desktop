@@ -106,6 +106,7 @@ export type CollectorApplyReason =
   | "foreign-confirmation-required"
   | "program-folder-unsafe"
   | "reparse-point-found"
+  | "program-folder-unrecognized-content"
   | "payload-unavailable"
   | "registration-changed"
   | "layout-unresolved"
