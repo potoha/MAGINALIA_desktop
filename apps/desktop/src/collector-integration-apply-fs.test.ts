@@ -10,6 +10,7 @@ import { applyCollectorIntegration } from "./collector-integration-apply";
 import { createNodeCollectorApplyFileSystem } from "./collector-integration-apply-fs";
 import {
   HOST_SELF_CHECK_TIMEOUT_MS,
+  buildCleanHostEnvironment,
   createNodeHostSelfCheckRunner,
   encodeHealthFrame,
   parseHealthFrame,
@@ -418,6 +419,43 @@ describe("Host self-check runner", () => {
     const promise = runnerWith(child)(request);
     child.emit("error", new Error("C:\\secret"));
     expect(await promise).toEqual({ status: "failed" });
+  });
+
+  it("spawns with the executable's folder as cwd and only the supplied clean environment", async () => {
+    const child = fakeChild();
+    const seen: Array<{ cwd: string; env: Readonly<Record<string, string>> }> = [];
+    const runner = createNodeHostSelfCheckRunner({
+      spawn: (_executable, _args, options) => {
+        seen.push({ cwd: options.cwd, env: options.env });
+        return child;
+      },
+      environment: { SystemRoot: "C:\\Windows" },
+    });
+    const promise = runner(request);
+    child.stdout.write(frame({ protocol: COLLECTOR_PROTOCOL, ok: true }));
+    await promise;
+    expect(seen).toEqual([{ cwd: path.win32.dirname(request.executablePath), env: { SystemRoot: "C:\\Windows" } }]);
+    expect(seen[0]?.cwd.toLowerCase().endsWith(".exe")).toBe(false);
+  });
+
+  it("buildCleanHostEnvironment keeps an allowlist, drops everything else and pins PATH to System32", () => {
+    const clean = buildCleanHostEnvironment({
+      SYSTEMROOT: "C:\\Windows",
+      LocalAppData: "C:\\Users\\u\\AppData\\Local",
+      TEMP: "C:\\Temp",
+      PATH: "C:\\attacker;C:\\Windows",
+      NODE_OPTIONS: "--require evil.js",
+      HTTPS_PROXY: "http://proxy",
+      GITHUB_TOKEN: "secret",
+      USERNAME: "",
+    });
+    expect(clean).toEqual({
+      SystemRoot: "C:\\Windows",
+      LOCALAPPDATA: "C:\\Users\\u\\AppData\\Local",
+      TEMP: "C:\\Temp",
+      PATH: "C:\\Windows\\System32",
+    });
+    expect(buildCleanHostEnvironment({ PATH: "C:\\x" })).toEqual({});
   });
 
   it("fails when spawn throws", async () => {
