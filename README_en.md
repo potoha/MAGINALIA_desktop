@@ -92,8 +92,20 @@ Historical implementation and design sources include `potoha/MAGINALIA_IDE`, `po
 
 ## License
 
-Code in this repository owned by **beyond the Word. / MAGINALIA PROJECT** is covered by the [MIT License](LICENSE) unless a file or component states otherwise.
+- MAGINALIA 0.2.0 and later: [GNU Affero General Public License v3.0 or later](LICENSE) (AGPL-3.0-or-later).
+- MAGINALIA 0.1.x and earlier: MIT License ([LICENSE-MIT-0.1.txt](LICENSE-MIT-0.1.txt)). The license of 0.1.x does not change.
+- The copyright holder may offer a separate commercial license to organizations that cannot use the software under the AGPL terms. Contact: [GitHub Issues](https://github.com/potoha/MAGINALIA_desktop/issues)
+- See [TRADEMARKS.md](TRADEMARKS.md) for how the "MAGINALIA" name and logo may be used.
+- If you would like to contribute, please read [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The **MAGINALIA** name, logo, wordmark, and other brand elements are not licensed under the MIT License. See [NOTICE](NOTICE). Third-party libraries and components, including NDLOCR-Lite, remain subject to their respective licenses.
+### Summary (not legal advice)
+
+- You are free to use, modify, and redistribute the software.
+- If you distribute a modified version, or offer it to users as a network service, you must make the source code of that modified version available to those users under the same AGPL terms.
+- Forks are welcome. Please consider sending improvements upstream.
+
+Third-party libraries and components, including NDLOCR-Lite, remain subject to their respective licenses.
 
 Manuscripts, notes, quotations, and other user-created content do not automatically become subject to MAGINALIA's software license merely because they were created, edited, or processed using the application.
+
+Copyright (C) 2026 MADA 5sounds (go-on) / beyond the Word.
