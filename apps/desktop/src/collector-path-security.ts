@@ -102,15 +102,28 @@ function sameSid(left: string, right: string): boolean {
   return left.length > 0 && left.toUpperCase() === right.toUpperCase();
 }
 
+export interface PathSecurityEvaluationOptions {
+  /**
+   * Also accept SYSTEM or BUILTIN\Administrators as the owner. Only for PARENT folders the user
+   * does not control (`%LOCALAPPDATA%`, `Programs`): an installer or an elevated process may have
+   * created them. The write-access rule below is unchanged, and the folders we create or write
+   * into never use this option.
+   */
+  readonly allowSystemOrAdministratorOwner?: boolean;
+}
+
 /** Apply the ownership/ACL rule to one entry. */
 export function evaluatePathSecurity(
   facts: PathSecurityFacts,
   expected: "file" | "directory",
+  options: PathSecurityEvaluationOptions = {},
 ): PathSecurityEvaluation {
   if (!facts.exists) return Object.freeze({ ok: false, violation: "missing" });
   if (facts.isReparsePoint) return Object.freeze({ ok: false, violation: "reparse-point" });
   if (facts.isDirectory !== (expected === "directory")) return Object.freeze({ ok: false, violation: "wrong-entry-type" });
-  if (!sameSid(facts.ownerSid, facts.currentUserSid)) return Object.freeze({ ok: false, violation: "owner-not-current-user" });
+  const ownerAccepted = sameSid(facts.ownerSid, facts.currentUserSid)
+    || (options.allowSystemOrAdministratorOwner === true && (sameSid(facts.ownerSid, WINDOWS_SYSTEM_SID) || sameSid(facts.ownerSid, WINDOWS_ADMINISTRATORS_SID)));
+  if (!ownerAccepted) return Object.freeze({ ok: false, violation: "owner-not-current-user" });
   // A NULL DACL grants everyone full control.
   if (!facts.daclPresent) return Object.freeze({ ok: false, violation: "null-dacl" });
   const trusted = [facts.currentUserSid, WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID];
@@ -132,7 +145,7 @@ export function inspectAndEvaluatePathSecurity(
   inspect: PathSecurityInspector,
   target: string,
   expected: "file" | "directory",
-  options: { readonly optional?: boolean } = {},
+  options: { readonly optional?: boolean } & PathSecurityEvaluationOptions = {},
 ): PathSecurityEvaluation {
   let facts: PathSecurityFacts | undefined;
   try {
@@ -142,7 +155,7 @@ export function inspectAndEvaluatePathSecurity(
   }
   if (facts === undefined) return Object.freeze({ ok: false, violation: "inspection-failed" });
   if (!facts.exists && options.optional === true) return Object.freeze({ ok: true });
-  return evaluatePathSecurity(facts, expected);
+  return evaluatePathSecurity(facts, expected, options);
 }
 
 export type CollectorStorageSecurityTarget = "application-root" | "binding-directory" | "binding-file" | "coordination-root";

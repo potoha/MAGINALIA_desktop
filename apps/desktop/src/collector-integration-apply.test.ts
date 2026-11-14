@@ -441,6 +441,26 @@ describe("preconditions (refuse, write nothing)", () => {
     expect(fixture.fileSystem.privateDirectories).toEqual([]);
   });
 
+  it("accepts SYSTEM or Administrators as the owner of the PARENT folders (LocalAppData, Programs) but not of the program folder", async () => {
+    for (const owner of ["S-1-5-18", "S-1-5-32-544"]) {
+      const fixture = createApplyFixture();
+      for (const parent of [fixture.userProgramFiles, path.win32.dirname(fixture.userProgramFiles)]) {
+        fixture.securityFacts.set(fakeKey(parent), { ...safeFacts(true), ownerSid: owner } as never);
+      }
+      expect((await run(fixture, { action: "setup" })).outcome, owner).toBe("applied");
+    }
+    const fixture = createApplyFixture();
+    fixture.fileSystem.addDirectory(fixture.programFolder);
+    fixture.securityFacts.set(fakeKey(fixture.programFolder), { ...safeFacts(true), ownerSid: "S-1-5-32-544" } as never);
+    expect(await run(fixture, { action: "setup" })).toMatchObject({ outcome: "refused", reason: "program-folder-unsafe" });
+  });
+
+  it("still refuses a parent folder owned by some other account", async () => {
+    const fixture = createApplyFixture();
+    fixture.securityFacts.set(fakeKey(fixture.userProgramFiles), { ...safeFacts(true), ownerSid: "S-1-5-21-9-9-9-9" } as never);
+    expect(await run(fixture, { action: "setup" })).toMatchObject({ outcome: "refused", reason: "program-folder-unsafe" });
+  });
+
   it("refuses when the ACL inspection itself throws", async () => {
     const fixture = createApplyFixture();
     fixture.securityFacts.set(fakeKey(fixture.userProgramFiles), "throw");

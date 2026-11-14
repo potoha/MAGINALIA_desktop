@@ -208,8 +208,9 @@ function resolveLayout(deps: CollectorIntegrationApplyDependencies): Integration
 
 // ----- Folder preparation (design 3.5, 8.3) -------------------------------------------------
 
-function requireSafeDirectory(context: Context, target: string): void {
-  const result = inspectAndEvaluatePathSecurity(context.deps.inspectPathSecurity, target, "directory");
+/** `parent`: a folder above ours that an installer or an elevated process may have created (SYSTEM / Administrators may own it). */
+function requireSafeDirectory(context: Context, target: string, parent = false): void {
+  const result = inspectAndEvaluatePathSecurity(context.deps.inspectPathSecurity, target, "directory", { allowSystemOrAdministratorOwner: parent });
   if (!result.ok) throw new Abort("program-folder-unsafe");
 }
 
@@ -223,14 +224,14 @@ async function ensureProgramFolder(context: Context): Promise<void> {
   const programs = userProgramFilesOf(paths);
   const parent = path.win32.dirname(programs);
   // A drive root has no owner we can reason about; any real parent is checked.
-  if (parent !== programs && path.win32.dirname(parent) !== parent) requireSafeDirectory(context, parent);
+  if (parent !== programs && path.win32.dirname(parent) !== parent) requireSafeDirectory(context, parent, true);
   const programsEntry = await deps.fileSystem.stat(programs);
   if (programsEntry === null) {
     await deps.fileSystem.createPrivateDirectory(programs);
   } else if (programsEntry.isReparsePoint || programsEntry.kind !== "directory") {
     throw new Abort("program-folder-unsafe");
   }
-  requireSafeDirectory(context, programs);
+  requireSafeDirectory(context, programs, true);
 
   const entry = await deps.fileSystem.stat(paths.programFolder);
   if (entry === null) {
