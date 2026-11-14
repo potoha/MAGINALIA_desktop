@@ -2,6 +2,7 @@
   "name": "@maginalia/repository-core",
   "version": "0.0.0",
   "private": true,
+  "license": "AGPL-3.0-or-later",
   "description": "Host-independent MAGINALIA Repository identity and templates.",
   "type": "module",
   "main": "dist/index.js",

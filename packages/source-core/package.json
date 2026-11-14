@@ -2,6 +2,7 @@
   "name": "@maginalia/source-core",
   "version": "0.0.0",
   "private": true,
+  "license": "AGPL-3.0-or-later",
   "description": "Provider-neutral MAGINALIA Source identity and book mapping.",
   "type": "module",
   "main": "dist/index.js",
