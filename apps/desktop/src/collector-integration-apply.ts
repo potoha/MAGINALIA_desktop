@@ -514,22 +514,52 @@ async function writeSlot(context: Context, slot: CollectorHostSlot, descriptor: 
   }
 }
 
+/**
+ * Re-hash the Host executable and add-on of a slot against the descriptor. Called right before the
+ * manifest switch (the slot is about to become what Chrome runs) and right before the self-check
+ * spawn, so a swap of the files after `writeSlot` verified them is caught (TOCTOU).
+ */
+async function slotHostFilesMatch(context: Context, slot: CollectorHostSlot, descriptor: CollectorPayloadDescriptor): Promise<boolean> {
+  const { fileSystem } = context.deps;
+  for (const name of [COLLECTOR_HOST_EXECUTABLE_NAME, COLLECTOR_HOST_ADDON_NAME] as const) {
+    const target = join(slotFolder(context.paths, slot), name);
+    const entry = await fileSystem.stat(target);
+    if (entry === null || entry.isReparsePoint || entry.kind !== "file") return false;
+    if ((await fileSystem.sha256File(target)) !== descriptor.host.files[name]) return false;
+  }
+  return true;
+}
+
 // ----- Extension folder (design 4.5, 6.4) ---------------------------------------------------
 
-async function recoverPendingExtensionSwap(context: Context): Promise<void> {
+/**
+ * Returns `false` when a leftover `extension.prev` could not be cleaned up (a locked file): that
+ * is a warning, not an error, and the caller skips this swap only (design 6.4). A restore of an
+ * interrupted swap is still strict.
+ */
+async function recoverPendingExtensionSwap(context: Context): Promise<boolean> {
   const { fileSystem } = context.deps;
   const { paths } = context;
   const previous = join(paths.programFolder, COLLECTOR_EXTENSION_PREVIOUS_NAME);
   const previousEntry = await fileSystem.stat(previous);
-  if (previousEntry === null) return;
+  if (previousEntry === null) return true;
   if (previousEntry.isReparsePoint || previousEntry.kind !== "directory") throw new Abort("reparse-point-found");
   const current = await fileSystem.stat(paths.extensionFolder);
   if (current === null) {
     // A swap was interrupted between the two renames: put the previous complete folder back.
     await fileSystem.renameDirectory(previous, paths.extensionFolder);
-  } else {
-    await removeTree(context, previous, true, { locked: false });
+    return true;
   }
+  try {
+    if ((await removeTree(context, previous, false, { locked: false })) === "leftover") {
+      warn(context, "previous-extension-retained");
+      return false;
+    }
+  } catch {
+    warn(context, "previous-extension-retained");
+    return false;
+  }
+  return true;
 }
 
 async function stageExtension(context: Context, descriptor: CollectorPayloadDescriptor, staging: string): Promise<void> {
@@ -580,7 +610,10 @@ async function swapExtension(context: Context, descriptor: CollectorPayloadDescr
   const { paths } = context;
   const staging = join(paths.programFolder, COLLECTOR_EXTENSION_STAGING_NAME);
   const previous = join(paths.programFolder, COLLECTOR_EXTENSION_PREVIOUS_NAME);
-  await recoverPendingExtensionSwap(context);
+  // A locked `extension.prev` cannot be cleaned, and the current folder cannot be moved on top of
+  // it: skip the swap (warning). The state file still records the new payload, so the next
+  // inspection reports the stale extension and one repair finishes the swap.
+  if (!(await recoverPendingExtensionSwap(context))) return;
   await stageExtension(context, descriptor, staging);
 
   const current = await fileSystem.stat(paths.extensionFolder);
@@ -670,8 +703,13 @@ async function runSelfCheck(context: Context, slot: CollectorHostSlot, descripto
     if (!sameLocation(resolved, expected)) return false;
     const entry = await deps.fileSystem.stat(expected);
     if (entry === null || entry.kind !== "file" || entry.isReparsePoint) return false;
+    // Re-hash immediately before spawning: the bytes about to run are the verified bytes.
+    if (!(await slotHostFilesMatch(context, slot, descriptor))) return false;
     const result = await deps.runHostSelfCheck({ executablePath: expected, allowedOrigin: COLLECTOR_ALLOWED_ORIGINS[0] as string });
     if (result.status !== "ok" || result.protocol !== COLLECTOR_PROTOCOL) return false;
+    // TODO(WP-6): the Host does not report its version in `health` until `host_info` lands, so
+    // `hostVersion` is `undefined` today and this comparison never rejects anything. Once WP-6
+    // ships, make a missing `hostVersion` a failure as well.
     return result.hostVersion === undefined || result.hostVersion === descriptor.host.version;
   } catch {
     return false;
@@ -800,7 +838,12 @@ async function converge(
     await writeSlot(context, slot, descriptor);
     await swapExtension(context, descriptor);
 
-    // Point of no return: the manifest switch makes Chrome use the new Host.
+    // Last check before the manifest switch: the Host files are re-hashed (not trusted from
+    // `writeSlot`) and the guard is re-evaluated. After the manifest rename succeeds Chrome runs the
+    // new Host and nothing is rolled back: a later failure (registry, state file, self-check) is
+    // reported as `failed` with the files left in place, the previous slot stays complete as the
+    // fallback, and a repair converges. Until that rename the previous installation is untouched.
+    if (!(await slotHostFilesMatch(context, slot, descriptor))) throw new Abort("hash-mismatch");
     await guard(context, initialRegistration, { folderExists: true });
     await writeAtomically(context, paths.manifestPath, manifestBytes(slot, paths.programFolder));
 
@@ -825,6 +868,10 @@ async function converge(
     reason = reasonForError(error);
   }
   if (reason === null) return result(deps, request.action, "applied", null, context.warnings, selfCheck);
+  // `refused` = a precondition failed before anything of the installation was changed. `wrote`
+  // turns true once the program folder is verified and every content check passed; creating the
+  // empty program folder itself does not count (a refusal may leave an empty protected folder).
+  // Any failure after that point is `failed`, with the post-action inspection showing what is on disk.
   const refusedBeforeWrite = !wrote && (reason === "e2e-isolation" || reason === "policy-blocked" || reason === "registration-changed" || reason === "program-folder-unsafe" || reason === "inspection-incomplete" || reason === "reparse-point-found" || reason === "program-folder-unrecognized-content");
   return result(deps, request.action, refusedBeforeWrite ? "refused" : "failed", reason, context.warnings, selfCheck);
 }

@@ -859,6 +859,59 @@ describe("extension folder (design 4.5, 6.4)", () => {
   });
 });
 
+describe("extension.prev that cannot be cleaned (design 6.4)", () => {
+  it("a locked leftover extension.prev skips that swap with a warning instead of failing the whole run", async () => {
+    const fixture = await outdated(createApplyFixture());
+    fixture.fileSystem.addFile(p(fixture, "extension.prev", "old.txt"), "old");
+    fixture.fileSystem.lock(p(fixture, "extension.prev"));
+    const result = await run(fixture, { action: "refresh" });
+    expect(result.outcome).toBe("applied");
+    expect(result.reason).toBeNull();
+    expect(result.warnings).toContain("previous-extension-retained");
+    // the current extension folder was neither moved nor replaced; no staging folder is left behind
+    expect(fixture.fileSystem.has(p(fixture, "extension", "manifest.json"))).toBe(true);
+    expect(JSON.parse(fixture.fileSystem.text(p(fixture, "extension", "manifest.json"))).version).toBe("0.3.0");
+    expect(fixture.fileSystem.has(p(fixture, "extension.next"))).toBe(false);
+    // the Host slot did switch, and the stale extension is reported so that one repair finishes the swap
+    expect(result.inspection.installed.activeSlot).toBe("b");
+    expect(result.state).toBe("damaged");
+    fixture.fileSystem.locked.clear();
+    expect((await run(fixture, { action: "repair" })).outcome).toBe("applied");
+    expect((await inspectCollectorIntegration(fixture.deps)).state).toBe("ready");
+  });
+});
+
+describe("re-hashing the Host before it is used (TOCTOU)", () => {
+  it("refuses to switch the manifest when a slot file changed after it was written", async () => {
+    const fixture = await outdated(createApplyFixture());
+    const original = fixture.fileSystem.renameDirectory.bind(fixture.fileSystem);
+    fixture.fileSystem.renameDirectory = async (from, to) => {
+      // the extension swap happens after the slot was written and verified, before the manifest switch
+      if (from.endsWith("extension.next")) fixture.fileSystem.setBytes(p(fixture, "host-b", COLLECTOR_HOST_EXECUTABLE_NAME), "swapped-after-verification");
+      await original(from, to);
+    };
+    const manifestBefore = fixture.fileSystem.text(p(fixture, "org.maginalia.collector.json"));
+    fixture.selfChecks.length = 0;
+    const result = await run(fixture, { action: "refresh" });
+    expect(result).toMatchObject({ outcome: "failed", reason: "hash-mismatch" });
+    expect(fixture.fileSystem.text(p(fixture, "org.maginalia.collector.json"))).toBe(manifestBefore);
+    expect(fixture.selfChecks).toEqual([]);
+  });
+
+  it("does not spawn a Host whose bytes changed after the manifest switch", async () => {
+    const fixture = createApplyFixture();
+    const register = fixture.registry.registerCollectorHost.bind(fixture.registry);
+    fixture.registry.registerCollectorHost = () => {
+      const outcome = register();
+      fixture.fileSystem.setBytes(p(fixture, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME), "swapped-before-spawn");
+      return outcome;
+    };
+    const result = await run(fixture, { action: "setup" });
+    expect(fixture.selfChecks).toEqual([]);
+    expect(result).toMatchObject({ outcome: "failed", reason: "self-check-failed", selfCheck: "failed" });
+  });
+});
+
 describe("registry and read-back (design 3.3)", () => {
   it("access-denied keeps the files, writes the state, reports registration-missing", async () => {
     const fixture = createApplyFixture();
