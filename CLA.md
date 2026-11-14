@@ -15,7 +15,7 @@ This Contributor License Agreement ("Agreement") is between You and the Maintain
 ### 1. Definitions
 
 - "Maintainer" means MADA 5sounds (go-on), an individual acting under that pen name and operating the individual product-development circle "beyond the Word.", and its successors and assigns, including any company formed to continue the Project.
-- "Project" means MAGINALIA and the repositories published by the Maintainer for it, including MAGINALIA_desktop and MAGINALIA-Collector.
+- "Project" means MAGINALIA and the repositories published by the Maintainer for it, including MAGINALIA_desktop. MAGINALIA-Collector is licensed separately under the MIT License and does not use this Agreement.
 - "Contribution" means any work of authorship, including source code, documentation, and designs, that You intentionally submit to the Project, and any modification of it.
 - "You" means the individual (or the legal entity on whose behalf the individual acts) who signs this Agreement.
 
