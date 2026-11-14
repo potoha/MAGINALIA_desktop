@@ -110,6 +110,7 @@ export type CollectorApplyReason =
   | "payload-unavailable"
   | "registration-changed"
   | "layout-unresolved"
+  | "busy"
   // failures
   | "file-locked"
   | "source-changed"
@@ -132,9 +133,15 @@ export type CollectorApplyWarning =
 /**
  * - `applied`: the action completed.
  * - `noop`: nothing needed doing (idempotent second run).
- * - `refused`: a precondition failed before any write.
- * - `failed`: a step failed; `reason` says which class and `inspection` shows what is on disk now.
- * - `partial`: remove deleted what it could; `warnings` contains `leftovers-remain`.
+ * - `refused`: a precondition failed before anything of the installation was changed: no Host,
+ *   extension, manifest, state or registry change. (Creating the empty protected program folder is
+ *   not counted, so a refusal may leave that one empty folder.) Also `busy`: another apply is running.
+ * - `failed`: a step failed after that point; `reason` says which class and `inspection` shows what
+ *   is on disk now. A failure after the manifest switch is never rolled back (design 6.3): the
+ *   files stay, the previous slot is intact, and a repair converges.
+ * - `partial`: remove deleted what it could; `warnings` contains `leftovers-remain`. The registration
+ *   may already be gone (remove unregisters first, even from an unsafe folder: `reason` is then
+ *   `program-folder-unsafe` and nothing on disk was touched).
  */
 export type CollectorApplyOutcome = "applied" | "noop" | "refused" | "failed" | "partial";
 

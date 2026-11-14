@@ -18,6 +18,21 @@
  * | refresh | outdated (ours; automatic for opted-in users)   | ready      |
  * | remove  | any state with a recognizable program folder    | not-set-up |
  *
+ * Single run at a time: `applyCollectorIntegration` rejects a second call while one is running
+ * (`refused` / `busy`); it does not queue. WP-7 must serialize the UI actions that lead here
+ * (disable the buttons while a run is in progress, and do not fire repair/refresh from automatic
+ * triggers while a user-started run is open); the guard is the safety net, not the UX.
+ *
+ * Notes for WP-7 / WP-8 (not implemented here):
+ *  - Hash the compiled constants, not only the packaged `collector-payload.json`: the descriptor
+ *    file is informational, the constants in the main bundle are authoritative (design 2.1).
+ *  - Persist "the user asked for remove" so that repair notifications / automatic refresh stay
+ *    quiet after a remove that ended `partial` (the state file of an interrupted removal still
+ *    looks like a damaged installation).
+ *  - The NSIS uninstaller must know our private temp names, `<name>.<16 hex>.tmp`, in the program
+ *    folder and in `host-a` / `host-b`, besides the fixed names, `extension`, `extension.next`
+ *    and `extension.prev`; anything else in the folder is the user's and must be left alone.
+ *
  * Order of side effects for setup / repair / refresh (each step is verified before the next):
  *  1. preconditions (inspect; E2E isolation; policy; payload; state matrix; foreign confirmation)
  *  2. program folder (protected DACL; parents checked; existing unsafe folder is never re-permissioned)
@@ -1086,6 +1101,23 @@ async function remove(
  * the order of side effects.
  */
 export async function applyCollectorIntegration(
+  request: CollectorApplyRequest,
+  deps: CollectorIntegrationApplyDependencies,
+): Promise<CollectorApplyResult> {
+  // Set synchronously, before the first await: two overlapping calls can never both pass this line.
+  if (applyInFlight) return result(deps, request.action, "refused", "busy", [], "skipped");
+  applyInFlight = true;
+  try {
+    return await applyExclusive(request, deps);
+  } finally {
+    applyInFlight = false;
+  }
+}
+
+/** Process-wide: there is one program folder, one manifest and one registry value per user. */
+let applyInFlight = false;
+
+async function applyExclusive(
   request: CollectorApplyRequest,
   deps: CollectorIntegrationApplyDependencies,
 ): Promise<CollectorApplyResult> {

@@ -879,6 +879,46 @@ describe("extension folder (design 4.5, 6.4)", () => {
   });
 });
 
+describe("single run guard", () => {
+  it("rejects an overlapping apply as busy without touching anything, then accepts the next one", async () => {
+    const fixture = createApplyFixture();
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const original = fixture.deps.readPayloadDescriptor;
+    const slowDeps = { ...fixture.deps, readPayloadDescriptor: async () => { await gate; return original(); } };
+    const firstRun = applyCollectorIntegration({ action: "setup" }, slowDeps);
+    const overlapping = await Promise.all([
+      run(fixture, { action: "setup" }),
+      run(fixture, { action: "remove" }),
+      run(fixture, { action: "repair" }),
+    ]);
+    for (const result of overlapping) expect(result).toMatchObject({ outcome: "refused", reason: "busy", selfCheck: "skipped" });
+    expect(fixture.fileSystem.mutations).toEqual([]);
+    expect(registryWrites(fixture)).toEqual([]);
+    release?.();
+    expect((await firstRun).outcome).toBe("applied");
+    expect((await run(fixture, { action: "remove" })).outcome).toBe("applied");
+  });
+
+  it("releases the guard after a refusal and after a failure", async () => {
+    const fixture = createApplyFixture();
+    fixture.isolated = true;
+    expect((await run(fixture, { action: "setup" })).reason).toBe("e2e-isolation");
+    fixture.isolated = false;
+    fixture.fileSystem.crashAfter = 10;
+    expect((await run(fixture, { action: "setup" })).outcome).toBe("failed");
+    fixture.fileSystem.crashAfter = null;
+    expect((await run(fixture, { action: "setup" })).outcome).toBe("applied");
+  });
+
+  it("releases the guard even when the whole run throws unexpectedly", async () => {
+    const fixture = createApplyFixture();
+    const broken = { ...fixture.deps, registry: undefined as never };
+    await run({ ...fixture, deps: broken } as ApplyFixture, { action: "setup" }).catch(() => undefined);
+    expect((await run(fixture, { action: "setup" })).outcome).toBe("applied");
+  });
+});
+
 describe("extension.prev that cannot be cleaned (design 6.4)", () => {
   it("a locked leftover extension.prev skips that swap with a warning instead of failing the whole run", async () => {
     const fixture = await outdated(createApplyFixture());
