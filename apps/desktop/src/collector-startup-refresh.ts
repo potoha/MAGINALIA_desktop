@@ -21,7 +21,9 @@
  *    which would be a false alarm.
  *  - After the user asked for `remove` (`removeRequested`, persisted) no refresh and no repair
  *    notice happen until a setup or repair is applied (`recordApplyResult`).
- *  - alpha1 notice (design 5): once, for a user who has not opted in and shows an alpha1 footprint.
+ *  - alpha1 notice (design 5, owner decision): once, whenever the user has not opted in, the state is
+ *    `not-set-up` and the notice was never shown. Only the Desktop notice state (userData) is written.
+ *    Other states (foreign-registration etc.) never raise it; the repair notice owns those.
  *  - Under E2E isolation the orchestrator does nothing at all.
  */
 import { compareCollectorVersions } from "./collector-version.js";
@@ -43,8 +45,6 @@ export interface CollectorStartupRefreshDependencies {
   readonly apply: (request: CollectorApplyRequest) => Promise<CollectorApplyResult>;
   /** `true` when a valid `integration-state.json` exists (the user set the integration up). Read-only. */
   readonly hasOptedIn: () => Promise<boolean>;
-  /** `true` when an alpha1 Collector footprint exists on this machine. Read-only. Not called for opted-in users. */
-  readonly hasAlpha1Footprint: () => Promise<boolean>;
   readonly noticeStore: CollectorNoticeStore;
   readonly now: () => Date;
   /** Decided by the composition root (this module reads no environment). */
@@ -151,8 +151,7 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
     if (!optedIn) {
       // Nothing is refreshed or repaired. A leftover "updated" notice of a removed installation is dropped.
       if (state.updated !== null) state = { ...state, updated: null };
-      const candidate = inspection.state === "not-set-up" || inspection.state === "foreign-registration";
-      if (candidate && state.alpha1 === "unseen" && (inspection.registration === "foreign" || await probe(deps.hasAlpha1Footprint))) {
+      if (inspection.state === "not-set-up" && state.alpha1 === "unseen") {
         // Shown once: remembered before it is shown. A notice that could not be remembered stays hidden.
         if (await persist({ ...state, alpha1: "shown" })) active.set(COLLECTOR_NOTICE_IDS.alpha1Migration, buildAlpha1MigrationNotice());
       }

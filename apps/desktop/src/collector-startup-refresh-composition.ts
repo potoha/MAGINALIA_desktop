@@ -13,7 +13,7 @@
  *    (design 2.1, apply-module note). Those constants do not exist yet (open design point, see the
  *    WP-5c report), so reading the resource file here would silently settle that question.
  *
- * The opt-in probe (`hasOptedIn`) and the alpha1 probe are read-only.
+ * The opt-in probe (`hasOptedIn`) is read-only.
  */
 import { randomBytes } from "node:crypto";
 import * as path from "node:path";
@@ -22,7 +22,7 @@ import {
   createNodeHostSelfCheckRunner,
 } from "./collector-integration-apply-self-check.js";
 import { createNodeCollectorApplyFileSystem } from "./collector-integration-apply-fs.js";
-import { applyCollectorIntegration, COLLECTOR_STANDALONE_FOLDER_NAME } from "./collector-integration-apply.js";
+import { applyCollectorIntegration } from "./collector-integration-apply.js";
 import type { CollectorIntegrationApplyDependencies } from "./collector-integration-apply-types.js";
 import {
   inspectCollectorIntegration,
@@ -66,7 +66,6 @@ const inertDependencies = (now: () => Date, noticeStore: CollectorNoticeStore): 
   inspect: () => Promise.reject(new Error("unavailable under E2E isolation")),
   apply: () => Promise.reject(new Error("unavailable under E2E isolation")),
   hasOptedIn: () => Promise.resolve(false),
-  hasAlpha1Footprint: () => Promise.resolve(false),
   noticeStore,
   now,
   e2eIsolationActive: true,
@@ -107,13 +106,6 @@ export function createCollectorStartupRefreshFromParts(options: CollectorStartup
       } catch {
         return false;
       }
-    },
-    // alpha1 Collector users installed the standalone Host into the user's program folder.
-    hasAlpha1Footprint: async () => {
-      const paths = resolveIntegrationPaths(registry);
-      if (paths === undefined) return false;
-      const entry = await fileSystem.stat(path.win32.join(path.win32.dirname(paths.programFolder), COLLECTOR_STANDALONE_FOLDER_NAME));
-      return entry !== null && entry.kind === "directory";
     },
     noticeStore,
     now,

@@ -61,7 +61,6 @@ interface Rig {
   readonly inspects: number[];
   current: CollectorIntegrationInspection;
   optedIn: boolean;
-  alpha1: boolean;
   applyOutcome: CollectorApplyResult | "throw";
   isolated: boolean;
   clock: Date;
@@ -76,7 +75,6 @@ function rig(state: CollectorIntegrationState = "ready"): Rig {
     inspects: [],
     current: inspection(state),
     optedIn: true,
-    alpha1: false,
     applyOutcome: applyResult("applied"),
     isolated: false,
     clock: new Date(T0),
@@ -93,7 +91,6 @@ function rig(state: CollectorIntegrationState = "ready"): Rig {
           return r.applyOutcome;
         },
         hasOptedIn: async () => r.optedIn,
-        hasAlpha1Footprint: async () => r.alpha1,
         noticeStore: store,
         now: () => r.clock,
         e2eIsolationActive: r.isolated,
@@ -188,15 +185,15 @@ describe("automatic refresh (design 6.2)", () => {
 });
 
 describe("opt-in and isolation", () => {
-  it("does nothing, writes nothing and shows nothing when the user has not opted in", async () => {
+  it("never refreshes or repairs when the user has not opted in; only the alpha1 notice state is written for not-set-up", async () => {
     for (const state of ["outdated", "damaged", "registration-missing", "ready", "not-set-up", "policy-blocked"] as const) {
       const r = rig(state);
       r.optedIn = false;
       const result = await createCollectorStartupRefresh(r.deps).runStartup();
       expect(result.outcome).toBe("not-opted-in");
-      expect(result.notices).toEqual([]);
+      expect(kinds(result.notices)).toEqual(state === "not-set-up" ? ["alpha1-migration"] : []);
       expect(r.applies).toEqual([]);
-      expect(r.store.writes).toEqual([]);
+      expect(r.store.writes).toHaveLength(state === "not-set-up" ? 1 : 0);
     }
   });
 
@@ -274,35 +271,37 @@ describe("updated notice clears itself (design 6.5)", () => {
 });
 
 describe("alpha1 to alpha2 notice (design 5)", () => {
-  it("is shown once for a user without the integration who has an alpha1 footprint", async () => {
+  it("is shown once on a fresh userData for a user without the integration", async () => {
     const r = rig("not-set-up");
     r.optedIn = false;
-    r.alpha1 = true;
     const first = await createCollectorStartupRefresh(r.deps).runStartup();
     expect(kinds(first.notices)).toEqual(["alpha1-migration"]);
     const notice = first.notices[0] as CollectorNotice;
     expect(notice.actions.map((action) => action.commandId)).toEqual([COLLECTOR_SETUP_COMMAND_ID, COLLECTOR_DISMISS_NOTICE_COMMAND_ID]);
+    expect(notice.actions[0]?.closesNoticeId).toBe(COLLECTOR_NOTICE_IDS.alpha1Migration);
     expect(r.store.state.alpha1).toBe("shown");
-    const second = await createCollectorStartupRefresh(r.deps).runStartup();
-    expect(second.notices).toEqual([]);
-  });
-
-  it("is also offered for an alpha1 standalone registration (foreign) of a user who has not opted in, but never repaired", async () => {
-    const r = rig("foreign-registration");
-    r.optedIn = false;
-    const result = await createCollectorStartupRefresh(r.deps).runStartup();
-    expect(kinds(result.notices)).toEqual(["alpha1-migration"]);
     expect(r.applies).toEqual([]);
+    expect((await createCollectorStartupRefresh(r.deps).runStartup()).notices).toEqual([]);
   });
 
-  it("is not shown without an alpha1 footprint, or when it cannot be remembered", async () => {
-    const none = rig("not-set-up");
-    none.optedIn = false;
-    expect((await createCollectorStartupRefresh(none.deps).runStartup()).notices).toEqual([]);
-    expect(none.store.writes).toEqual([]);
+  it("is not shown for an opted-in user, for ready, or for foreign / damaged / outdated states", async () => {
+    for (const state of ["ready", "foreign-registration", "damaged", "registration-missing", "outdated", "policy-blocked"] as const) {
+      const r = rig(state);
+      r.optedIn = state === "ready";
+      const result = await createCollectorStartupRefresh(r.deps).runStartup();
+      expect(kinds(result.notices).includes("alpha1-migration")).toBe(false);
+      expect(r.store.state.alpha1).toBe("unseen");
+    }
+    const notOptedForeign = rig("foreign-registration");
+    notOptedForeign.optedIn = false;
+    const result = await createCollectorStartupRefresh(notOptedForeign.deps).runStartup();
+    expect(result.notices).toEqual([]);
+    expect(notOptedForeign.store.writes).toEqual([]);
+  });
+
+  it("is not shown when it cannot be remembered (so it can never repeat)", async () => {
     const unwritable = rig("not-set-up");
     unwritable.optedIn = false;
-    unwritable.alpha1 = true;
     unwritable.store.failWrites = true;
     expect((await createCollectorStartupRefresh(unwritable.deps).runStartup()).notices).toEqual([]);
   });
@@ -310,12 +309,20 @@ describe("alpha1 to alpha2 notice (design 5)", () => {
   it("stays dismissed", async () => {
     const r = rig("not-set-up");
     r.optedIn = false;
-    r.alpha1 = true;
     const startup = createCollectorStartupRefresh(r.deps);
     await startup.runStartup();
     expect(await startup.dismiss(COLLECTOR_NOTICE_IDS.alpha1Migration)).toEqual([]);
     expect(r.store.state.alpha1).toBe("dismissed");
     expect((await createCollectorStartupRefresh(r.deps).runStartup()).notices).toEqual([]);
+  });
+
+  it("writes and shows nothing under E2E isolation", async () => {
+    const r = rig("not-set-up");
+    r.optedIn = false;
+    r.isolated = true;
+    const result = await createCollectorStartupRefresh(r.deps).runStartup();
+    expect(result.notices).toEqual([]);
+    expect(r.store.writes).toEqual([]);
   });
 });
 

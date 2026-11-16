@@ -34,6 +34,8 @@ export interface CollectorNoticeAction {
   readonly label: string;
   /** Only `maginalia.collector.dismissNotice` carries an argument: the id of the notice to close. */
   readonly argument?: { readonly noticeId: string };
+  /** After this action runs, the caller also dispatches `maginalia.collector.dismissNotice` for this notice. */
+  readonly closesNoticeId?: string;
 }
 
 interface NoticeBase {
@@ -105,7 +107,7 @@ export function buildAlpha1MigrationNotice(): CollectorNotice {
     detail: null,
     clearsWhen: "dismissed" as const,
     actions: Object.freeze([
-      { commandId: COLLECTOR_SETUP_COMMAND_ID, label: "設定する" },
+      { commandId: COLLECTOR_SETUP_COMMAND_ID, label: "設定する", closesNoticeId: COLLECTOR_NOTICE_IDS.alpha1Migration },
       { commandId: COLLECTOR_DISMISS_NOTICE_COMMAND_ID, label: "今はしない", argument: { noticeId: COLLECTOR_NOTICE_IDS.alpha1Migration } },
     ]),
   });

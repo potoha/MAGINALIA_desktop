@@ -44,13 +44,14 @@ describe("startup refresh composition (unwired)", () => {
     expect(await readdir(m.root)).toEqual(["Local", "Programs"]);
   });
 
-  it("writes and shows nothing for a machine without the integration state", async () => {
+  it("writes nothing outside userData for a machine without the integration state (alpha1 notice only)", async () => {
     const m = await machine();
     const startup = createCollectorStartupRefreshFromParts(parts(m));
     const result = await startup.runStartup();
     expect(result.outcome).toBe("not-opted-in");
-    expect(result.notices).toEqual([]);
-    expect(await readdir(m.root)).toEqual(["Local", "Programs"]);
+    expect(result.notices.map((notice) => notice.kind)).toEqual(["alpha1-migration"]);
+    expect(await readdir(m.root)).toEqual(["Local", "Programs", "userData"]);
+    expect(await readdir(m.registry.knownFolders.LocalAppData)).toEqual([]);
     expect(await readdir(m.registry.knownFolders.UserProgramFiles)).toEqual([]);
   });
 
@@ -65,9 +66,8 @@ describe("startup refresh composition (unwired)", () => {
     expect(await readdir(m.programFolder)).toEqual(before);
   });
 
-  it("shows the alpha1 notice once for a standalone Host folder", async () => {
+  it("shows the alpha1 notice only once", async () => {
     const m = await machine();
-    await mkdir(path.join(m.registry.knownFolders.UserProgramFiles, "MAGINALIA Collector Host"), { recursive: true });
     const first = await createCollectorStartupRefreshFromParts(parts(m)).runStartup();
     expect(first.notices.map((notice) => notice.kind)).toEqual(["alpha1-migration"]);
     const second = await createCollectorStartupRefreshFromParts(parts(m)).runStartup();
