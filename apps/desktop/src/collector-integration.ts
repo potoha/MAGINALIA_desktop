@@ -101,7 +101,7 @@ export function isLocalAbsoluteWindowsPath(value: unknown): value is string {
   return path.win32.normalize(value) === value && !value.endsWith("\\");
 }
 
-interface IntegrationPaths {
+export interface IntegrationPaths {
   readonly programFolder: string;
   readonly manifestPath: string;
   readonly statePath: string;
@@ -112,11 +112,11 @@ interface IntegrationPaths {
   readonly localAppData: string;
 }
 
-function slotFolder(paths: IntegrationPaths, slot: CollectorHostSlot): string {
+export function slotFolder(paths: IntegrationPaths, slot: CollectorHostSlot): string {
   return path.win32.join(paths.programFolder, `host-${slot}`);
 }
 
-function resolvePaths(registry: CollectorRegistryAdapter): IntegrationPaths | undefined {
+export function resolveIntegrationPaths(registry: CollectorRegistryAdapter): IntegrationPaths | undefined {
   try {
     const userProgramFiles = registry.getKnownFolderPath("UserProgramFiles");
     const localAppData = registry.getKnownFolderPath("LocalAppData");
@@ -397,6 +397,15 @@ export function expectedHostManifest(slot: CollectorHostSlot): Readonly<Record<s
   });
 }
 
+/**
+ * The slot a generated manifest points at, or `null` when the value is not exactly a manifest this
+ * app generates. This is the authority for "which Host slot does Chrome run" (design 3.5, 6.3).
+ */
+export function collectorManifestSlot(value: unknown, programFolder: string): CollectorHostSlot | null {
+  for (const slot of COLLECTOR_HOST_SLOTS) if (manifestMatches(value, slot, programFolder) === "ok") return slot;
+  return null;
+}
+
 function manifestMatches(value: unknown, slot: CollectorHostSlot, programFolder: string): "ok" | "invalid" | "mismatch" {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return "invalid";
   const record = value as Record<string, unknown>;
@@ -560,7 +569,7 @@ export async function inspectCollectorIntegration(
     sink.add(reason);
   };
 
-  const paths = resolvePaths(dependencies.registry);
+  const paths = resolveIntegrationPaths(dependencies.registry);
   if (paths === undefined) incomplete("known-folder-unavailable");
 
   let registration: HostRegistrationOwnership | "unknown" = "unknown";
