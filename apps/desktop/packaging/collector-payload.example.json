@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "payloadId": "0.2.0+0000000",
+  "host": {
+    "version": "0.2.0",
+    "files": {
+      "MAGINALIA-Collector-Host.exe": "1bac9de98946405c74a33c8d861fba4ba1a0205f134639e60e284a47120b2821",
+      "shelf_mutex.node": "2e544639603cdd08e6d8eb9455409fcf6e8e78b4194a77f631b0f21ac46646a1"
+    }
+  },
+  "extension": {
+    "version": "0.3.0",
+    "id": "blgmoddncpknfnikdfnjelmdmphfgknf",
+    "zipSha256": "d5190a0f02fafe59b4d1bdc14ef35f7d029f6d70551f0ee2d70857c554b3df00",
+    "files": {
+      "capture.css": "aba5e81983c43b9b6ede8a306592b4953da16c2d94aeaf3f82227c2881ea4dd3",
+      "capture.html": "c04ff4f7944a3566cc0d1f1e00d9ebbc0d58db1749b4d769fbfd9202f263f3ed",
+      "capture.js": "46e9157fdd7098648f96ef333f56bffa99a63da8143d17708fbbd47976ac73c0",
+      "host-client.js": "3bb729912da3f0f64d324c4e878ef46b0459510427134703fa9a8fc351c39ef7",
+      "icon..png": "87854c88845046506c33765c0a2958a5744e4c7147225eecce7d2c47f48ead67",
+      "manifest.json": "3335f812650a18f9e181e59eb1ce27b9a6b417002d14614e44ac3a7e79c2bbd5",
+      "onboarding.css": "89ea786d13b1e8f368bb982b5ab1407e76c6f47b43a5c5b65f91aa14220e85e5",
+      "onboarding.html": "b71b8298e5f3b1322293344614bf778fafbe6d9e96c255c9d8d453ad35013820",
+      "onboarding.js": "371634a06e7b668d9352573f2f86a02c2375978d00be7503aae9e12e40544bce",
+      "outbox.js": "a76ccb0b8824964570ea381abd3c5444ad39d1032a8ee7bf248ac2f1567bd0f0",
+      "popup.css": "d89db6c88cd8932091ef64b78bd921024d718df532bcbb2751ce4906d2450606",
+      "popup.html": "4e537bb54f2789d98c4b8af7cf572eb0d4cc94f5f87e67b965db992ab303c1c2",
+      "popup.js": "8c149e10cb2b89bab339dae48658d15bf32823237d3365e81afb4824918b6d3a",
+      "service-worker.js": "870ca0e656868d1f318578d412385ebf15bc210c1a2e16fe385a938c3efc8c99"
+    }
+  },
+  "protocol": "maginalia.collector.experimental.v1"
+}
