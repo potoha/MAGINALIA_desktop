@@ -146,10 +146,19 @@ recovery probe; none of these exist in the production entry.
   `readCollectorShelfConfiguration` is valid. `configured_shelf` returns the Shelf
   UUID, `library.json` name, `type: "private"` and `writesEnabled: true`, or the
   configuration error code.
-- `save_web_quote`: request validation (`invalid_request`), then configuration
-  (codes in section 1), then the unchanged `commitShelfQuoteWithNativeLock` with the
-  fixed coordination root. A mutex acquisition timeout maps to `shelf_write_busy`,
-  and any other writer failure maps to `save_failed`. A receipt is returned only
+- `save_web_quote`: request validation (`invalid_request`, including the writer's
+  strict `getDate` ranges), then configuration (codes in section 1), then the
+  `commitShelfQuoteWithNativeLock` writer with the fixed coordination root. The
+  writer validates the request (shape, `get.date`, planned Book/Annotation schema,
+  journal digest conflict for a reused request ID) before it publishes
+  `writer-recovery.json`, so a request rejected by that validation leaves no marker
+  and no journal record. A request that passes it but then hits a Book conflict
+  still publishes the marker, writes an `aborted` journal record and fails with
+  `save_failed`. The permanent request errors (`shelf-write-invalid-request`,
+  `shelf-write-request-mismatch`) map to `invalid_request`; known limitation:
+  `request-mismatch` can also describe Shelf state rather than the request. A mutex acquisition
+  timeout maps to `shelf_write_busy`, and any other writer failure maps to
+  `save_failed`. A receipt is returned only
   after the writer has cleared `writer-recovery.json`, and only in state `committed`
   or `already-committed` for the requested ID and bound Shelf.
 - stdout carries frames only. Responses and stderr carry no paths, path-to-UUID
@@ -157,8 +166,9 @@ recovery probe; none of these exist in the production entry.
 - Time budget: the Collector waits 30 s for a save. The Host's save path is the
   configuration read (milliseconds), then at most the writer's unchanged 15 s mutex
   acquisition timeout, then the commit (normally well under 1 s). A recovery
-  assessment after an interrupted write scans the journal and is not bounded by a
-  separate deadline. This is the only path that could approach the 30 s budget, and
+  assessment after an interrupted write reads the journal and builds the Book and
+  Annotation ID-to-file index once (two directory scans, independent of the journal
+  size); it is not bounded by a separate deadline. This is the only path that could approach the 30 s budget, and
   it is NOT VERIFIED on a large journal.
 
 Tests: `npm run test:collector-product-host` covers the unit cases (origin,

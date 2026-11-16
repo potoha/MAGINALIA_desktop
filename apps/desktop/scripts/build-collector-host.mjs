@@ -16,9 +16,9 @@
  * The build reads the toolchain from this checkout only. Nothing is installed or
  * registered on the build machine.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -122,6 +122,56 @@ async function buildAddon() {
     if (text.includes(dll)) throw new Error(`The Shelf mutex addon imports ${dll}; expected a static CRT (/MT) build.`);
   }
   return addon;
+}
+
+/**
+ * `execArgvExtension: "none"` (a recent SEA option) is what keeps
+ * NODE_OPTIONS and CLI flags away from the Host. A Node that predates it would silently
+ * ignore the option and produce an executable that honours NODE_OPTIONS, so the build
+ * refuses to run on anything older than the pinned major.
+ */
+export const MINIMUM_BUILD_NODE_MAJOR = 24;
+
+export function assertBuildNodeSupportsExecArgvExtension(version = process.versions.node) {
+  const major = Number.parseInt(version.split(".")[0] ?? "", 10);
+  if (!Number.isInteger(major) || major < MINIMUM_BUILD_NODE_MAJOR) {
+    throw new Error(
+      `The Collector Host must be built with Node.js ${MINIMUM_BUILD_NODE_MAJOR} or later `
+      + `(SEA execArgvExtension support); this is ${version}.`,
+    );
+  }
+}
+
+/**
+ * Prove on the built executable that NODE_OPTIONS and CLI runtime flags are ignored.
+ * A rejected origin makes the Host answer without reading any binding or Shelf, so this
+ * check touches no user data. A preload script that runs would leave a marker file.
+ */
+export async function verifyExecutableIgnoresRuntimeOptions(executable) {
+  const marker = path.join(stage, "node-options-injected.txt");
+  const preload = path.join(stage, "node-options-preload.cjs");
+  await writeFile(preload, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "x");
+`);
+  const body = Buffer.from(JSON.stringify({ protocol: "maginalia.collector.experimental.v1", operation: "health" }));
+  const header = Buffer.alloc(4);
+  header.writeUInt32LE(body.length);
+  const input = Buffer.concat([header, body]);
+  const attempts = [
+    { label: "NODE_OPTIONS", args: [], env: { ...process.env, NODE_OPTIONS: `--require "${preload}"` } },
+    { label: "CLI --require", args: ["--require", preload], env: process.env },
+  ];
+  for (const attempt of attempts) {
+    const result = spawnSync(executable, attempt.args, { input, env: attempt.env, cwd: stage, timeout: 30000, windowsHide: true });
+    if (result.error || result.status !== 0) {
+      throw new Error(`The built Host failed the ${attempt.label} check: ${result.error?.message ?? `exit ${result.status}`}.`);
+    }
+    const reply = result.stdout.length >= 4 ? result.stdout.subarray(4, 4 + result.stdout.readUInt32LE(0)).toString("utf8") : "";
+    if (!reply.includes("host_configuration_or_origin_invalid")) {
+      throw new Error(`The built Host did not reject the missing caller origin during the ${attempt.label} check.`);
+    }
+    const injected = await access(marker).then(() => true, () => false);
+    if (injected) throw new Error(`The built Host executed a preload script supplied through ${attempt.label}.`);
+  }
 }
 
 async function buildExecutable(bundleFile) {
@@ -233,6 +283,7 @@ async function writeNotice(nodeLicenseSha256, bundled) {
 
 async function main() {
   if (process.platform !== "win32" || process.arch !== "x64") throw new Error("The Collector Host is built on Windows x64 only.");
+  assertBuildNodeSupportsExecArgvExtension();
   const nodeLicense = await readNodeLicense();
   const nodeLicenseSha256 = sha256(nodeLicense);
   for (const required of [
@@ -253,7 +304,8 @@ async function main() {
   if (!run(process.execPath, [selfTest]).includes("COLLECTOR_HOST_BUNDLE_SELFTEST_OK")) {
     throw new Error("The Collector Host bundle self-test did not pass.");
   }
-  await buildExecutable(bundleFile);
+  const executable = await buildExecutable(bundleFile);
+  await verifyExecutableIgnoresRuntimeOptions(executable);
   await copyFile(addon, path.join(payload, ADDON));
   // Chrome on Windows resolves a relative `path` against the manifest's folder, so the
   // manifest is static ASCII and safe for any (including non-ASCII) install path.

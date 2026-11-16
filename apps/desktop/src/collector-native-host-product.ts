@@ -33,6 +33,7 @@ import {
   type RecordValue,
 } from "./collector-native-host-core.js";
 import { commitShelfQuoteWithNativeLock } from "./shelf-native-write-lock.js";
+import { ShelfWriteCoordinationError } from "./shelf-write-coordination.js";
 import {
   ShelfNativeMutexError,
   getNativeLocalAppDataPath,
@@ -60,6 +61,12 @@ function isMutexBusy(error: unknown): boolean {
   return error instanceof ShelfNativeMutexError && error.code === "shelf-write-busy";
 }
 
+/** The request itself can never succeed; retrying the same bytes cannot help. */
+function isPermanentRequestError(error: unknown): boolean {
+  return error instanceof ShelfWriteCoordinationError
+    && (error.code === "shelf-write-invalid-request" || error.code === "shelf-write-request-mismatch");
+}
+
 async function saveWebQuote(value: RecordValue, dependencies: CollectorProductHostDependencies): Promise<RecordValue> {
   if (!isValidSaveWebQuoteRequest(value)) return protocolError("invalid_request");
   const configuration = await dependencies.readConfiguration();
@@ -79,6 +86,7 @@ async function saveWebQuote(value: RecordValue, dependencies: CollectorProductHo
     });
   } catch (error: unknown) {
     // Shelf paths, quote text and filesystem diagnostics never cross Native Messaging.
+    if (isPermanentRequestError(error)) return protocolError("invalid_request");
     return protocolError(isMutexBusy(error) ? "shelf_write_busy" : "save_failed");
   }
   if (receipt === null || typeof receipt !== "object"

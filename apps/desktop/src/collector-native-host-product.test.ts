@@ -11,6 +11,8 @@ import {
 } from "./collector-native-host-product";
 import { readCollectorShelfConfiguration } from "./collector-shelf-configuration";
 import { commitShelfQuoteWithNativeLock } from "./shelf-native-write-lock";
+import { ShelfWriteCoordinationError } from "./shelf-write-coordination";
+import { COLLECTOR_GET_DATE_PATTERN } from "./collector-native-host-core";
 import { acquireShelfMutex, nativeShelfMutexAvailable, ShelfNativeMutexError } from "./shelf-native-mutex";
 import {
   FIXTURE_SHELF_ID,
@@ -123,6 +125,38 @@ describe("production Host fail-closed configuration", () => {
       expect(await handleCollectorProductRequest(value, origin, deps)).toMatchObject({ ok: false, error: "invalid_request" });
     }
     expect(await handleCollectorProductRequest({ protocol, operation: "save" }, origin, deps)).toMatchObject({ error: "unsupported_operation" });
+  });
+});
+
+describe("production Host request validation and error mapping", () => {
+  it("rejects getDate values the Shelf writer would reject, before configuration or writing", async () => {
+    fixture = await createCollectorFixture();
+    await fixture.writeBinding();
+    const deps = dependencies(fixture, neverWrite);
+    for (const getDate of ["202613011200", "202600011200", "202611001200", "202611321200", "202611122400", "202611121260", "20261112120", "2026111212000", "2026-11-12", ""]) {
+      expect(await handleCollectorProductRequest({ ...save, getDate }, origin, deps)).toEqual({ protocol, ok: false, error: "invalid_request" });
+    }
+    for (const getDate of ["202601010000", "202612312359", "202611121200"]) {
+      expect(COLLECTOR_GET_DATE_PATTERN.test(getDate)).toBe(true);
+    }
+  });
+
+  it("maps permanent request errors to invalid_request and keeps other failures retryable", async () => {
+    fixture = await createCollectorFixture();
+    await fixture.writeBinding();
+    for (const code of ["shelf-write-invalid-request", "shelf-write-request-mismatch"] as const) {
+      const response = await handleCollectorProductRequest(save, origin, dependencies(fixture, async () => {
+        throw new ShelfWriteCoordinationError(code, "private detail", `${fixture?.temp}`);
+      }));
+      expect(response).toEqual({ protocol, ok: false, error: "invalid_request" });
+      expect(JSON.stringify(response)).not.toContain(fixture.temp);
+    }
+    for (const code of ["shelf-write-journal-unavailable", "shelf-write-recovery-state-unavailable", "shelf-write-book-conflict", "shelf-write-receipt-missing"] as const) {
+      const response = await handleCollectorProductRequest(save, origin, dependencies(fixture, async () => {
+        throw new ShelfWriteCoordinationError(code, "private detail");
+      }));
+      expect(response).toEqual({ protocol, ok: false, error: "save_failed" });
+    }
   });
 });
 

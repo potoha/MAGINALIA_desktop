@@ -69,7 +69,12 @@ export function classifyCollectorRequest(value: unknown): CollectorRequestKind {
 }
 
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const GET_DATE_PATTERN = /^\d{12}$/;
+/**
+ * YYYYMMDDHHMM with the same month/day/hour/minute ranges as the Shelf writer's
+ * `GET_DATE_PATTERN` (`shelf-write-coordination.ts`), so a date the writer would reject
+ * is refused here as `invalid_request` instead of reaching the write path.
+ */
+export const COLLECTOR_GET_DATE_PATTERN = /^[0-9]{4}(?:0[1-9]|1[0-2])(?:0[1-9]|[12][0-9]|3[01])(?:[01][0-9]|2[0-3])(?:[0-5][0-9])$/u;
 
 export interface ValidSaveWebQuoteRequest extends RecordValue {
   readonly protocol: string;
@@ -90,7 +95,7 @@ export function isValidSaveWebQuoteRequest(value: RecordValue): value is ValidSa
   if (typeof value.requestId !== "string" || !REQUEST_ID_PATTERN.test(value.requestId)
     || typeof value.quote !== "string" || value.quote.trim().length === 0
     || typeof value.url !== "string" || value.url.length > 8192
-    || typeof value.getDate !== "string" || !GET_DATE_PATTERN.test(value.getDate)) return false;
+    || typeof value.getDate !== "string" || !COLLECTOR_GET_DATE_PATTERN.test(value.getDate)) return false;
   try {
     const parsed = new URL(value.url);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
