@@ -1628,7 +1628,7 @@ function unregisterMarkdownIpc(): void {
 let startupProgressWindow: BrowserWindow | null = null;
 let startupProgressWindowReady = false;
 let startupProgressWindowShown = false;
-let startupProgressState: BrandProgressState = createBrandProgressState("MAGINALIA desktop α1 を起動しています", 0);
+let startupProgressState: BrandProgressState = createBrandProgressState("MAGINALIA α2 wild berry を起動しています", 0);
 let startupOutcome: "pending" | "succeeded" | "failed" = "pending";
 let startupProgressTimer: NodeJS.Timeout | null = null;
 const startupProgressReadiness = new StartupProgressReadiness<BrowserWindow>(10_000);
@@ -1792,7 +1792,7 @@ function completeStartupProgress(window: BrowserWindow): void {
       clearTimeout(startupProgressTimer);
       startupProgressTimer = null;
     }
-    updateStartupProgress("MAGINALIA desktop α1 の準備ができました", 1);
+    updateStartupProgress("MAGINALIA α2 wild berry の準備ができました", 1);
   }
   window.show();
   if (!completesInitialStartup) return;
@@ -2575,7 +2575,7 @@ void app.whenReady().then(async () => {
     console.error("MAGINALIA_FIRST_RUN_JOURNAL_UNAVAILABLE", error);
   }
   if (!smokeMode || brandProgressSmoke) {
-    updateStartupProgress("MAGINALIA desktop α1 を起動しています", 0.08);
+    updateStartupProgress("MAGINALIA α2 wild berry を起動しています", 0.08);
     startStartupProgressWindow(140);
     if (process.platform === "darwin") {
       const dockIcon = resolveBrandAsset("icon.v2.png");

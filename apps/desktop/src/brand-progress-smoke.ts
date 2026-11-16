@@ -22,7 +22,7 @@ export async function runBrandProgressElectronSmoke(options: BrandProgressSmokeO
     throw new Error("The branded splash window was not visible during the Electron smoke.");
   }
   if (applicationName !== MAGINALIA_APPLICATION_NAME || !mainWindow.getTitle().includes(MAGINALIA_APPLICATION_NAME)) {
-    throw new Error("The Electron app or main window did not expose the MAGINALIA desktop α1 identity.");
+    throw new Error("The Electron app or main window did not expose the MAGINALIA α2 wild berry identity.");
   }
   if (expectedUserDataPath !== undefined && path.resolve(userDataPath) !== path.resolve(expectedUserDataPath)) {
     throw new Error("The branded application identity changed the selected Electron userData path.");
@@ -120,7 +120,7 @@ async function inspectProgressAt(
   readonly message: string;
 }> {
   const percent = Math.round(progress * 100);
-  update(`MAGINALIA desktop α1 を起動しています · ${percent}%`, progress);
+  update(`MAGINALIA α2 wild berry を起動しています · ${percent}%`, progress);
   await delay(260);
   const result = await splash.webContents.executeJavaScript(`(() => {
     const message = document.getElementById("startup-message");
