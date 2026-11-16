@@ -3,6 +3,7 @@ import {
   BrowserWindow,
   Menu,
   WebContentsView,
+  clipboard,
   dialog,
   ipcMain,
   shell,
@@ -12,6 +13,7 @@ import {
   type OpenDialogReturnValue,
   type WebContents
 } from "electron";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
@@ -123,6 +125,21 @@ import {
   CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL,
   type CollectorSaveDestinationIpcResult,
 } from "./collector-save-destination-ipc";
+import {
+  COLLECTOR_INTEGRATION_CHANNEL,
+  COLLECTOR_NOTICES_EVENT_CHANNEL,
+  DISMISS_COLLECTOR_NOTICE_CHANNEL,
+  GET_COLLECTOR_NOTICES_CHANNEL,
+  type CollectorIntegrationResponse,
+} from "./collector-integration-ipc";
+import {
+  createCollectorApplyGate,
+  createCollectorIntegrationService,
+  type CollectorIntegrationService,
+} from "./collector-integration-service";
+import { createCollectorIntegrationRuntimeFromParts } from "./collector-startup-refresh-composition";
+import { createProductCollectorRegistryAdapter } from "./collector-registry-adapter";
+import type { CollectorNotice } from "./collector-integration-notices";
 import { createReferenceHandlers } from "./reference-ipc";
 import { resolveShelfQuoteRefs } from "./shelf-resolution";
 import { PackagedReviewerLaunchStrategy, ReviewerProcessManager, UserDataReviewerWorkspaceLocator } from "./reviewer-process-manager";
@@ -206,7 +223,7 @@ import {
 } from "./autosave-ipc";
 import { AutosaveShutdownCoordinator } from "./autosave-shutdown";
 import { establishApplicationIdentity, MAGINALIA_APPLICATION_NAME } from "./application-identity";
-import { enforceE2EIsolationBeforeStartup } from "./e2e-isolation";
+import { E2E_ISOLATION_ROOT_ENV, enforceE2EIsolationBeforeStartup } from "./e2e-isolation";
 import { FirstRunCoordinator } from "./first-run-coordinator";
 import { FirstRunJournalStore } from "./first-run-setup";
 import { runFirstRunRestoreSmoke, runFirstRunSmoke } from "./first-run-smoke";
@@ -230,7 +247,7 @@ import {
 // Test-only E2E isolation gate (#93). Inert unless MAGINALIA_E2E_ISOLATION_ROOT
 // is set; otherwise it exits with code 78 before any Desktop side effect when a
 // Desktop-controlled destination resolves outside the disposable test root.
-enforceE2EIsolationBeforeStartup(app);
+const e2eIsolationState = enforceE2EIsolationBeforeStartup(app);
 
 // Set a product-stable Electron identity before resolving any local stores.
 // Retain the profile Electron selected before this upgrade so existing state
@@ -388,6 +405,106 @@ async function runCollectorSaveDestinationCommand(
   } finally {
     collectorSaveDestinationBusy = false;
   }
+}
+
+// ----- Collector integration (WP-7 slice A) -------------------------------------------------
+// One main-process service owns every Collector apply (setup / repair / remove / startup refresh),
+// serialized through one gate. The renderer only sends enumerated intents; no path crosses IPC.
+const collectorApplyGate = createCollectorApplyGate();
+let collectorIntegration: CollectorIntegrationService | undefined;
+
+function logCollectorIntegrationError(code: string, error?: unknown): void {
+  // Code and error name only: an error message could carry a machine-local path.
+  console.error(code, error instanceof Error ? error.name : typeof error);
+}
+
+function publishCollectorNotices(notices: readonly CollectorNotice[]): void {
+  const window = mainWindow;
+  if (window === null || window.isDestroyed() || window.webContents.isDestroyed()) return;
+  window.webContents.send(COLLECTOR_NOTICES_EVENT_CHANNEL, notices);
+}
+
+function launchDetachedProcess(executablePath: string, args: readonly string[]): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const child = spawn(executablePath, [...args], { detached: true, stdio: "ignore" });
+      child.once("error", () => resolve(false));
+      child.once("spawn", () => {
+        child.unref();
+        resolve(true);
+      });
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+async function confirmCollectorRemoval(): Promise<{ readonly confirmed: boolean; readonly clearSaveDestination: boolean }> {
+  const result = await showCollectorSaveDestinationDialog({
+    type: "question",
+    title: "Collector 連携",
+    message: "Collector 連携を解除しますか？",
+    detail: "この MAGINALIA の連携プログラムの登録と、拡張機能のフォルダーを削除します。本棚・引用データ・Workdesk・書き込み記録は削除されません。Chrome に保留中の引用がある場合は、先に Collector で内容を確認してください。Chrome の拡張機能一覧に残る MAGINALIA Collector は、Chrome の画面から削除できます（削除すると保留中の引用も消えます）。",
+    buttons: ["解除する", "キャンセル"],
+    defaultId: 1,
+    cancelId: 1,
+    checkboxLabel: "保存先の設定も解除する",
+    checkboxChecked: false,
+    noLink: true,
+  });
+  return { confirmed: result.response === 0, clearSaveDestination: result.response === 0 && result.checkboxChecked };
+}
+
+/** Builds the service once. Never throws: a failure leaves the feature off and the app starting. */
+function createCollectorIntegrationForMain(): CollectorIntegrationService | undefined {
+  try {
+    const runtime = createCollectorIntegrationRuntimeFromParts({
+      e2eIsolationActive: e2eIsolationState !== undefined || process.env[E2E_ISOLATION_ROOT_ENV] !== undefined,
+      createRegistry: createProductCollectorRegistryAdapter,
+      inspectPathSecurity: inspectNativePathSecurity,
+      createPrivateDirectory: createNativePrivateDirectory,
+      resourcesPath: process.resourcesPath,
+      isPackaged: app.isPackaged,
+      processEnvironment: process.env,
+      noticeStatePath: path.join(userDataPath, "collector-notice-state.json"),
+      wrapApply: (apply) => (request) => collectorApplyGate.queue(() => apply(request)),
+    });
+    return createCollectorIntegrationService({
+      mode: runtime.mode,
+      startupRefresh: runtime.startupRefresh,
+      inspect: runtime.inspect,
+      apply: runtime.apply,
+      locateChrome: runtime.locateChrome,
+      gate: collectorApplyGate,
+      launchChrome: launchDetachedProcess,
+      writeClipboardText: (text) => clipboard.writeText(text),
+      openFolder: async (folder) => (await shell.openPath(folder)) === "",
+      confirmRemove: confirmCollectorRemoval,
+      clearSaveDestination: () => runCollectorSaveDestinationCommand(clearCollectorSaveDestination),
+      publishNotices: publishCollectorNotices,
+      logError: logCollectorIntegrationError,
+    });
+  } catch (error: unknown) {
+    logCollectorIntegrationError("MAGINALIA_COLLECTOR_INTEGRATION_UNAVAILABLE", error);
+    return undefined;
+  }
+}
+
+/** Fire and forget: the startup path never waits for the Collector inspection or refresh. */
+function startCollectorIntegration(): void {
+  if (smokeMode) return; // smoke runs must not touch the registry
+  collectorIntegration = createCollectorIntegrationForMain();
+  const service = collectorIntegration;
+  if (service === undefined) return;
+  void service.runStartup();
+  service.startPeriodicReconcile();
+  app.on("browser-window-focus", () => { void service.reconcile(); });
+}
+
+async function handleCollectorIntegrationRequest(event: IpcMainInvokeEvent, value: unknown, ...args: readonly unknown[]): Promise<CollectorIntegrationResponse> {
+  if (args.length !== 0 || !isLiveMainWindowSender(event.sender)) return { kind: "error" };
+  if (collectorIntegration === undefined) return { kind: "unavailable", reason: "startup-failed" };
+  return collectorIntegration.handle(value);
 }
 
 let configuredPrivateShelf: ConfiguredPrivateShelf | undefined;
@@ -1460,6 +1577,15 @@ function registerMarkdownIpc(): void {
     if (event.sender !== mainWindow?.webContents) return { kind: "error" };
     return runCollectorSaveDestinationCommand(clearCollectorSaveDestination);
   });
+  ipcMain.handle(COLLECTOR_INTEGRATION_CHANNEL, handleCollectorIntegrationRequest);
+  ipcMain.handle(GET_COLLECTOR_NOTICES_CHANNEL, (event, ...args: readonly unknown[]): readonly CollectorNotice[] => {
+    if (args.length !== 0 || !isLiveMainWindowSender(event.sender)) return [];
+    return collectorIntegration?.currentNotices() ?? [];
+  });
+  ipcMain.handle(DISMISS_COLLECTOR_NOTICE_CHANNEL, async (event, noticeId: unknown, ...args: readonly unknown[]): Promise<readonly CollectorNotice[]> => {
+    if (args.length !== 0 || !isLiveMainWindowSender(event.sender)) return [];
+    return collectorIntegration?.dismissNotice(noticeId) ?? [];
+  });
   ipcMain.handle(OPEN_BUNDLED_MANUAL_CHANNEL, async (event) => {
     if (event.sender !== mainWindow?.webContents) return { kind: "error" as const };
     const manualPath = app.isPackaged
@@ -1571,6 +1697,9 @@ function unregisterMarkdownIpc(): void {
   ipcMain.removeHandler(OPEN_BUNDLED_MANUAL_CHANNEL);
   ipcMain.removeHandler(CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL);
   ipcMain.removeHandler(CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL);
+  ipcMain.removeHandler(COLLECTOR_INTEGRATION_CHANNEL);
+  ipcMain.removeHandler(GET_COLLECTOR_NOTICES_CHANNEL);
+  ipcMain.removeHandler(DISMISS_COLLECTOR_NOTICE_CHANNEL);
   ipcMain.removeHandler(GET_FIRST_RUN_STATUS_CHANNEL);
   ipcMain.removeHandler(RUN_FIRST_RUN_SETUP_CHANNEL);
   ipcMain.removeHandler(OPEN_MARKDOWN_CHANNEL);
@@ -2611,6 +2740,7 @@ void app.whenReady().then(async () => {
   if (!smokeMode || brandProgressSmoke) updateStartupProgress("編集画面を読み込んでいます", 0.72);
   openMainWindow();
   app.on("activate", openMainWindow);
+  startCollectorIntegration();
 });
 
 app.on("will-quit", () => {
@@ -2624,6 +2754,7 @@ app.on("will-quit", () => {
   cleanupStartupProgressWindowListeners();
   if (reviewerProcessManager !== undefined) void reviewerProcessManager.shutdown();
   void modHost.dispose();
+  collectorIntegration?.stop();
   unregisterMarkdownIpc();
 });
 

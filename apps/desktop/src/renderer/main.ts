@@ -57,6 +57,7 @@ import { stripDerivedReferenceList } from "./reference-list";
 import { ContextKeyService } from "./command-context";
 import { CommandRegistry, type CommandArgs } from "./command-registry";
 import { registerDocumentTabCommands, ACTIVATE_DOCUMENT_COMMAND_ID } from "./document-tab-commands";
+import { registerCollectorIntegrationCommands } from "./collector-integration-commands";
 import { registerLinkCommands, OPEN_EXTERNAL_LINK_COMMAND_ID, OPEN_INTERNAL_LINK_AT_CURSOR_COMMAND_ID, OPEN_EXTERNAL_LINK_AT_CURSOR_COMMAND_ID, OPEN_INTERNAL_LINK_COMMAND_ID } from "./link-commands";
 import {
   INSERT_PROJECT_SEARCH_SELECTION_COMMAND_ID,
@@ -2005,6 +2006,10 @@ commandRegistry.register({
   keywords: ["collector", "browser", "extension", "unbind", "clear", "解除"]
 }, async () => {
   await window.maginalia.clearCollectorSaveDestination?.();
+});
+registerCollectorIntegrationCommands(commandRegistry, {
+  run: typeof window.maginalia.runCollectorIntegration === "function" ? (request) => window.maginalia.runCollectorIntegration!(request) : null,
+  dismiss: typeof window.maginalia.dismissCollectorNotice === "function" ? (noticeId) => window.maginalia.dismissCollectorNotice!(noticeId) : null
 });
 commandRegistry.register({
   id: "maginalia.workdesk.open",
