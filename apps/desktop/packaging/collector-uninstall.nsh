@@ -6,7 +6,8 @@
 # the design win and this file is the one to fix.
 #
 # Rules (all enforced by src/collector-uninstall.test.ts):
-#  - Runs only from `customUnInstall` and only when NOT ${isUpdated} (an update keeps the integration).
+#  - Runs only from `customUnInstall`, only when NOT ${isUpdated} (an update keeps the integration)
+#    and only for a per-user install ($installMode == "CurrentUser"; see the macro at the end).
 #  - The HKCU Native Messaging Host key is removed only when its default value equals OUR manifest
 #    path. A foreign value is left alone and the folder cleanup still runs.
 #  - Files are deleted only inside the fixed program folder, only by fixed name (or our private
@@ -33,12 +34,20 @@
 
 !ifdef BUILD_UNINSTALLER
 
-# Pop path; $0 = "none" | "link" (any reparse point) | "dir" | "file". Clobbers $0-$3.
+# Pop path; $0 = "none" | "unknown" | "link" (any reparse point) | "dir" | "file". Clobbers $0-$3.
 Function un.MAGINALIA_PathKind
   Pop $1
-  System::Call 'Kernel32::GetFileAttributesW(w r1)i.r2'
+  System::Call 'Kernel32::GetFileAttributesW(w r1)i.r2 ? e'
+  Pop $3
   ${If} $2 == -1
-    StrCpy $0 "none"
+    # Only "not found" counts as absent (2 = FILE_NOT_FOUND, 3 = PATH_NOT_FOUND). Any other failure
+    # (access denied, sharing problem) is "unknown": treated as present and never deleted.
+    ${If} $3 == 2
+    ${OrIf} $3 == 3
+      StrCpy $0 "none"
+    ${Else}
+      StrCpy $0 "unknown"
+    ${EndIf}
     Return
   ${EndIf}
   IntOp $3 $2 & 0x400
@@ -250,16 +259,19 @@ Function un.MAGINALIA_HasValidState
   FileWrite $9 `  $$p = $$env:MAGINALIA_COLLECTOR_STATE$\r$\n`
   FileWrite $9 `  $$i = Get-Item -LiteralPath $$p -Force$\r$\n`
   FileWrite $9 `  if ($$i.PSIsContainer -or ($$i.Attributes -band 1024) -or $$i.Length -gt 4096) { exit 3 }$\r$\n`
-  FileWrite $9 `  $$t = [System.IO.File]::ReadAllText($$p, (New-Object System.Text.UTF8Encoding($$false, $$true)))$\r$\n`
+  FileWrite $9 `  $$b = [System.IO.File]::ReadAllBytes($$p)$\r$\n`
+  FileWrite $9 `  if ($$b.Length -ge 3 -and $$b[0] -eq 239 -and $$b[1] -eq 187 -and $$b[2] -eq 191) { $$b = $$b[3..($$b.Length - 1)] }$\r$\n`
+  FileWrite $9 `  $$t = (New-Object System.Text.UTF8Encoding($$false, $$true)).GetString([byte[]]$$b)$\r$\n`
   FileWrite $9 `  Add-Type -AssemblyName System.Web.Extensions$\r$\n`
   FileWrite $9 `  $$o = (New-Object System.Web.Script.Serialization.JavaScriptSerializer).DeserializeObject($$t)$\r$\n`
   FileWrite $9 `  if ($$o -isnot [System.Collections.IDictionary] -or $$o.Count -ne 5) { exit 3 }$\r$\n`
   FileWrite $9 `  foreach ($$k in 'version','payloadId','activeSlot','extensionVersion','placedAt') { if (-not $$o.ContainsKey($$k)) { exit 3 } }$\r$\n`
   FileWrite $9 `  if ($$o['version'] -isnot [int] -or $$o['version'] -ne 1) { exit 3 }$\r$\n`
-  FileWrite $9 `  if ($$o['payloadId'] -isnot [string] -or $$o['payloadId'] -cnotmatch '^[0-9A-Za-z][0-9A-Za-z.-]{0,63}\+[0-9A-Za-z]{1,40}$$') { exit 3 }$\r$\n`
+  FileWrite $9 `  if ($$o['payloadId'] -isnot [string] -or $$o['payloadId'] -cnotmatch '^[0-9A-Za-z][0-9A-Za-z.-]{0,63}\+[0-9A-Za-z]{1,40}\z') { exit 3 }$\r$\n`
   FileWrite $9 `  if ($$o['activeSlot'] -isnot [string] -or ($$o['activeSlot'] -cne 'a' -and $$o['activeSlot'] -cne 'b')) { exit 3 }$\r$\n`
-  FileWrite $9 `  if ($$o['extensionVersion'] -isnot [string] -or $$o['extensionVersion'] -cnotmatch '^\d{1,9}(\.\d{1,9}){0,3}(-[0-9A-Za-z][0-9A-Za-z.-]{0,31})?(\+[0-9A-Za-z][0-9A-Za-z.-]{0,63})?$$') { exit 3 }$\r$\n`
-  FileWrite $9 `  if ($$o['placedAt'] -isnot [string] -or $$o['placedAt'] -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$$') { exit 3 }$\r$\n`
+  FileWrite $9 `  if ($$o['extensionVersion'] -isnot [string] -or $$o['extensionVersion'] -cnotmatch '^[0-9]{1,9}(\.[0-9]{1,9}){0,3}(-(?<pre>[0-9A-Za-z][0-9A-Za-z.-]{0,31}))?(\+[0-9A-Za-z][0-9A-Za-z.-]{0,63})?\z') { exit 3 }$\r$\n`
+  FileWrite $9 `  if ($$Matches['pre'] -and @($$Matches['pre'].Split('.') | Where-Object { $$_.Length -eq 0 }).Count -gt 0) { exit 3 }$\r$\n`
+  FileWrite $9 `  if ($$o['placedAt'] -isnot [string] -or $$o['placedAt'] -cnotmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,3})?Z\z') { exit 3 }$\r$\n`
   FileWrite $9 `  exit 0$\r$\n`
   FileWrite $9 `} catch { exit 3 }$\r$\n`
   FileClose $9
@@ -300,6 +312,8 @@ Function un.MAGINALIA_CleanProgramFolder
   # The state file goes last, and only when every owned folder is gone, so that an interrupted or
   # partial cleanup still looks like ours (WP-5b). Then the root, non-recursive.
   StrCpy $7 "0"
+  StrCpy $8 "${MAGINALIA_COLLECTOR_MANIFEST_NAME}"
+  Call un.MAGINALIA_NoteLeftover
   StrCpy $8 "host-a"
   Call un.MAGINALIA_NoteLeftover
   StrCpy $8 "host-b"
@@ -392,8 +406,17 @@ FunctionEnd
 
 # Only a real uninstall removes the integration. electron-builder's update path runs the previous
 # uninstaller with --updated; the registration and folder must survive it (design 2.3, 8.5).
+#
+# Only for a per-user install. In an "all users" install (`$installMode == "all"`, set by
+# setInstallModePerAllUsers, which also does SetShellVarContext all and runs the uninstaller
+# elevated) NSIS's $LOCALAPPDATA is C:\ProgramData: a folder an ordinary user can pre-create
+# (valid state file, junctions) and an administrator's uninstaller must never delete from. Nothing
+# is cleaned up there; the in-app removal command is the way out for such users (design 2.4).
+# electron-builder's multiUser.nsh: `Var installMode`, values "CurrentUser" or "all".
 !macro customUnInstall
   ${ifNot} ${isUpdated}
-    !insertmacro MAGINALIA_CollectorCleanup
+    ${if} $installMode == "CurrentUser"
+      !insertmacro MAGINALIA_CollectorCleanup
+    ${endIf}
   ${endIf}
 !macroend

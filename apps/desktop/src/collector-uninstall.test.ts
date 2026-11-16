@@ -10,7 +10,7 @@ import os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { COLLECTOR_EXTENSION_PREVIOUS_NAME, COLLECTOR_EXTENSION_STAGING_NAME, COLLECTOR_HOST_LICENSE_FILES } from "./collector-integration-apply.js";
-import { COLLECTOR_EXTENSION_FOLDER_NAME, COLLECTOR_HOST_SLOTS, COLLECTOR_STATE_FILE_NAME } from "./collector-integration.js";
+import { COLLECTOR_EXTENSION_FOLDER_NAME, COLLECTOR_HOST_SLOTS, COLLECTOR_STATE_FILE_NAME, parseIntegrationStateFile } from "./collector-integration.js";
 import { COLLECTOR_HOST_ADDON_NAME, COLLECTOR_HOST_EXECUTABLE_NAME } from "./collector-payload.js";
 import { COLLECTOR_HOST_REGISTRY_SUBKEY, COLLECTOR_MANIFEST_FILE_NAME, COLLECTOR_PROGRAM_FOLDER_NAME } from "./windows-integration.js";
 
@@ -35,6 +35,30 @@ function functionBody(source: string, name: string): string {
   return match[1] as string;
 }
 
+/**
+ * The LogicLib conditions enclosing the first line that starts with `prefix`, outermost first. A
+ * block's `${AndIf}` / `${OrIf}` lines are appended to its opening line. Throws when the line does
+ * not exist.
+ */
+function enclosingConditions(body: string, prefix: string): string[] {
+  const stack: string[] = [];
+  for (const raw of body.split("\n")) {
+    const line = raw.trim();
+    if (line.startsWith(prefix)) return [...stack];
+    if (/^\$\{(if|ifNot|IfNot|If)\}/u.test(line)) stack.push(line);
+    else if (/^\$\{(AndIf|OrIf|AndIfNot|OrIfNot)\}/u.test(line)) stack[stack.length - 1] += ` ${line}`;
+    else if (/^\$\{(endIf|EndIf)\}/u.test(line)) stack.pop();
+  }
+  throw new Error(`line not found: ${prefix}`);
+}
+
+/** The PowerShell state check, rebuilt from the FileWrite lines of un.MAGINALIA_HasValidState. */
+function stateCheckScript(source: string): string {
+  const body = functionBody(source, "un.MAGINALIA_HasValidState");
+  const lines = [...body.matchAll(/^ {2}FileWrite \$9 `(.*)\$\\r\$\\n`$/gmu)].map((match) => (match[1] as string).replaceAll("$$", "$"));
+  return `${lines.join("\r\n")}\r\n`;
+}
+
 /** `Push "$R8\name"` lines of a function, as bare names. */
 function pushedNames(body: string): string[] {
   return [...body.matchAll(/^ {2}Push "\$R8\\([^"]+)"$/gmu)].map((match) => match[1] as string);
@@ -51,7 +75,13 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
     expect(builder.nsis.deleteAppDataOnUninstall).toBe(false);
     const hook = /!macro customUnInstall\n([\s\S]*?)!macroend/u.exec(source);
     expect(hook).not.toBeNull();
-    expect((hook as RegExpExecArray)[1]).toMatch(/\$\{ifNot\} \$\{isUpdated\}\n\s*!insertmacro MAGINALIA_CollectorCleanup\n\s*\$\{endIf\}/u);
+    // Structure, not order: the cleanup call sits INSIDE both the not-updated and the per-user blocks.
+    const conditions = enclosingConditions((hook as RegExpExecArray)[1] as string, "!insertmacro MAGINALIA_CollectorCleanup");
+    expect(conditions).toEqual(["${ifNot} ${isUpdated}", '${if} $installMode == "CurrentUser"']);
+    expect(source.match(/^\s*!insertmacro MAGINALIA_CollectorCleanup$/gmu)?.length).toBe(1);
+    // An "all users" uninstall runs elevated with $LOCALAPPDATA = ProgramData; only "CurrentUser" may
+    // reach the cleanup (electron-builder multiUser.nsh: `Var installMode`, "CurrentUser" | "all").
+    expect(codeLines(source).join("\n")).not.toMatch(/\$installMode\s*(!=|==)\s*"all"/u);
   });
 
   it("unregisters only when the registry value equals our own manifest path", async () => {
@@ -88,7 +118,7 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
     expect(lines.filter((line) => /^Delete\b/u.test(line) && /[*?]/u.test(line))).toEqual([]);
     expect(lines.filter((line) => /^(RMDir|Delete|Rename|CopyFiles)\b/u.test(line) && /[*?]/u.test(line))).toEqual([]);
     // Wildcards exist only to enumerate private temp files; each hit is validated before deletion.
-    expect(lines.filter((line) => !line.startsWith("FileWrite ") && /[*?]/u.test(line) && !/^FindFirst \$R6 \$R7 "\$R5\\\*\.tmp"$/u.test(line) && !line.startsWith("ReadRegStr"))).toEqual([]);
+    expect(lines.filter((line) => !line.startsWith("FileWrite ") && !line.startsWith("System::Call ") && /[*?]/u.test(line) && !/^FindFirst \$R6 \$R7 "\$R5\\\*\.tmp"$/u.test(line) && !line.startsWith("ReadRegStr"))).toEqual([]);
     const sweep = functionBody(source, "un.MAGINALIA_DeleteTempFiles");
     expect(sweep.indexOf("Call un.MAGINALIA_IsTempName")).toBeGreaterThan(-1);
     expect(sweep.indexOf("Call un.MAGINALIA_IsTempName")).toBeLessThan(sweep.indexOf("Call un.MAGINALIA_DeleteOwnedFile"));
@@ -102,6 +132,12 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
     expect(kind).toContain("GetFileAttributesW");
     expect(kind).toContain("0x400"); // FILE_ATTRIBUTE_REPARSE_POINT
     expect(kind.indexOf("0x400")).toBeLessThan(kind.indexOf("0x10"));
+    // Only "not found" (2, 3) counts as absent; any other failure is "unknown" (= present, never deleted).
+    expect(kind).toContain("? e");
+    expect(kind).toMatch(/\$3 == 2\n\s*\$\{OrIf\} \$3 == 3\n\s*StrCpy \$0 "none"\n\s*\$\{Else\}\n\s*StrCpy \$0 "unknown"/u);
+    // The delete sits INSIDE the "regular file" branch, the directory removal inside the "plain dir" branch.
+    expect(enclosingConditions(functionBody(source, "un.MAGINALIA_DeleteOwnedFile"), "Delete $R1")).toEqual(['${If} $0 == "file"']);
+    expect(enclosingConditions(functionBody(source, "un.MAGINALIA_RemoveEmptyDir"), "RMDir $R1")).toEqual(['${If} $0 == "dir"']);
   });
 
   it("touches the program folder only after a valid integration-state.json proved ownership", async () => {
@@ -115,6 +151,13 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
     expect(guard).toBeGreaterThan(validate);
     expect(clean).toBeGreaterThan(guard);
     expect(body.match(/Call un\.MAGINALIA_CleanProgramFolder/gu)?.length).toBe(1);
+    // Structure: the folder cleanup is INSIDE the "state is valid" block, and that block tests the
+    // un-inverted result of HasValidState ($0 == "1" is ownership proven).
+    expect(enclosingConditions(body, "Call un.MAGINALIA_CleanProgramFolder")).toEqual(['${If} $0 == "1"']);
+    const validState = functionBody(source, "un.MAGINALIA_HasValidState");
+    expect(validState).toMatch(/\$\{If\} \$9 == "0"\n\s*StrCpy \$0 "1"\n\s*\$\{Else\}\n\s*StrCpy \$0 "0"\n\s*\$\{EndIf\}\s*$/u);
+    // Every early return of HasValidState reports "not ours".
+    for (const match of validState.matchAll(/StrCpy \$0 "(\d)"\n\s*Return/gu)) expect(match[1]).toBe("0");
     // Nothing below the program folder is reached from anywhere else.
     for (const name of ["CleanSlot", "CleanExtension", "DeleteTempFiles"]) {
       const callers = [...source.matchAll(new RegExp(`Call un\\.MAGINALIA_${name}`, "gu"))].length;
@@ -123,7 +166,7 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
     const validity = functionBody(source, "un.MAGINALIA_HasValidState");
     expect(validity).toContain("${MAGINALIA_COLLECTOR_STATE_NAME}");
     expect(source).toContain(`!define MAGINALIA_COLLECTOR_STATE_NAME "${COLLECTOR_STATE_FILE_NAME}"`);
-    // Same five fields and patterns as parseIntegrationStateFile; any failure means "not ours".
+    // Equivalent strictness to parseIntegrationStateFile (proven by the execution test below); any failure means "not ours".
     for (const field of ["version", "payloadId", "activeSlot", "extensionVersion", "placedAt"]) expect(validity).toContain(`'${field}'`);
     expect(validity).toContain("$$o.Count -ne 5");
     expect(validity).toContain("catch { exit 3 }");
@@ -132,6 +175,10 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
     // Folder cleanup: the state file goes last and only when every owned folder is gone.
     const folder = functionBody(source, "un.MAGINALIA_CleanProgramFolder");
     expect(folder.indexOf("MAGINALIA_NoteLeftover")).toBeGreaterThan(folder.indexOf("Call un.MAGINALIA_CleanExtension"));
+    // The manifest and all five subfolders are checked for leftovers (WP-5b: a surviving manifest keeps the state file).
+    const noted = [...folder.matchAll(/StrCpy \$8 "([^"]+)"\n\s*Call un\.MAGINALIA_NoteLeftover/gu)].map((match) => match[1]);
+    expect(noted).toEqual(["${MAGINALIA_COLLECTOR_MANIFEST_NAME}", "host-a", "host-b", "extension", "extension.next", "extension.prev"]);
+    expect(enclosingConditions(folder, "Push \"$6\\${MAGINALIA_COLLECTOR_STATE_NAME}\"")).toEqual(['${If} $7 == "0"']);
     expect(folder.lastIndexOf("MAGINALIA_COLLECTOR_STATE_NAME")).toBeGreaterThan(folder.indexOf('${If} $7 == "0"'));
   });
 
@@ -161,6 +208,12 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
     for (const name of versions.collectorExtension.files) expect(listed, `pinned file ${name}`).toContain(name);
     for (const name of Object.keys(example.extension.files)) expect(listed, `example file ${name}`).toContain(name);
     for (const name of listed) expect(name).not.toMatch(/[\\/*?]|^\.\.?$/u);
+    // Append-only snapshot: names of every Collector release ever pinned. Add new names; NEVER remove one.
+    const everPinned = [
+      "manifest.json", "capture.css", "capture.html", "capture.js", "host-client.js", "icon..png", "onboarding.css",
+      "onboarding.html", "onboarding.js", "outbox.js", "popup.css", "popup.html", "popup.js", "service-worker.js",
+    ];
+    for (const name of everPinned) expect(listed, `append-only: ${name} must stay`).toContain(name);
   });
 
   it("knows the private temp name pattern <name>.<16 lowercase hex>.tmp", async () => {
@@ -189,7 +242,99 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
     for (const use of uses) expect(use).toMatch(/^\$LOCALAPPDATA\\\$\{MAGINALIA_COLLECTOR_PROGRAM_SUBPATH\}/u);
   });
 
+  const powershell = findPowerShell();
+  if (powershell === undefined) console.warn("[collector-uninstall] SKIPPED state-check equivalence test: Windows PowerShell 5.1 is not available (non-Windows platform or missing powershell.exe).");
+  it.skipIf(powershell === undefined)("the PowerShell state check accepts and rejects exactly what parseIntegrationStateFile does", async () => {
+    const valid = {
+      version: 1,
+      payloadId: "0.2.0+abc1234",
+      activeSlot: "a",
+      extensionVersion: "0.3.0",
+      placedAt: "2026-11-16T01:02:03.456Z",
+    };
+    const text = (override: Record<string, unknown> = {}, drop: string[] = []): string => {
+      const value: Record<string, unknown> = { ...valid, ...override };
+      for (const key of drop) delete value[key];
+      return JSON.stringify(value);
+    };
+    const utf8 = (value: string): Buffer => Buffer.from(value, "utf8");
+    const cases: Array<[string, Buffer]> = [
+      ["valid", utf8(text())],
+      ["valid, trailing newline", utf8(`${text()}\n`)],
+      ["valid, CRLF pretty", utf8(JSON.stringify(valid, null, 2).replaceAll("\n", "\r\n"))],
+      ["valid, UTF-8 BOM", Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), utf8(text())])],
+      ["valid, slot b, prerelease", utf8(text({ activeSlot: "b", extensionVersion: "1.2.3.4-rc.1+build.5" }))],
+      ["empty", Buffer.alloc(0)],
+      ["whitespace only", utf8("  \n")],
+      ["broken JSON", utf8('{"version":1,')],
+      ["not an object", utf8("[]")],
+      ["null", utf8("null")],
+      ["missing version", utf8(text({}, ["version"]))],
+      ["missing placedAt", utf8(text({}, ["placedAt"]))],
+      ["only one field", utf8('{"version":1}')],
+      ["extra key", utf8(text({ extra: 1 }))],
+      ["version 2", utf8(text({ version: 2 }))],
+      ["version as string", utf8(text({ version: "1" }))],
+      ["bad slot", utf8(text({ activeSlot: "c" }))],
+      ["slot uppercase", utf8(text({ activeSlot: "A" }))],
+      ["payloadId without build", utf8(text({ payloadId: "0.2.0" }))],
+      ["payloadId trailing newline", utf8(text({ payloadId: "0.2.0+abc1234\n" }))],
+      ["payloadId number", utf8(text({ payloadId: 1 }))],
+      ["extensionVersion trailing newline", utf8(text({ extensionVersion: "0.3.0\n" }))],
+      ["extensionVersion full-width digits", utf8(text({ extensionVersion: "０.３.０" }))],
+      ["extensionVersion empty prerelease part", utf8(text({ extensionVersion: "1.0.0-a..b" }))],
+      ["extensionVersion trailing dot prerelease", utf8(text({ extensionVersion: "1.0.0-a." }))],
+      ["extensionVersion five parts", utf8(text({ extensionVersion: "1.2.3.4.5" }))],
+      ["extensionVersion garbage", utf8(text({ extensionVersion: "latest" }))],
+      ["placedAt full-width digits", utf8(text({ placedAt: "２026-11-16T01:02:03Z" }))],
+      ["placedAt trailing newline", utf8(text({ placedAt: "2026-11-16T01:02:03Z\n" }))],
+      ["placedAt no zone", utf8(text({ placedAt: "2026-11-16T01:02:03" }))],
+      ["UTF-16LE with BOM", Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text(), "utf16le")])],
+      ["UTF-16BE with BOM", Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(text(), "utf16le").swap16()])],
+      ["invalid UTF-8", Buffer.concat([utf8('{"version":1,"payloadId":"'), Buffer.from([0xff, 0xfe]), utf8('"}')])],
+    ];
+    const oversize = utf8(`${text()}${" ".repeat(5000)}`);
+    const directory = await mkdtemp(path.join(os.tmpdir(), "maginalia-state-"));
+    try {
+      const script = path.join(directory, "check.ps1");
+      await writeFile(script, stateCheckScript(await readScript()), "utf8");
+      const all: Array<[string, Buffer]> = [...cases, ["oversize (> 4096 bytes)", oversize]];
+      for (const [index, [, bytes]] of all.entries()) await writeFile(path.join(directory, `case-${index}.json`), bytes);
+      const driver = path.join(directory, "run.ps1");
+      await writeFile(
+        driver,
+        [
+          "$dir = $args[0]",
+          "$check = Join-Path $dir 'check.ps1'",
+          `foreach ($i in 0..${all.length - 1}) {`,
+          "  $env:MAGINALIA_COLLECTOR_STATE = Join-Path $dir \"case-$i.json\"",
+          "  & $check",
+          "  Write-Output \"$i=$LASTEXITCODE\"",
+          "}",
+          "",
+        ].join("\r\n"),
+        "utf8",
+      );
+      const output = execFileSync(powershell as string, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", driver, directory], { encoding: "utf8" });
+      const results = new Map([...output.matchAll(/^(\d+)=(\d+)\s*$/gmu)].map((match) => [Number(match[1]), Number(match[2])]));
+      for (const [index, [label, bytes]] of all.entries()) {
+        let expected = false;
+        if (bytes.length <= 4096) {
+          try {
+            expected = parseIntegrationStateFile(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) !== undefined;
+          } catch {
+            expected = false;
+          }
+        }
+        expect(results.get(index) === 0, `${label} (script exit ${String(results.get(index))})`).toBe(expected);
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 120_000);
+
   const makensis = findMakensis();
+  if (makensis === undefined) console.warn("[collector-uninstall] SKIPPED makensis compile test: electron-builder's cached NSIS (makensis.exe) was not found; the script compile is NOT VERIFIED here.");
   it.skipIf(makensis === undefined)("compiles as an uninstaller with the electron-builder NSIS", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "maginalia-nsis-"));
     try {
@@ -205,11 +350,13 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
           '  StrCmp "$0" "1" `${_t}` `${_f}`',
           "!macroend",
           '!define isUpdated `"" isUpdated ""`',
+          "Var installMode",
           'Name "check"',
           `OutFile "${path.join(directory, "check.exe")}"`,
           "RequestExecutionLevel user",
           `!include "${scriptPath}"`,
           'Section "i"',
+          '  StrCpy $installMode "CurrentUser"',
           `  WriteUninstaller "${path.join(directory, "u.exe")}"`,
           "SectionEnd",
           'Section "un.u"',
@@ -226,6 +373,13 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
     }
   });
 });
+
+function findPowerShell(): string | undefined {
+  const root = process.env.SystemRoot;
+  if (process.platform !== "win32" || root === undefined) return undefined;
+  const candidate = path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  return existsSync(candidate) ? candidate : undefined;
+}
 
 function findMakensis(): string | undefined {
   const local = process.env.LOCALAPPDATA;
