@@ -1,0 +1,327 @@
+/**
+ * Collector integration service (main process, WP-7 slice A).
+ *
+ * The single object the IPC handlers, the startup run and the focus / interval reconcile talk to.
+ * Every side effect is injected, so the rules below are unit-tested with fakes; nothing here
+ * imports Electron.
+ *
+ *  - Apply-class operations (`setup`, `repair`, `remove`, and the startup `refresh`) run one at a
+ *    time through ONE gate (`createCollectorApplyGate`). A user intent that arrives while another
+ *    apply is running or queued is answered `busy` immediately (no queueing of user clicks, so a
+ *    repeated click can never replay a stale `remove` after a `setup`). The startup refresh QUEUES
+ *    behind a user apply instead of failing, because it has no user to retry it.
+ *  - Every apply result is handed to the orchestrator (`recordApplyResult`) and the resulting
+ *    notice list is published.
+ *  - `setup` refuses without Chrome unless the user explicitly continued (design 4.2). `remove`
+ *    always asks for confirmation here, in the main process, so the renderer cannot remove the
+ *    integration on its own.
+ *  - Results are summaries (`collector-integration-ipc.ts`): no machine-local path is returned and
+ *    nothing here logs one. Errors are logged by code only.
+ */
+import type { CollectorNotice } from "./collector-integration-notices.js";
+import type { CollectorApplyRequest, CollectorApplyResult } from "./collector-integration-apply-types.js";
+import type { CollectorInspectOptions, CollectorIntegrationInspection, ChromeLocation } from "./collector-integration-types.js";
+import type { CollectorStartupRefresh, CollectorStartupResult } from "./collector-startup-refresh.js";
+import type { CollectorIntegrationRuntimeMode } from "./collector-startup-refresh-composition.js";
+import {
+  isCollectorIntegrationRequest,
+  isCollectorNoticeId,
+  type CollectorConnectionSummary,
+  type CollectorIntegrationRequest,
+  type CollectorIntegrationResponse,
+  type CollectorIntegrationStatus,
+} from "./collector-integration-ipc.js";
+import type { CollectorSaveDestinationIpcResult } from "./collector-save-destination-ipc.js";
+
+// ----- Serialization gate --------------------------------------------------------------------
+
+export interface CollectorApplyGate {
+  /** Runs `task` when nothing is running or queued; otherwise resolves `{ ran: false }` without running it. */
+  tryRun<T>(task: () => Promise<T>): Promise<{ readonly ran: true; readonly value: T } | { readonly ran: false }>;
+  /** Runs `task` after everything already running or queued. */
+  queue<T>(task: () => Promise<T>): Promise<T>;
+  readonly busy: boolean;
+}
+
+export function createCollectorApplyGate(): CollectorApplyGate {
+  let pending = 0;
+  let tail: Promise<unknown> = Promise.resolve();
+  function enqueue<T>(task: () => Promise<T>): Promise<T> {
+    pending += 1; // synchronous: two overlapping callers can never both see an idle gate
+    const result = tail.then(() => task());
+    tail = result.then(() => undefined, () => undefined).finally(() => { pending -= 1; });
+    return result;
+  }
+  return {
+    queue: enqueue,
+    async tryRun<T>(task: () => Promise<T>) {
+      if (pending > 0) return { ran: false as const };
+      return { ran: true as const, value: await enqueue(task) };
+    },
+    get busy() {
+      return pending > 0;
+    },
+  };
+}
+
+// ----- Dependencies --------------------------------------------------------------------------
+
+export interface CollectorIntegrationServiceDependencies {
+  readonly mode: CollectorIntegrationRuntimeMode;
+  readonly startupRefresh: CollectorStartupRefresh;
+  readonly inspect: (options?: CollectorInspectOptions) => Promise<CollectorIntegrationInspection>;
+  readonly apply: (request: CollectorApplyRequest) => Promise<CollectorApplyResult>;
+  readonly locateChrome: () => Promise<ChromeLocation>;
+  /** The gate also handed to the composition's `wrapApply`, so the startup refresh shares it. */
+  readonly gate: CollectorApplyGate;
+  /** Detached launch of the validated `chrome.exe` with fixed arguments. `false` on failure. */
+  readonly launchChrome: (executablePath: string, args: readonly string[]) => Promise<boolean>;
+  readonly writeClipboardText: (text: string) => void;
+  /** Opens a folder in the shell. `false` when it could not be opened. */
+  readonly openFolder: (folder: string) => Promise<boolean>;
+  /** Native confirmation owned by the main process (design 5, removal copy). */
+  readonly confirmRemove: () => Promise<{ readonly confirmed: boolean; readonly clearSaveDestination: boolean }>;
+  /** The existing `maginalia.collector.clearSaveDestination` implementation. */
+  readonly clearSaveDestination: () => Promise<CollectorSaveDestinationIpcResult>;
+  /** Called with the full active notice list whenever it changed. */
+  readonly publishNotices: (notices: readonly CollectorNotice[]) => void;
+  /** Logs a stable code (never a path or an error message). */
+  readonly logError: (code: string, error?: unknown) => void;
+  readonly setInterval?: (callback: () => void, milliseconds: number) => unknown;
+  readonly clearInterval?: (handle: unknown) => void;
+}
+
+export const COLLECTOR_CHROME_EXTENSIONS_ARGUMENTS: readonly string[] = Object.freeze(["chrome://extensions/"]);
+export const COLLECTOR_RECONCILE_INTERVAL_MS = 60_000;
+
+export interface CollectorIntegrationService {
+  /** Handles one renderer request. Never throws and never returns a path. */
+  handle(request: unknown): Promise<CollectorIntegrationResponse>;
+  /** Startup refresh and notice evaluation. Never throws. Publishes the notices. */
+  runStartup(): Promise<CollectorStartupResult | undefined>;
+  /** Re-evaluates the "updated" notice (window focus, interval). Never throws. */
+  reconcile(): Promise<void>;
+  /** The renderer closed a notice. Invalid ids are ignored. Never throws. */
+  dismissNotice(noticeId: unknown): Promise<readonly CollectorNotice[]>;
+  currentNotices(): readonly CollectorNotice[];
+  /** Starts the periodic `reconcile`. Idempotent. */
+  startPeriodicReconcile(intervalMs?: number): void;
+  stop(): void;
+}
+
+// ----- Summaries -----------------------------------------------------------------------------
+
+export function summarizeInspection(inspection: CollectorIntegrationInspection): CollectorIntegrationStatus {
+  return Object.freeze({
+    state: inspection.state,
+    reasons: Object.freeze([...inspection.reasons]),
+    inspectionComplete: inspection.inspectionComplete,
+    registration: inspection.registration,
+    chrome: Object.freeze({ status: inspection.chrome.status, defaultBrowser: inspection.chrome.defaultBrowser }),
+    policy: Object.freeze({
+      blocked: inspection.policy.blocked,
+      userLevelHostsDisabled: inspection.policy.userLevelHostsDisabled,
+      hostBlocked: inspection.policy.hostBlocked,
+      extensionLoadMayBeBlocked: inspection.policy.extensionLoadMayBeBlocked,
+    }),
+    installed: Object.freeze({ hostVersion: inspection.installed.hostVersion, extensionVersion: inspection.installed.extensionVersion }),
+    payloadStatus: inspection.payload.status,
+    extensionFolderPlaced: inspection.installed.extensionVersion !== null && inspection.extensionFolderDisplay !== null,
+    writesAllowed: inspection.writesAllowed,
+  });
+}
+
+export function summarizeConnection(inspection: CollectorIntegrationInspection): CollectorConnectionSummary {
+  const contact = inspection.contact;
+  if (contact.status === "absent") return { state: "waiting" };
+  if (contact.status === "unavailable") return { state: "unavailable" };
+  if (contact.status === "invalid") return contact.reason === "wrong-protocol" ? { state: "protocol-differs" } : { state: "unavailable" };
+  if (contact.extensionVersionVsPlaced === "equal" || contact.extensionVersionVsPlaced === "newer") {
+    return { state: "connected", extensionVersion: contact.record.extensionVersion, hostVersion: contact.record.hostVersion, contactedAt: contact.record.contactedAt };
+  }
+  return { state: "extension-version-differs", loadedVersion: contact.record.extensionVersion, placedVersion: inspection.installed.extensionVersion };
+}
+
+function noticeKey(notices: readonly CollectorNotice[]): string {
+  return JSON.stringify(notices.map((notice) => [notice.id, notice.kind, notice.title, notice.detail]));
+}
+
+// ----- Service -------------------------------------------------------------------------------
+
+export function createCollectorIntegrationService(deps: CollectorIntegrationServiceDependencies): CollectorIntegrationService {
+  let lastPublished = noticeKey([]);
+  let timer: unknown;
+  let inspectInFlight: Promise<CollectorIntegrationInspection> | undefined;
+
+  const unavailableReason = (): "e2e-isolation" | "payload-unavailable" | undefined =>
+    deps.mode === "inert-e2e-isolation" ? "e2e-isolation" : deps.mode === "inert-no-payload" ? "payload-unavailable" : undefined;
+
+  function publish(notices: readonly CollectorNotice[]): void {
+    const key = noticeKey(notices);
+    if (key === lastPublished) return;
+    lastPublished = key;
+    try {
+      deps.publishNotices(notices);
+    } catch (error: unknown) {
+      deps.logError("MAGINALIA_COLLECTOR_NOTICE_PUBLISH_FAILED", error);
+    }
+  }
+
+  /** Read-only inspections share one run: a fast poll never stacks inspections. */
+  function inspectShared(): Promise<CollectorIntegrationInspection> {
+    inspectInFlight ??= deps.inspect({ verifyFileHashes: false }).finally(() => { inspectInFlight = undefined; });
+    return inspectInFlight;
+  }
+
+  async function runApply(request: CollectorApplyRequest): Promise<CollectorIntegrationResponse> {
+    const outcome = await deps.gate.tryRun(async () => {
+      let extra: Partial<{ saveDestination: CollectorSaveDestinationIpcResult["kind"] }> = {};
+      if (request.action === "remove") {
+        const confirmation = await deps.confirmRemove();
+        if (!confirmation.confirmed) return { kind: "cancelled" } as const;
+        const result = await deps.apply(request);
+        await recordSafely(result);
+        if (confirmation.clearSaveDestination) {
+          try {
+            extra = { saveDestination: (await deps.clearSaveDestination()).kind };
+          } catch (error: unknown) {
+            deps.logError("MAGINALIA_COLLECTOR_CLEAR_SAVE_DESTINATION_FAILED", error);
+            extra = { saveDestination: "error" };
+          }
+        }
+        return { kind: "result", result, extra } as const;
+      }
+      const result = await deps.apply(request);
+      await recordSafely(result);
+      return { kind: "result", result, extra } as const;
+    });
+    if (!outcome.ran) return { kind: "busy" };
+    const value = outcome.value;
+    if (value.kind === "cancelled") return { kind: "cancelled" };
+    const { result, extra } = value;
+    return {
+      kind: "apply",
+      action: result.action,
+      outcome: result.outcome,
+      reason: result.reason,
+      warnings: Object.freeze([...result.warnings]),
+      selfCheck: result.selfCheck,
+      status: summarizeInspection(result.inspection),
+      ...extra,
+    };
+  }
+
+  async function recordSafely(result: CollectorApplyResult): Promise<void> {
+    try {
+      await deps.startupRefresh.recordApplyResult(result);
+    } catch (error: unknown) {
+      deps.logError("MAGINALIA_COLLECTOR_RECORD_APPLY_FAILED", error);
+    }
+    publish(deps.startupRefresh.currentNotices());
+  }
+
+  async function handleValidated(request: CollectorIntegrationRequest): Promise<CollectorIntegrationResponse> {
+    switch (request.intent) {
+      case "inspect":
+        return { kind: "status", status: summarizeInspection(await inspectShared()) };
+      case "checkConnection": {
+        const inspection = await inspectShared();
+        return { kind: "connection", state: inspection.state, connection: summarizeConnection(inspection) };
+      }
+      case "setup": {
+        if (request.proceedWithoutChrome !== true) {
+          const inspection = await inspectShared();
+          if (inspection.chrome.status !== "found") return { kind: "chrome-required", status: summarizeInspection(inspection) };
+        }
+        return runApply({ action: "setup", ...(request.confirmReplaceForeign === true ? { confirmReplaceForeign: true } : {}) });
+      }
+      case "repair":
+        return runApply({ action: "repair", ...(request.confirmReplaceForeign === true ? { confirmReplaceForeign: true } : {}) });
+      case "remove":
+        return runApply({ action: "remove" });
+      case "openChromeExtensions": {
+        const location = await deps.locateChrome();
+        if (location.status !== "found") return { kind: "chrome-extensions", result: "chrome-not-found" };
+        const launched = await deps.launchChrome(location.executablePath, COLLECTOR_CHROME_EXTENSIONS_ARGUMENTS);
+        return { kind: "chrome-extensions", result: launched ? "opened" : "failed" };
+      }
+      case "copyExtensionPath":
+      case "revealExtensionFolder": {
+        const inspection = await inspectShared();
+        const folder = inspection.extensionFolderDisplay;
+        if (folder === null || inspection.installed.extensionVersion === null) return { kind: "extension-folder", intent: request.intent, result: "unavailable" };
+        if (request.intent === "copyExtensionPath") {
+          deps.writeClipboardText(folder);
+          return { kind: "extension-folder", intent: request.intent, result: "done" };
+        }
+        return { kind: "extension-folder", intent: request.intent, result: (await deps.openFolder(folder)) ? "done" : "failed" };
+      }
+    }
+  }
+
+  async function reconcile(): Promise<void> {
+    try {
+      publish(await deps.startupRefresh.reconcile());
+    } catch (error: unknown) {
+      deps.logError("MAGINALIA_COLLECTOR_RECONCILE_FAILED", error);
+    }
+  }
+
+  return {
+    async handle(value: unknown): Promise<CollectorIntegrationResponse> {
+      if (!isCollectorIntegrationRequest(value)) return { kind: "invalid-request" };
+      const reason = unavailableReason();
+      if (reason !== undefined) return { kind: "unavailable", reason };
+      try {
+        return await handleValidated(value);
+      } catch (error: unknown) {
+        deps.logError("MAGINALIA_COLLECTOR_INTEGRATION_REQUEST_FAILED", error);
+        return { kind: "error" };
+      }
+    },
+
+    async runStartup(): Promise<CollectorStartupResult | undefined> {
+      try {
+        const result = await deps.startupRefresh.runStartup();
+        publish(result.notices);
+        return result;
+      } catch (error: unknown) {
+        deps.logError("MAGINALIA_COLLECTOR_STARTUP_FAILED", error);
+        return undefined;
+      }
+    },
+
+    reconcile,
+
+    async dismissNotice(noticeId: unknown): Promise<readonly CollectorNotice[]> {
+      if (!isCollectorNoticeId(noticeId)) return deps.startupRefresh.currentNotices();
+      try {
+        const notices = await deps.startupRefresh.dismiss(noticeId);
+        publish(notices);
+        return notices;
+      } catch (error: unknown) {
+        deps.logError("MAGINALIA_COLLECTOR_DISMISS_FAILED", error);
+        return deps.startupRefresh.currentNotices();
+      }
+    },
+
+    currentNotices: () => deps.startupRefresh.currentNotices(),
+
+    startPeriodicReconcile(intervalMs = COLLECTOR_RECONCILE_INTERVAL_MS): void {
+      if (timer !== undefined || unavailableReason() !== undefined) return;
+      const set = deps.setInterval ?? ((callback, ms) => {
+        const handle = setInterval(callback, ms);
+        handle.unref?.();
+        return handle;
+      });
+      timer = set(() => { void reconcile(); }, intervalMs);
+    },
+
+    stop(): void {
+      if (timer === undefined) return;
+      (deps.clearInterval ?? ((handle) => clearInterval(handle as NodeJS.Timeout)))(timer);
+      timer = undefined;
+    },
+  };
+}
+

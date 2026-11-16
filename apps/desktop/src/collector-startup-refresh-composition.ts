@@ -1,5 +1,6 @@
 /**
- * Composition for the Collector startup refresh (WP-5c). NOT wired into `main.ts` yet.
+ * Composition for the Collector startup refresh (WP-5c) and the main-process Collector integration
+ * runtime (WP-7 slice A).
  *
  * It assembles the production dependencies of WP-5b (registry adapter, native path security,
  * protected-directory creation, Host self-check runner with a clean environment, random suffix)
@@ -33,6 +34,9 @@ import {
 import type { CollectorRegistryAdapter } from "./collector-registry-adapter.js";
 import type { PathSecurityInspector } from "./collector-path-security.js";
 import { COLLECTOR_PAYLOAD_EMBEDDED, COMPILED_COLLECTOR_PAYLOAD } from "./collector-payload-compiled.js";
+import { locateChromeExecutable } from "./collector-integration.js";
+import type { ChromeLocation, CollectorInspectOptions, CollectorIntegrationInspection } from "./collector-integration-types.js";
+import type { CollectorApplyRequest, CollectorApplyResult } from "./collector-integration-apply-types.js";
 import { createFileCollectorNoticeStore, type CollectorNoticeStore } from "./collector-integration-notices.js";
 import {
   createCollectorStartupRefresh,
@@ -64,6 +68,25 @@ export interface CollectorStartupCompositionOptions {
   /** Test seams. */
   readonly noticeStore?: CollectorNoticeStore;
   readonly randomSuffix?: () => string;
+  /**
+   * Wraps every apply the orchestrator starts (startup refresh) so it shares one serialization gate
+   * with the user-started applies. Default: no wrapping.
+   */
+  readonly wrapApply?: (apply: (request: CollectorApplyRequest) => Promise<CollectorApplyResult>) => (request: CollectorApplyRequest) => Promise<CollectorApplyResult>;
+}
+
+/** `active`: real dependencies. `inert-*`: nothing was constructed and every operation rejects. */
+export type CollectorIntegrationRuntimeMode = "active" | "inert-e2e-isolation" | "inert-no-payload";
+
+export interface CollectorIntegrationRuntime {
+  readonly mode: CollectorIntegrationRuntimeMode;
+  readonly startupRefresh: CollectorStartupRefresh;
+  /** Read-only inspection. Rejects in an inert runtime. */
+  readonly inspect: (options?: CollectorInspectOptions) => Promise<CollectorIntegrationInspection>;
+  /** Raw apply (not wrapped by `wrapApply`). Rejects in an inert runtime. */
+  readonly apply: (request: CollectorApplyRequest) => Promise<CollectorApplyResult>;
+  /** Main-process only: the validated `chrome.exe` path must never reach the renderer or a log. Rejects in an inert runtime. */
+  readonly locateChrome: () => Promise<ChromeLocation>;
 }
 
 export class CollectorPayloadNotEmbeddedError extends Error {
@@ -83,14 +106,22 @@ const inertDependencies = (now: () => Date, noticeStore: CollectorNoticeStore, i
   payloadUnavailable: !isolated,
 });
 
-export function createCollectorStartupRefreshFromParts(options: CollectorStartupCompositionOptions): CollectorStartupRefresh {
+const rejectInert = (): Promise<never> => Promise.reject(new Error("The Collector integration is inert in this process."));
+
+function inertRuntime(mode: "inert-e2e-isolation" | "inert-no-payload", startupRefresh: CollectorStartupRefresh): CollectorIntegrationRuntime {
+  return Object.freeze({ mode, startupRefresh, inspect: rejectInert, apply: rejectInert, locateChrome: rejectInert });
+}
+
+export function createCollectorIntegrationRuntimeFromParts(options: CollectorStartupCompositionOptions): CollectorIntegrationRuntime {
   const now = options.now ?? (() => new Date());
   const noticeStore = options.noticeStore ?? createFileCollectorNoticeStore(options.noticeStatePath);
-  if (options.e2eIsolationActive) return createCollectorStartupRefresh(inertDependencies(now, noticeStore, true));
+  if (options.e2eIsolationActive) {
+    return inertRuntime("inert-e2e-isolation", createCollectorStartupRefresh(inertDependencies(now, noticeStore, true)));
+  }
   const compiled = options.compiledPayload ?? { embedded: COLLECTOR_PAYLOAD_EMBEDDED, value: COMPILED_COLLECTOR_PAYLOAD };
   if (!compiled.embedded || compiled.value === null || compiled.value === undefined) {
     if (options.isPackaged) throw new CollectorPayloadNotEmbeddedError();
-    return createCollectorStartupRefresh(inertDependencies(now, noticeStore, false));
+    return inertRuntime("inert-no-payload", createCollectorStartupRefresh(inertDependencies(now, noticeStore, false)));
   }
   const compiledValue = compiled.value;
 
@@ -111,9 +142,11 @@ export function createCollectorStartupRefreshFromParts(options: CollectorStartup
     randomSuffix: options.randomSuffix ?? (() => randomBytes(8).toString("hex")),
   };
 
-  return createCollectorStartupRefresh({
-    inspect: (inspectOptions) => inspectCollectorIntegration(applyDependencies, inspectOptions),
-    apply: (request) => applyCollectorIntegration(request, applyDependencies),
+  const inspect = (inspectOptions?: CollectorInspectOptions): Promise<CollectorIntegrationInspection> => inspectCollectorIntegration(applyDependencies, inspectOptions);
+  const apply = (request: CollectorApplyRequest): Promise<CollectorApplyResult> => applyCollectorIntegration(request, applyDependencies);
+  const startupRefresh = createCollectorStartupRefresh({
+    inspect: (inspectOptions) => inspect(inspectOptions),
+    apply: options.wrapApply === undefined ? apply : options.wrapApply(apply),
     hasOptedIn: async () => {
       const paths = resolveIntegrationPaths(registry);
       if (paths === undefined) return false;
@@ -129,4 +162,15 @@ export function createCollectorStartupRefreshFromParts(options: CollectorStartup
     now,
     e2eIsolationActive: false,
   });
+  return Object.freeze({
+    mode: "active" as const,
+    startupRefresh,
+    inspect,
+    apply,
+    locateChrome: () => locateChromeExecutable({ registry, fileSystem }),
+  });
+}
+
+export function createCollectorStartupRefreshFromParts(options: CollectorStartupCompositionOptions): CollectorStartupRefresh {
+  return createCollectorIntegrationRuntimeFromParts(options).startupRefresh;
 }
