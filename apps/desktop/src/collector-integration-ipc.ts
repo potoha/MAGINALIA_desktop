@@ -87,6 +87,11 @@ export function isCollectorNoticeId(value: unknown): value is string {
 
 /** Everything safe for the renderer. Deliberately has no path field. */
 export interface CollectorIntegrationStatus {
+  /**
+   * An apply (setup / repair / remove / refresh) was running when this was produced: the facts may
+   * describe a half-written installation. Do not act on or display them; ask again.
+   */
+  readonly applyInProgress: boolean;
   readonly state: CollectorIntegrationState;
   readonly reasons: readonly CollectorIntegrationReason[];
   readonly inspectionComplete: boolean;
@@ -140,7 +145,7 @@ export type CollectorIntegrationResponse =
   | { readonly kind: "chrome-required"; readonly status: CollectorIntegrationStatus }
   | { readonly kind: "chrome-extensions"; readonly result: "opened" | "chrome-not-found" | "failed" }
   | { readonly kind: "extension-folder"; readonly intent: "copyExtensionPath" | "revealExtensionFolder"; readonly result: "done" | "unavailable" | "failed" }
-  | { readonly kind: "connection"; readonly state: CollectorIntegrationState; readonly connection: CollectorConnectionSummary };
+  | { readonly kind: "connection"; readonly state: CollectorIntegrationState; readonly applyInProgress: boolean; readonly connection: CollectorConnectionSummary };
 
 // ----- Notices ------------------------------------------------------------------------------
 

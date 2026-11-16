@@ -41,15 +41,25 @@ export interface CollectorApplyGate {
   /** Runs `task` after everything already running or queued. */
   queue<T>(task: () => Promise<T>): Promise<T>;
   readonly busy: boolean;
+  /** Incremented when a task starts and again when it ends (any task, including the startup refresh). */
+  readonly generation: number;
 }
 
 export function createCollectorApplyGate(): CollectorApplyGate {
   let pending = 0;
+  let generation = 0;
   let tail: Promise<unknown> = Promise.resolve();
   function enqueue<T>(task: () => Promise<T>): Promise<T> {
     pending += 1; // synchronous: two overlapping callers can never both see an idle gate
     // The counter drops before the caller's promise settles, so a follow-up call never sees a stale "busy".
-    const result = tail.then(() => task()).finally(() => { pending -= 1; });
+    const result = tail.then(async () => {
+      generation += 1;
+      try {
+        return await task();
+      } finally {
+        generation += 1;
+      }
+    }).finally(() => { pending -= 1; });
     tail = result.then(() => undefined, () => undefined);
     return result;
   }
@@ -61,6 +71,9 @@ export function createCollectorApplyGate(): CollectorApplyGate {
     },
     get busy() {
       return pending > 0;
+    },
+    get generation() {
+      return generation;
     },
   };
 }
@@ -102,6 +115,11 @@ export interface CollectorIntegrationService {
   runStartup(): Promise<CollectorStartupResult | undefined>;
   /** Re-evaluates the "updated" notice (window focus, interval). Never throws. */
   reconcile(): Promise<void>;
+  /**
+   * The renderer asked for the notices (first call: it can show them). Releases the one-time alpha1
+   * notice and returns the active list. Never throws.
+   */
+  connectNoticeSurface(): Promise<readonly CollectorNotice[]>;
   /** The renderer closed a notice. Invalid ids are ignored. Never throws. */
   dismissNotice(noticeId: unknown): Promise<readonly CollectorNotice[]>;
   currentNotices(): readonly CollectorNotice[];
@@ -112,8 +130,9 @@ export interface CollectorIntegrationService {
 
 // ----- Summaries -----------------------------------------------------------------------------
 
-export function summarizeInspection(inspection: CollectorIntegrationInspection): CollectorIntegrationStatus {
+export function summarizeInspection(inspection: CollectorIntegrationInspection, applyInProgress = false): CollectorIntegrationStatus {
   return Object.freeze({
+    applyInProgress,
     state: inspection.state,
     reasons: Object.freeze([...inspection.reasons]),
     inspectionComplete: inspection.inspectionComplete,
@@ -158,7 +177,13 @@ function noticeKey(notices: readonly CollectorNotice[]): string {
 export function createCollectorIntegrationService(deps: CollectorIntegrationServiceDependencies): CollectorIntegrationService {
   let lastPublished = noticeKey([]);
   let timer: unknown;
-  let inspectInFlight: Promise<CollectorIntegrationInspection> | undefined;
+  /**
+   * The gate's generation changes when any apply starts and when it ends. A read-only inspection is
+   * shared only within one generation, so nobody receives a snapshot that started before an apply
+   * began (or ended) as if it were current. Inspections that run DURING an apply may still see a
+   * half-written installation: their status carries `applyInProgress: true` and slice B must ignore it.
+   */
+  let inspectInFlight: { readonly generation: number; readonly promise: Promise<CollectorIntegrationInspection> } | undefined;
 
   const unavailableReason = (): "e2e-isolation" | "payload-unavailable" | undefined =>
     deps.mode === "inert-e2e-isolation" ? "e2e-isolation" : deps.mode === "inert-no-payload" ? "payload-unavailable" : undefined;
@@ -176,19 +201,29 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
 
   /** Read-only inspections share one run: a fast poll never stacks inspections. */
   function inspectShared(): Promise<CollectorIntegrationInspection> {
-    inspectInFlight ??= deps.inspect({ verifyFileHashes: false }).finally(() => { inspectInFlight = undefined; });
-    return inspectInFlight;
+    if (inspectInFlight !== undefined && inspectInFlight.generation === deps.gate.generation) return inspectInFlight.promise;
+    const entry: { generation: number; promise: Promise<CollectorIntegrationInspection> } = {
+      generation: deps.gate.generation,
+      promise: deps.inspect({ verifyFileHashes: false }).finally(() => { if (inspectInFlight === entry) inspectInFlight = undefined; }),
+    };
+    inspectInFlight = entry;
+    return entry.promise;
   }
 
   async function runApply(request: CollectorApplyRequest): Promise<CollectorIntegrationResponse> {
-    const outcome = await deps.gate.tryRun(async () => {
+    const outcome = await deps.gate.tryRun(runExclusive);
+    if (!outcome.ran) return { kind: "busy" };
+    return toResponse(outcome.value);
+
+    async function runExclusive() {
       let extra: Partial<{ saveDestination: CollectorSaveDestinationIpcResult["kind"] }> = {};
       if (request.action === "remove") {
         const confirmation = await deps.confirmRemove();
         if (!confirmation.confirmed) return { kind: "cancelled" } as const;
         const result = await deps.apply(request);
         await recordSafely(result);
-        if (confirmation.clearSaveDestination) {
+        // A refused removal changed nothing: the save destination setting stays too.
+        if (confirmation.clearSaveDestination && result.outcome !== "refused") {
           try {
             extra = { saveDestination: (await deps.clearSaveDestination()).kind };
           } catch (error: unknown) {
@@ -201,9 +236,9 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
       const result = await deps.apply(request);
       await recordSafely(result);
       return { kind: "result", result, extra } as const;
-    });
-    if (!outcome.ran) return { kind: "busy" };
-    const value = outcome.value;
+    }
+
+    function toResponse(value: Awaited<ReturnType<typeof runExclusive>>): CollectorIntegrationResponse {
     if (value.kind === "cancelled") return { kind: "cancelled" };
     const { result, extra } = value;
     return {
@@ -216,6 +251,7 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
       status: summarizeInspection(result.inspection),
       ...extra,
     };
+    }
   }
 
   async function recordSafely(result: CollectorApplyResult): Promise<void> {
@@ -230,15 +266,15 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
   async function handleValidated(request: CollectorIntegrationRequest): Promise<CollectorIntegrationResponse> {
     switch (request.intent) {
       case "inspect":
-        return { kind: "status", status: summarizeInspection(await inspectShared()) };
+        return { kind: "status", status: summarizeInspection(await inspectShared(), deps.gate.busy) };
       case "checkConnection": {
         const inspection = await inspectShared();
-        return { kind: "connection", state: inspection.state, connection: summarizeConnection(inspection) };
+        return { kind: "connection", state: inspection.state, applyInProgress: deps.gate.busy, connection: summarizeConnection(inspection) };
       }
       case "setup": {
         if (request.proceedWithoutChrome !== true) {
           const inspection = await inspectShared();
-          if (inspection.chrome.status !== "found") return { kind: "chrome-required", status: summarizeInspection(inspection) };
+          if (inspection.chrome.status !== "found") return { kind: "chrome-required", status: summarizeInspection(inspection, deps.gate.busy) };
         }
         return runApply({ action: "setup", ...(request.confirmReplaceForeign === true ? { confirmReplaceForeign: true } : {}) });
       }
@@ -308,6 +344,17 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
         return notices;
       } catch (error: unknown) {
         deps.logError("MAGINALIA_COLLECTOR_DISMISS_FAILED", error);
+        return deps.startupRefresh.currentNotices();
+      }
+    },
+
+    async connectNoticeSurface(): Promise<readonly CollectorNotice[]> {
+      try {
+        const notices = await deps.startupRefresh.markNoticeSurfaceReady();
+        publish(notices);
+        return notices;
+      } catch (error: unknown) {
+        deps.logError("MAGINALIA_COLLECTOR_NOTICE_SURFACE_FAILED", error);
         return deps.startupRefresh.currentNotices();
       }
     },

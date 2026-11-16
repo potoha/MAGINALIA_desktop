@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { CollectorApplyRequest, CollectorApplyResult } from "./collector-integration-apply-types.js";
 import { buildAlpha1MigrationNotice, COLLECTOR_NOTICE_IDS, type CollectorNotice } from "./collector-integration-notices.js";
 import type { ChromeLocation, CollectorIntegrationInspection, CollectorIntegrationState } from "./collector-integration-types.js";
-import type { CollectorStartupRefresh } from "./collector-startup-refresh.js";
+import { createCollectorStartupRefresh, type CollectorStartupRefresh } from "./collector-startup-refresh.js";
+import { DEFAULT_COLLECTOR_NOTICE_STATE, type CollectorNoticeState } from "./collector-integration-notices.js";
 import {
   createCollectorApplyGate,
   createCollectorIntegrationService,
@@ -108,6 +109,7 @@ function rig(overrides: Partial<CollectorIntegrationServiceDependencies> = {}): 
     runStartup: async () => ({ outcome: "no-action", notices: r.notices }),
     reconcile: async () => r.notices,
     dismiss: async (noticeId) => { r.notices = r.notices.filter((notice) => notice.id !== noticeId); return r.notices; },
+    markNoticeSurfaceReady: async () => r.notices,
     recordApplyResult: async (result) => { r.recorded.push(result); },
     currentNotices: () => r.notices,
   };
@@ -394,6 +396,87 @@ describe("collector integration service", () => {
     expect(reconciles).toBe(1);
     service.stop();
     expect(cleared).toEqual(["handle"]);
+  });
+});
+
+describe("collector integration service (review fixes)", () => {
+  it("a refused remove records nothing and keeps the save destination", async () => {
+    const r = rig();
+    r.confirmation = { confirmed: true, clearSaveDestination: true };
+    r.applyImpl = async (request) => applyResult(request.action, "refused", "wrong-state");
+    const service = createCollectorIntegrationService(r.deps);
+    const response = await service.handle({ intent: "remove" });
+    expect(response).toMatchObject({ kind: "apply", outcome: "refused" });
+    expect((response as { saveDestination?: unknown }).saveDestination).toBeUndefined();
+    expect(r.clearCalls).toBe(0);
+  });
+
+  it("connectNoticeSurface releases the alpha1 notice and publishes it", async () => {
+    const r = rig();
+    const calls: string[] = [];
+    r.startup = { ...r.startup, markNoticeSurfaceReady: async () => { calls.push("ready"); r.notices = [buildAlpha1MigrationNotice()]; return r.notices; } };
+    const service = createCollectorIntegrationService(r.deps);
+    expect((await service.connectNoticeSurface()).map((notice) => notice.id)).toEqual([COLLECTOR_NOTICE_IDS.alpha1Migration]);
+    expect(calls).toEqual(["ready"]);
+    expect(r.published).toHaveLength(1);
+  });
+
+  it("does not hand a pre-apply inspection to a caller that arrives after the apply started", async () => {
+    const r = rig();
+    const first = deferred<CollectorIntegrationInspection>();
+    const calls: Array<Promise<CollectorIntegrationInspection>> = [first.promise];
+    let n = 0;
+    const applying = deferred<CollectorApplyResult>();
+    r.applyImpl = () => applying.promise;
+    const service = createCollectorIntegrationService({ ...r.deps, inspect: () => calls[n++] ?? Promise.resolve(inspection("damaged")) });
+    const early = service.handle({ intent: "inspect" }); // starts inspection #1 (slow)
+    const run = service.handle({ intent: "setup", proceedWithoutChrome: true }); // apply starts: new generation
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const during = await service.handle({ intent: "inspect" });
+    expect(n).toBe(2); // not the shared pre-apply inspection
+    expect(during).toMatchObject({ kind: "status", status: { applyInProgress: true } });
+    first.resolve(inspection("ready"));
+    await early;
+    applying.resolve(applyResult("setup"));
+    await run;
+    const after = await service.handle({ intent: "inspect" });
+    expect(after).toMatchObject({ kind: "status", status: { applyInProgress: false } });
+    expect(await service.handle({ intent: "checkConnection" })).toMatchObject({ kind: "connection", applyInProgress: false });
+  });
+
+  it("real orchestrator and shared gate: a startup refresh waits behind a remove confirmation and ends refused without being recorded", async () => {
+    const gate = createCollectorApplyGate();
+    let stored: CollectorNoticeState = DEFAULT_COLLECTOR_NOTICE_STATE;
+    const store = { read: async () => stored, write: async (state: CollectorNoticeState) => { stored = state; } };
+    const order: string[] = [];
+    const confirmation = deferred<{ confirmed: boolean; clearSaveDestination: boolean }>();
+    const raw = async (request: CollectorApplyRequest): Promise<CollectorApplyResult> => {
+      order.push(request.action);
+      return request.action === "remove" ? applyResult("remove") : applyResult(request.action, "refused", "wrong-state");
+    };
+    const startup = createCollectorStartupRefresh({
+      inspect: async () => inspection("outdated", { installed: { payloadId: "old", activeSlot: "a", hostVersion: "1.2.0", extensionVersion: "0.3.0" } }),
+      apply: (request) => gate.queue(() => raw(request)),
+      hasOptedIn: async () => true,
+      noticeStore: store,
+      now: () => new Date("2026-11-16T09:00:00.000Z"),
+      e2eIsolationActive: false,
+    });
+    const base = rig().deps;
+    const service = createCollectorIntegrationService({ ...base, startupRefresh: startup, gate, apply: raw, confirmRemove: () => confirmation.promise });
+    const removing = service.handle({ intent: "remove" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const starting = service.runStartup();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(order).toEqual([]); // both are waiting: the dialog holds the gate
+    confirmation.resolve({ confirmed: true, clearSaveDestination: false });
+    expect((await removing).kind).toBe("apply");
+    const result = await starting;
+    expect(order).toEqual(["remove", "refresh"]);
+    expect(result?.outcome).toBe("refresh-failed");
+    expect(stored.removeRequested).toBe(true);
+    expect(stored.updated).toBeNull();
+    expect(service.currentNotices()).toEqual([]);
   });
 });
 

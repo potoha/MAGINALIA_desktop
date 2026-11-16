@@ -1578,9 +1578,10 @@ function registerMarkdownIpc(): void {
     return runCollectorSaveDestinationCommand(clearCollectorSaveDestination);
   });
   ipcMain.handle(COLLECTOR_INTEGRATION_CHANNEL, handleCollectorIntegrationRequest);
-  ipcMain.handle(GET_COLLECTOR_NOTICES_CHANNEL, (event, ...args: readonly unknown[]): readonly CollectorNotice[] => {
+  ipcMain.handle(GET_COLLECTOR_NOTICES_CHANNEL, async (event, ...args: readonly unknown[]): Promise<readonly CollectorNotice[]> => {
     if (args.length !== 0 || !isLiveMainWindowSender(event.sender)) return [];
-    return collectorIntegration?.currentNotices() ?? [];
+    // The first request proves a notice surface exists: only now may the one-time alpha1 notice be spent.
+    return collectorIntegration?.connectNoticeSurface() ?? [];
   });
   ipcMain.handle(DISMISS_COLLECTOR_NOTICE_CHANNEL, async (event, noticeId: unknown, ...args: readonly unknown[]): Promise<readonly CollectorNotice[]> => {
     if (args.length !== 0 || !isLiveMainWindowSender(event.sender)) return [];
