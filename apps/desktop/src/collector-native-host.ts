@@ -159,6 +159,8 @@ export async function handleExperimentalRequest(
   const writesEnabled = testOnlyWritesEnabled(config, env);
   if (request.kind === "health") return healthResponse(writesEnabled);
   if (request.kind === "configured_shelf") return shelfStatus(config, writesEnabled);
+  // `host_info` and its contact record exist only in the production Host.
+  if (request.kind === "host_info") return error("unsupported_operation");
   return saveWebQuote(config, request.value, env, writeQuote);
 }
 

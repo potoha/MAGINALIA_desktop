@@ -88,7 +88,7 @@ test("production entry ignores env/cwd/descriptor input and fails closed without
     const results = await runProcess([productEntry, origin, "--parent-window=0"],
       [health.subarray(0, 3), health.subarray(3), op("configured_shelf"), save("00000000-0000-4000-8000-0000000000b1")], env);
     assert.deepEqual(results, [
-      { protocol, ok: true, experimental: true, operations: ["health", "configured_shelf"], writesEnabled: false },
+      { protocol, ok: true, experimental: true, operations: ["health", "configured_shelf", "host_info"], writesEnabled: false },
       { protocol, ok: false, error: "shelf_unconfigured" },
       { protocol, ok: false, error: "shelf_unconfigured" }
     ]);
@@ -137,7 +137,7 @@ test("product core in a real process commits, replays idempotently and reports b
   const fixture = await createBoundFixture("write");
   try {
     const first = await runProcess([harness, fixture.commandFile], [op("health"), op("configured_shelf"), save("00000000-0000-4000-8000-0000000000c1")]);
-    assert.deepEqual(first[0].operations, ["health", "configured_shelf", "save_web_quote"]);
+    assert.deepEqual(first[0].operations, ["health", "configured_shelf", "save_web_quote", "host_info"]);
     assert.equal(first[0].writesEnabled, true);
     assert.deepEqual(first[1].shelf, { id, name: "Disposable Shelf", type: "private", writesEnabled: true });
     assert.equal(first[2].ok, true);
@@ -188,11 +188,125 @@ test("product core in a real process fails closed for an unsafe binding ACL and 
     const { execFileSync } = await import("node:child_process");
     execFileSync("icacls", [fixture.paths.bindingPath, "/grant", "*S-1-1-0:(W)"], { stdio: "ignore" });
     assert.deepEqual(await runProcess([harness, fixture.commandFile], [op("health"), save("00000000-0000-4000-8000-0000000000d2")]), [
-      { protocol, ok: true, experimental: true, operations: ["health", "configured_shelf"], writesEnabled: false },
+      { protocol, ok: true, experimental: true, operations: ["health", "configured_shelf", "host_info"], writesEnabled: false },
       { protocol, ok: false, error: "configuration_unavailable" }
     ]);
     assert.equal((await readdir(path.join(fixture.shelf, "annotations"))).length, 0);
     assert.equal(await readFile(path.join(fixture.shelf, "shelf.magi"), "utf8"), `version = 1\ntype = shelf\nid = ${id}\n`);
+  } finally {
+    await rm(fixture.temp, { recursive: true, force: true });
+  }
+});
+
+const hostInfo = (extensionVersion) => frame({ protocol, operation: "host_info", extensionVersion });
+const contactFiles = ["version", "protocol", "hostVersion", "extensionVersion", "contactedAt"];
+
+test("host_info in a real process answers and writes the exact five-field contact record once per minute", async () => {
+  const fixture = await createBoundFixture("contact");
+  try {
+    const recordPath = path.join(fixture.paths.bindingDirectory, "collector-contact.json");
+    const first = await runProcess([harness, fixture.commandFile], [op("health"), hostInfo("0.3.0")]);
+    assert.ok(first[0].operations.includes("host_info"));
+    assert.deepEqual(Object.keys(first[1]), ["protocol", "ok", "host"]);
+    assert.equal(first[1].ok, true);
+    assert.deepEqual(Object.keys(first[1].host), ["version", "minimumExtensionVersion"]);
+    const text = await readFile(recordPath, "utf8");
+    const record = JSON.parse(text);
+    assert.deepEqual(Object.keys(record), contactFiles);
+    assert.equal(record.version, 1);
+    assert.equal(record.protocol, protocol);
+    assert.equal(record.hostVersion, first[1].host.version);
+    assert.equal(record.extensionVersion, "0.3.0");
+    assert.equal(new Date(record.contactedAt).toISOString(), record.contactedAt);
+    assert.equal(text.includes(fixture.temp), false);
+    assert.equal(text.includes(id), false, "no Shelf UUID");
+    assert.equal(JSON.stringify(first).includes(fixture.temp), false);
+    assert.deepEqual((await readdir(fixture.paths.bindingDirectory)).sort(), ["collector-contact.json", "private-shelf-binding.json"]);
+
+    // Same values within 60 s: the record is left untouched (a new process reads it back).
+    const again = await runProcess([harness, fixture.commandFile], [hostInfo("0.3.0")]);
+    assert.equal(again[0].ok, true);
+    assert.equal(await readFile(recordPath, "utf8"), text);
+    // A changed value is written at once.
+    await runProcess([harness, fixture.commandFile], [hostInfo("0.3.1")]);
+    assert.equal(JSON.parse(await readFile(recordPath, "utf8")).extensionVersion, "0.3.1");
+    assert.deepEqual((await readdir(fixture.paths.bindingDirectory)).sort(), ["collector-contact.json", "private-shelf-binding.json"]);
+  } finally {
+    await rm(fixture.temp, { recursive: true, force: true });
+  }
+});
+
+test("host_info validation and origin failures write nothing", async () => {
+  const fixture = await createBoundFixture("contact-invalid");
+  try {
+    const recordPath = path.join(fixture.paths.bindingDirectory, "collector-contact.json");
+    const bad = await runProcess([harness, fixture.commandFile], [
+      hostInfo("not-a-version"),
+      frame({ protocol, operation: "host_info", extensionVersion: "0.3.0", extra: true }),
+      frame({ protocol, operation: "host_info" }),
+    ]);
+    assert.deepEqual(bad, Array(3).fill({ protocol, ok: false, error: "invalid_request" }));
+    assert.equal(await exists(recordPath), false);
+
+    const wrongCommand = path.join(fixture.temp, "wrong-origin.json");
+    await writeFile(wrongCommand, JSON.stringify({ localAppData: path.join(fixture.temp, "Local"), origin: `chrome-extension://${"a".repeat(32)}/` }));
+    assert.deepEqual(await runProcess([harness, wrongCommand], [hostInfo("0.3.0")]),
+      [{ protocol, ok: false, error: "host_configuration_or_origin_invalid" }]);
+    assert.equal(await exists(recordPath), false);
+  } finally {
+    await rm(fixture.temp, { recursive: true, force: true });
+  }
+});
+
+test("host_info without an integration folder answers ok and creates nothing", async () => {
+  const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), "collector-product-contact-none-")));
+  try {
+    const localAppData = path.join(temp, "Local");
+    await mkdir(localAppData);
+    const commandFile = path.join(temp, "harness.json");
+    await writeFile(commandFile, JSON.stringify({ localAppData, origin }));
+    const values = await runProcess([harness, commandFile], [hostInfo("0.3.0"), op("health")]);
+    assert.equal(values[0].ok, true);
+    assert.equal(values[1].writesEnabled, false);
+    assert.deepEqual(await readdir(localAppData), []);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("host_info skips the contact record when the integration folder ACL is weak, still answering ok", async () => {
+  const fixture = await createBoundFixture("contact-acl");
+  try {
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("icacls", [fixture.paths.bindingDirectory, "/grant", "*S-1-1-0:(W)"], { stdio: "ignore" });
+    const values = await runProcess([harness, fixture.commandFile], [hostInfo("0.3.0")]);
+    assert.equal(values[0].ok, true);
+    assert.equal(await exists(path.join(fixture.paths.bindingDirectory, "collector-contact.json")), false);
+    assert.deepEqual((await readdir(fixture.paths.bindingDirectory)).filter((name) => name !== "private-shelf-binding.json"), []);
+  } finally {
+    await rm(fixture.temp, { recursive: true, force: true });
+  }
+});
+
+test("host_info refuses a non-regular or linked contact entry and leaves its target alone", async () => {
+  const fixture = await createBoundFixture("contact-reparse");
+  try {
+    const recordPath = path.join(fixture.paths.bindingDirectory, "collector-contact.json");
+    const target = path.join(fixture.temp, "link-target");
+    await mkdir(target);
+    await writeFile(path.join(target, "keep.txt"), "keep");
+    const { symlink } = await import("node:fs/promises");
+    await symlink(target, recordPath, "junction");
+    const linked = await runProcess([harness, fixture.commandFile], [hostInfo("0.3.0")]);
+    assert.equal(linked[0].ok, true);
+    assert.deepEqual(await readdir(target), ["keep.txt"]);
+    assert.equal((await lstat(recordPath)).isFile(), false);
+    await rm(recordPath, { recursive: true, force: true });
+    await mkdir(recordPath);
+    const directory = await runProcess([harness, fixture.commandFile], [hostInfo("0.3.0")]);
+    assert.equal(directory[0].ok, true);
+    assert.deepEqual(await readdir(recordPath), []);
+    assert.deepEqual((await readdir(fixture.paths.bindingDirectory)).sort(), ["collector-contact.json", "private-shelf-binding.json"]);
   } finally {
     await rm(fixture.temp, { recursive: true, force: true });
   }

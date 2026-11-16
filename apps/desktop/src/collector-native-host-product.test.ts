@@ -1,14 +1,16 @@
-import { readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  COLLECTOR_ALLOWED_ORIGIN,
+  COLLECTOR_ALLOWED_ORIGINS,
   COLLECTOR_HOST_NAME,
   collectorCallerOrigin,
   handleCollectorProductRequest,
   isAllowedCollectorOrigin,
   type CollectorProductHostDependencies,
 } from "./collector-native-host-product";
+import { createCollectorContactRecorder } from "./collector-contact-record";
+import { COLLECTOR_HOST_VERSION, COLLECTOR_MINIMUM_EXTENSION_VERSION } from "./collector-native-host-core";
 import { readCollectorShelfConfiguration } from "./collector-shelf-configuration";
 import { commitShelfQuoteWithNativeLock } from "./shelf-native-write-lock";
 import { ShelfWriteCoordinationError } from "./shelf-write-coordination";
@@ -23,7 +25,7 @@ import {
 } from "./collector-host-fixture.test-helper";
 
 const protocol = "maginalia.collector.experimental.v1";
-const origin = COLLECTOR_ALLOWED_ORIGIN;
+const origin = COLLECTOR_ALLOWED_ORIGINS[0];
 const requestId = "00000000-0000-4000-8000-0000000000a1";
 const save = {
   protocol, operation: "save_web_quote", requestId,
@@ -48,10 +50,12 @@ const neverWrite: CollectorProductHostDependencies["writeQuote"] = async () => {
 describe("production Host identity", () => {
   it("fixes the host name and compares Chrome's caller origin exactly", () => {
     expect(COLLECTOR_HOST_NAME).toBe("org.maginalia.collector");
-    expect(COLLECTOR_ALLOWED_ORIGIN).toBe("chrome-extension://blgmoddncpknfnikdfnjelmdmphfgknf/");
-    expect(isAllowedCollectorOrigin(COLLECTOR_ALLOWED_ORIGIN)).toBe(true);
-    for (const value of [undefined, "", "chrome-extension://blgmoddncpknfnikdfnjelmdmphfgknf", "CHROME-EXTENSION://blgmoddncpknfnikdfnjelmdmphfgknf/",
-      `chrome-extension://${"a".repeat(32)}/`, `${COLLECTOR_ALLOWED_ORIGIN} `, `${COLLECTOR_ALLOWED_ORIGIN}x`]) {
+    expect(COLLECTOR_ALLOWED_ORIGINS).toEqual(["chrome-extension://blgmoddncpknfnikdfnjelmdmphfgknf/"]);
+    expect(Object.isFrozen(COLLECTOR_ALLOWED_ORIGINS)).toBe(true);
+    expect(isAllowedCollectorOrigin(COLLECTOR_ALLOWED_ORIGINS[0])).toBe(true);
+    for (const value of [undefined, null, 1, ["chrome-extension://blgmoddncpknfnikdfnjelmdmphfgknf/"], "", "chrome-extension://blgmoddncpknfnikdfnjelmdmphfgknf", "CHROME-EXTENSION://blgmoddncpknfnikdfnjelmdmphfgknf/",
+      `chrome-extension://${"a".repeat(32)}/`, `${origin} `, ` ${origin}`, `${origin}x`, `x${origin}`, `${origin}${origin}`, `${origin}\n`,
+      "chrome-extension://blgmoddncpknfnikdfnjelmdmphfgknf/index.html", "https://blgmoddncpknfnikdfnjelmdmphfgknf/"]) {
       expect(isAllowedCollectorOrigin(value)).toBe(false);
     }
     expect(collectorCallerOrigin(["node", "host.js", origin, "--parent-window=0"], 2)).toBe(origin);
@@ -64,8 +68,116 @@ describe("production Host identity", () => {
       expect(await handleCollectorProductRequest({ protocol, operation }, `chrome-extension://${"b".repeat(32)}/`, deps))
         .toEqual({ protocol, ok: false, error: "host_configuration_or_origin_invalid" });
     }
+    expect(await handleCollectorProductRequest({ protocol, operation: "host_info", extensionVersion: "0.3.0" }, `chrome-extension://${"b".repeat(32)}/`, deps))
+      .toEqual({ protocol, ok: false, error: "host_configuration_or_origin_invalid" });
     expect(await handleCollectorProductRequest(save, undefined, deps)).toMatchObject({ error: "host_configuration_or_origin_invalid" });
     expect(reads).toBe(0);
+  });
+});
+
+/**
+ * The validation Collector 0.2.0 applies to a `health` response (host-client.js):
+ * exact keys, `experimental === true`, boolean `writesEnabled`, 1 to 16 unique operation
+ * names matching `^[a-z][a-z0-9_]{0,47}$`. Unknown names are accepted.
+ */
+function collector020AcceptsHealth(envelope: Record<string, unknown>): boolean {
+  const keys = ["protocol", "ok", "experimental", "operations", "writesEnabled"];
+  if (Object.keys(envelope).length !== keys.length || !keys.every((key) => Object.hasOwn(envelope, key))) return false;
+  if (envelope.protocol !== protocol || envelope.ok !== true || envelope.experimental !== true || typeof envelope.writesEnabled !== "boolean") return false;
+  const operations = envelope.operations;
+  if (!Array.isArray(operations) || operations.length === 0 || operations.length > 16) return false;
+  if (!operations.every((name) => typeof name === "string" && /^[a-z][a-z0-9_]{0,47}$/.test(name))) return false;
+  return new Set(operations).size === operations.length;
+}
+
+describe("production Host host_info", () => {
+  const hostInfo = { protocol, operation: "host_info", extensionVersion: "0.3.0" };
+
+  it("answers with compile-time constants and hands only validated values to the recorder", async () => {
+    const seen: unknown[] = [];
+    const deps: CollectorProductHostDependencies = {
+      readConfiguration: async () => { throw new Error("host_info must not read the configuration"); },
+      writeQuote: neverWrite,
+      recordContact: async (contact) => { seen.push(contact); return "written"; },
+    };
+    expect(await handleCollectorProductRequest(hostInfo, origin, deps))
+      .toEqual({ protocol, ok: true, host: { version: COLLECTOR_HOST_VERSION, minimumExtensionVersion: COLLECTOR_MINIMUM_EXTENSION_VERSION } });
+    expect(seen).toEqual([{ protocol, hostVersion: COLLECTOR_HOST_VERSION, extensionVersion: "0.3.0" }]);
+    expect(COLLECTOR_HOST_VERSION).toMatch(/^[0-9]+\.[0-9]+\.[0-9]+$/u);
+  });
+
+  it("rejects extra or missing keys and malformed versions before recording anything", async () => {
+    const seen: unknown[] = [];
+    const deps: CollectorProductHostDependencies = { readConfiguration: async () => ({ kind: "error", code: "shelf_unconfigured" }), writeQuote: neverWrite, recordContact: async (contact) => { seen.push(contact); return "written"; } };
+    const bad: unknown[] = [
+      { ...hostInfo, extra: 1 }, { ...hostInfo, shelfRoot: "C:\\" }, { protocol, operation: "host_info" },
+      { ...hostInfo, extensionVersion: undefined }, { ...hostInfo, extensionVersion: 3 }, { ...hostInfo, extensionVersion: null },
+      { ...hostInfo, extensionVersion: ["0.3.0"] }, { ...hostInfo, extensionVersion: "" }, { ...hostInfo, extensionVersion: "0.3" },
+      { ...hostInfo, extensionVersion: "v0.3.0" }, { ...hostInfo, extensionVersion: "0.3.0 " }, { ...hostInfo, extensionVersion: "0.3.0\n" },
+      { ...hostInfo, extensionVersion: "0.3.0+build" }, { ...hostInfo, extensionVersion: "0.3.0-" }, { ...hostInfo, extensionVersion: "1.2.3.4" },
+      { ...hostInfo, extensionVersion: "..\\0.3.0" }, { ...hostInfo, extensionVersion: "C:\\Users\\x" }, { ...hostInfo, extensionVersion: "0.3.0-" + "a".repeat(40) },
+      { ...hostInfo, extensionVersion: "1".repeat(33) }, { ...hostInfo, extensionVersion: "0.3.0\u0000" }, { protocol: "v2", operation: "host_info", extensionVersion: "0.3.0" },
+    ];
+    for (const value of bad) {
+      expect(await handleCollectorProductRequest(value, origin, deps)).toEqual({ protocol, ok: false, error: "invalid_request" });
+    }
+    expect(seen).toEqual([]);
+    for (const version of ["0.3.0", "10.20.30", "0.3.0-beta.1", "999999999.999999999.999999999", "0.0.0-rc1"]) {
+      expect(await handleCollectorProductRequest({ ...hostInfo, extensionVersion: version }, origin, deps)).toMatchObject({ ok: true });
+    }
+    expect(seen).toHaveLength(5);
+  });
+
+  it("never records for a wrong or missing origin", async () => {
+    let calls = 0;
+    const deps: CollectorProductHostDependencies = { readConfiguration: async () => ({ kind: "error", code: "shelf_unconfigured" }), writeQuote: neverWrite, recordContact: async () => { calls += 1; return "written"; } };
+    for (const wrong of [undefined, "", `${origin}x`, `chrome-extension://${"a".repeat(32)}/`]) {
+      expect(await handleCollectorProductRequest(hostInfo, wrong, deps)).toEqual({ protocol, ok: false, error: "host_configuration_or_origin_invalid" });
+    }
+    expect(calls).toBe(0);
+  });
+
+  it("answers ok even when the recorder throws or rejects", async () => {
+    const expected = { protocol, ok: true, host: { version: COLLECTOR_HOST_VERSION, minimumExtensionVersion: COLLECTOR_MINIMUM_EXTENSION_VERSION } };
+    for (const recordContact of [async () => { throw new Error(`private ${origin}`); }, (() => { throw new Error("sync"); }) as never, undefined]) {
+      const deps: CollectorProductHostDependencies = { readConfiguration: async () => ({ kind: "error", code: "shelf_unconfigured" }), writeQuote: neverWrite, ...(recordContact ? { recordContact } : {}) };
+      expect(await handleCollectorProductRequest(hostInfo, origin, deps)).toEqual(expected);
+    }
+  });
+
+  it("writes the real record only through the injected, ACL-checked location and keeps the response unchanged", async () => {
+    fixture = await createCollectorFixture();
+    const current = fixture;
+    const recordContact = createCollectorContactRecorder({ resolveLocalAppDataPath: () => current.localAppData, inspectPathSecurity: fakeSafeInspector });
+    const deps: CollectorProductHostDependencies = { ...dependencies(current, neverWrite), recordContact };
+    // No integration folder yet: skipped silently, the folder is not created.
+    expect(await handleCollectorProductRequest(hostInfo, origin, deps)).toMatchObject({ ok: true });
+    expect(await readdir(current.localAppData)).toEqual([]);
+    await mkdir(current.storage.bindingDirectory, { recursive: true });
+    const response = await handleCollectorProductRequest(hostInfo, origin, deps);
+    const record = JSON.parse(await readFile(path.join(current.storage.bindingDirectory, "collector-contact.json"), "utf8")) as Record<string, unknown>;
+    expect(Object.keys(record)).toEqual(["version", "protocol", "hostVersion", "extensionVersion", "contactedAt"]);
+    expect(record).toMatchObject({ version: 1, protocol, hostVersion: COLLECTOR_HOST_VERSION, extensionVersion: "0.3.0" });
+    expect(new Date(record.contactedAt as string).toISOString()).toBe(record.contactedAt);
+    expect(JSON.stringify([response, record])).not.toContain(current.temp);
+  });
+
+  it("keeps Collector 0.2.0 parsing health, with or without a valid binding", async () => {
+    fixture = await createCollectorFixture();
+    const deps = dependencies(fixture, neverWrite);
+    const unbound = await handleCollectorProductRequest({ protocol, operation: "health" }, origin, deps);
+    await fixture.writeBinding();
+    const bound = await handleCollectorProductRequest({ protocol, operation: "health" }, origin, deps);
+    for (const response of [unbound, bound]) {
+      expect(collector020AcceptsHealth(response)).toBe(true);
+      expect(response.operations).toContain("host_info");
+      expect((response.operations as string[]).length).toBeLessThanOrEqual(16);
+    }
+    // 0.2.0 requires save_web_quote only for writing; the prefix of each list is unchanged.
+    expect((bound.operations as string[]).slice(0, 3)).toEqual(["health", "configured_shelf", "save_web_quote"]);
+    // Sanity check of the replicated parser: it rejects what 0.2.0 rejects.
+    expect(collector020AcceptsHealth({ ...unbound, operations: ["health", "Host-Info"] })).toBe(false);
+    expect(collector020AcceptsHealth({ ...unbound, operations: Array.from({ length: 17 }, (_, i) => `op${i}`) })).toBe(false);
   });
 });
 
@@ -74,14 +186,14 @@ describe("production Host fail-closed configuration", () => {
     fixture = await createCollectorFixture();
     const deps = dependencies(fixture, neverWrite);
     expect(await handleCollectorProductRequest({ protocol, operation: "health" }, origin, deps))
-      .toEqual({ protocol, ok: true, experimental: true, operations: ["health", "configured_shelf"], writesEnabled: false });
+      .toEqual({ protocol, ok: true, experimental: true, operations: ["health", "configured_shelf", "host_info"], writesEnabled: false });
     expect(await handleCollectorProductRequest({ protocol, operation: "configured_shelf" }, origin, deps))
       .toEqual({ protocol, ok: false, error: "shelf_unconfigured" });
     expect(await handleCollectorProductRequest(save, origin, deps)).toEqual({ protocol, ok: false, error: "shelf_unconfigured" });
 
     await fixture.writeBinding();
     expect(await handleCollectorProductRequest({ protocol, operation: "health" }, origin, deps))
-      .toEqual({ protocol, ok: true, experimental: true, operations: ["health", "configured_shelf", "save_web_quote"], writesEnabled: true });
+      .toEqual({ protocol, ok: true, experimental: true, operations: ["health", "configured_shelf", "save_web_quote", "host_info"], writesEnabled: true });
     expect(await handleCollectorProductRequest({ protocol, operation: "configured_shelf" }, origin, deps))
       .toEqual({ protocol, ok: true, shelf: { id: FIXTURE_SHELF_ID, name: "研究棚", type: "private", writesEnabled: true } });
   });

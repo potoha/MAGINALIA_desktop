@@ -19,6 +19,7 @@ const main = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist
 const product = require(path.join(main, "collector-native-host-product.js"));
 const configuration = require(path.join(main, "collector-shelf-configuration.js"));
 const nativeMutex = require(path.join(main, "shelf-native-mutex.js"));
+const contact = require(path.join(main, "collector-contact-record.js"));
 const writer = require(path.join(main, "shelf-native-write-lock.js"));
 
 const command = JSON.parse(await readFile(process.argv[2], "utf8"));
@@ -34,5 +35,10 @@ await product.runCollectorProductHost({
       request,
       command.acquireTimeoutMs === undefined ? {} : { acquireTimeoutMs: command.acquireTimeoutMs },
     ),
+    // Same recorder as production, bound to the disposable LocalAppData root.
+    recordContact: contact.createCollectorContactRecorder({
+      resolveLocalAppDataPath: () => command.localAppData,
+      inspectPathSecurity: nativeMutex.inspectNativePathSecurity,
+    }),
   },
 });
