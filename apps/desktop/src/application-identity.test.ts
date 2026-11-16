@@ -1,12 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
+import { PRODUCT_DISPLAY_NAME } from "./branding";
 import { establishApplicationIdentity, MAGINALIA_APPLICATION_NAME } from "./application-identity";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 describe("Electron application identity", () => {
-  it("uses the branded α2 wild berry name", () => {
-    expect(MAGINALIA_APPLICATION_NAME).toBe("MAGINALIA α2 wild berry");
+  it("uses the branded Alpha2 Wild Berry name", () => {
+    expect(MAGINALIA_APPLICATION_NAME).toBe("MAGINALIA Alpha2 Wild Berry");
+    expect(MAGINALIA_APPLICATION_NAME).toBe(PRODUCT_DISPLAY_NAME);
   });
 
   it("sets a stable product name before stores are resolved and retains the existing profile path", () => {
@@ -68,9 +70,9 @@ describe("Electron application identity", () => {
     };
     try {
       const identity = establishApplicationIdentity(application);
-      expect(identity.applicationName).toBe("MAGINALIA α2 wild berry");
+      expect(identity.applicationName).toBe("MAGINALIA Alpha2 Wild Berry");
       expect(identity.userDataPath).toBe(alpha1UserData);
-      expect(join(roaming, "MAGINALIA α2 wild berry")).not.toBe(alpha1UserData);
+      expect(join(roaming, "MAGINALIA Alpha2 Wild Berry")).not.toBe(alpha1UserData);
     } finally {
       rmSync(profileParent, { recursive: true, force: true });
     }

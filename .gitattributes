@@ -2,3 +2,4 @@
 # would otherwise rewrite them and break contract tests and pinned hashes).
 Tutorial_sample_setup/** -text
 sidecars/reviewer/ndlocr-runtime/licenses/** -text
+apps/desktop/assets/fonts/** -text

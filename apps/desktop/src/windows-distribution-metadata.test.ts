@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
+import { PRODUCT_DISPLAY_NAME } from "./branding";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../../..");
 
@@ -17,7 +18,7 @@ describe("Windows distribution metadata", () => {
       appId: string;
       productName: string;
       win: { artifactName: string };
-      nsis: { perMachine: boolean; deleteAppDataOnUninstall: boolean };
+      nsis: { perMachine: boolean; deleteAppDataOnUninstall: boolean; shortcutName: string };
     };
     const stageScript = await readFile(path.join(repositoryRoot, "apps/desktop/scripts/stage-windows-app.mjs"), "utf8");
 
@@ -25,10 +26,11 @@ describe("Windows distribution metadata", () => {
     expect(lock.packages["apps/desktop"]).toMatchObject({ name: app.name, version: app.version });
     expect(installer).toMatchObject({
       appId: "org.maginalia.desktop.alpha1",
-      productName: "MAGINALIA α2 wild berry",
+      productName: PRODUCT_DISPLAY_NAME,
       win: { artifactName: "MAGINALIA-desktop-${version}-Setup.exe" },
       nsis: { perMachine: false, deleteAppDataOnUninstall: false },
     });
+    expect(installer.nsis).toMatchObject({ shortcutName: PRODUCT_DISPLAY_NAME });
     expect(stageScript).toContain("version: desktopPackage.version");
   });
 });

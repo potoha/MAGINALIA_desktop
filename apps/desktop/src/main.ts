@@ -16,6 +16,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
 import * as path from "node:path";
+import { PRODUCT_DISPLAY_NAME, brandVersionString } from "./branding";
 import { findApplicationIconPath, findBrandAssetPath } from "./brand-assets";
 import {
   brandProgressUpdateScript,
@@ -1628,7 +1629,7 @@ function unregisterMarkdownIpc(): void {
 let startupProgressWindow: BrowserWindow | null = null;
 let startupProgressWindowReady = false;
 let startupProgressWindowShown = false;
-let startupProgressState: BrandProgressState = createBrandProgressState("MAGINALIA α2 wild berry を起動しています", 0);
+let startupProgressState: BrandProgressState = createBrandProgressState(`${PRODUCT_DISPLAY_NAME} を起動しています`, 0);
 let startupOutcome: "pending" | "succeeded" | "failed" = "pending";
 let startupProgressTimer: NodeJS.Timeout | null = null;
 const startupProgressReadiness = new StartupProgressReadiness<BrowserWindow>(10_000);
@@ -1658,6 +1659,16 @@ function readBrandPngDataUrl(...fileNames: string[]): string | null {
   if (resolved === null) return null;
   try {
     return `data:image/png;base64,${readFileSync(resolved).toString("base64")}`;
+  } catch {
+    return null;
+  }
+}
+
+function readBrandFontDataUrl(fileName: string): string | null {
+  const resolved = resolveBrandAsset(fileName);
+  if (resolved === null) return null;
+  try {
+    return `data:font/woff2;base64,${readFileSync(resolved).toString("base64")}`;
   } catch {
     return null;
   }
@@ -1727,9 +1738,10 @@ function startStartupProgressWindow(delayMs: number): void {
     startupProgressWindow = window;
     const splashContents = window.webContents;
     const html = renderBrandProgressHtml({
-      logoDataUrl: readBrandPngDataUrl("splash.png", "header.png", "icon.png"),
+      logoDataUrl: readBrandPngDataUrl("splash.png"),
       markerDataUrl: readBrandPngDataUrl("marker-stroke.png"),
-    });
+      fontDataUrl: readBrandFontDataUrl(path.join("fonts", "jost-latin-700-normal.woff2")),
+    }, brandVersionString(app));
     const onReadyToShow = () => {
       if (window.isDestroyed()) {
         failStartupProgressWindow(window, new Error("The startup progress window was destroyed before it became ready."));
@@ -1792,7 +1804,7 @@ function completeStartupProgress(window: BrowserWindow): void {
       clearTimeout(startupProgressTimer);
       startupProgressTimer = null;
     }
-    updateStartupProgress("MAGINALIA α2 wild berry の準備ができました", 1);
+    updateStartupProgress(`${PRODUCT_DISPLAY_NAME} の準備ができました`, 1);
   }
   window.show();
   if (!completesInitialStartup) return;
@@ -2575,10 +2587,10 @@ void app.whenReady().then(async () => {
     console.error("MAGINALIA_FIRST_RUN_JOURNAL_UNAVAILABLE", error);
   }
   if (!smokeMode || brandProgressSmoke) {
-    updateStartupProgress("MAGINALIA α2 wild berry を起動しています", 0.08);
+    updateStartupProgress(`${PRODUCT_DISPLAY_NAME} を起動しています`, 0.08);
     startStartupProgressWindow(140);
     if (process.platform === "darwin") {
-      const dockIcon = resolveBrandAsset("icon.v2.png");
+      const dockIcon = resolveBrandAsset("logo.png");
       if (dockIcon !== null) app.dock?.setIcon(dockIcon);
     }
   }
