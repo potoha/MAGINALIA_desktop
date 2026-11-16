@@ -67,7 +67,7 @@ function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): b
 }
 
 /** Windows reserved device names (with or without an extension): `CON`, `NUL.txt`, `COM1`, ... */
-const RESERVED_DEVICE_NAME = /^(?:con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(?:\..*)?$/iu;
+const RESERVED_DEVICE_NAME = /^(?:conin\$|conout\$|con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(?:\..*)?$/iu;
 
 /** A bare relative POSIX-style file name: segments of safe characters, no traversal, no reserved device names. */
 export function isSafeRelativeFileName(name: unknown): name is string {

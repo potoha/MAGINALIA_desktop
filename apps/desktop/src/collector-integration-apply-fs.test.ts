@@ -347,7 +347,7 @@ function runnerWith(child: FakeChild, spawned: Array<{ executable: string; args:
     spawned.push({ executable, args });
     return child as never;
   };
-  return createNodeHostSelfCheckRunner({ spawn, ...(timeoutMs === undefined ? {} : { timeoutMs }) });
+  return createNodeHostSelfCheckRunner({ spawn, environment: {}, ...(timeoutMs === undefined ? {} : { timeoutMs }) });
 }
 
 const request = { executablePath: "C:\\host\\MAGINALIA-Collector-Host.exe", allowedOrigin: "chrome-extension://blgmoddncpknfnikdfnjelmdmphfgknf/" };
@@ -459,7 +459,7 @@ describe("Host self-check runner", () => {
   });
 
   it("fails when spawn throws", async () => {
-    const runner = createNodeHostSelfCheckRunner({ spawn: () => { throw new Error("blocked"); } });
+    const runner = createNodeHostSelfCheckRunner({ spawn: () => { throw new Error("blocked"); }, environment: {} });
     expect(await runner(request)).toEqual({ status: "failed" });
   });
 

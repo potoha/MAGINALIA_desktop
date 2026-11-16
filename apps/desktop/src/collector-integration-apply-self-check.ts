@@ -98,11 +98,11 @@ export function parseHealthFrame(data: Buffer): HostSelfCheckResult | undefined 
 export function createNodeHostSelfCheckRunner(options: {
   readonly spawn?: HostSpawn;
   readonly timeoutMs?: number;
-  /** Child environment, normally `buildCleanHostEnvironment(...)` of the process environment, built by the composition root. Default: empty. */
-  readonly environment?: Readonly<Record<string, string>>;
-} = {}): (request: HostSelfCheckRequest) => Promise<HostSelfCheckResult> {
+  /** Child environment: `buildCleanHostEnvironment(...)` of the process environment, built by the composition root. Required: an empty environment makes the Host fail every check. */
+  readonly environment: Readonly<Record<string, string>>;
+}): (request: HostSelfCheckRequest) => Promise<HostSelfCheckResult> {
   const spawnHost = options.spawn ?? defaultSpawn;
-  const environment = options.environment ?? Object.freeze({});
+  const environment = options.environment;
   const timeoutMs = options.timeoutMs ?? HOST_SELF_CHECK_TIMEOUT_MS;
   return (request) => new Promise<HostSelfCheckResult>((resolve) => {
     let settled = false;
