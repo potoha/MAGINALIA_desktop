@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { stageShelfMutexAddon } from "./shelf-mutex-addon.mjs";
+import { stageWindowsIntegrationAddon } from "./windows-integration-addon.mjs";
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const desktopRoot = path.resolve(scriptDirectory, "..");
@@ -21,6 +22,9 @@ await access(path.join(runtimeRoot, "reviewer", "marginalia-reviewer.exe"));
 // before staging anything if it is missing or not the expected /MT N-API build.
 const shelfMutex = await stageShelfMutexAddon({ desktopRoot, repositoryRoot, runtimeRoot });
 process.stdout.write(`Shelf mutex addon staged: sha256=${shelfMutex.sha256} bytes=${shelfMutex.bytes}\n`);
+// Collector wizard integration (WP-3): same fail-closed rule for the Windows integration addon.
+const windowsIntegration = await stageWindowsIntegrationAddon({ desktopRoot, repositoryRoot, runtimeRoot });
+process.stdout.write(`Windows integration addon staged: sha256=${windowsIntegration.sha256} bytes=${windowsIntegration.bytes}\n`);
 await rm(stageRoot, { recursive: true, force: true });
 await mkdir(vendorRoot, { recursive: true });
 

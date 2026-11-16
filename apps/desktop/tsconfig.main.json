@@ -63,6 +63,8 @@
     "src/collector-path-security.ts",
     "src/collector-shelf-configuration.ts",
     "src/collector-save-destination.ts",
-    "src/collector-save-destination-ipc.ts"
+    "src/collector-save-destination-ipc.ts",
+    "src/windows-integration.ts",
+    "src/collector-registry-adapter.ts"
   ]
 }
