@@ -55,9 +55,22 @@
  * Links and reparse points are skipped, never followed.
  *
  * Content safety for setup / repair / refresh: Host slots may only hold our fixed names, and the
- * extension folders may only hold descriptor files unless ownership is confirmed (registration ours,
- * valid state file, generated manifest); anything else is refused with
- * `program-folder-unrecognized-content` before the first write.
+ * extension folders may only hold descriptor files unless ownership is confirmed. Ownership is
+ * confirmed by a VALID STATE FILE inside the (already verified safe, protected) program folder, and
+ * by nothing else: not by the registration (it can be deleted or replaced by someone else while the
+ * folder is still ours) and not by the manifest. Without such a state file, anything unrecognized is
+ * refused with `program-folder-unrecognized-content` before the first write. Remove follows the
+ * same rule: with a valid state file the extension folders are removed by listing (links are
+ * skipped, never followed); without one only descriptor-listed names are deleted.
+ *
+ * FUTURE (permanent fix, design 2.4): ship `collector-extension-files.json`, an append-only union of
+ * every extension file name ever pinned, and recognize an extension folder by that list instead of
+ * by the state file alone. Until then a state file is the ownership evidence.
+ *
+ * A swap of the extension folder that cannot happen (a locked leftover `extension.prev`) fails the
+ * whole run with `file-locked` BEFORE the manifest switch: the previous installation (manifest,
+ * state file, slot, extension) is untouched, the newly written slot is not pointed at, and the next
+ * refresh / repair retries (it rewrites that same slot).
  */
 import { createHash } from "node:crypto";
 import * as path from "node:path";
@@ -81,6 +94,7 @@ import {
   resolveIntegrationPaths,
   slotFolder,
   collectorManifestSlot,
+  parseIntegrationStateFile,
   type CollectorHostSlot,
   type IntegrationPaths,
 } from "./collector-integration.js";
@@ -119,6 +133,7 @@ export const COLLECTOR_STALE_TEMP_AGE_MS = 10 * 60 * 1000;
 const MAX_TREE_ENTRIES = 2000;
 const MAX_TREE_DEPTH = 8;
 const MAX_MANIFEST_BYTES = 8192;
+const MAX_STATE_BYTES = 4096;
 const SUFFIX_PATTERN = /^[0-9a-f]{16}$/u;
 const TEMP_NAME_PATTERN = /^[A-Za-z0-9._-]{1,120}\.[0-9a-f]{16}\.tmp$/u;
 const CONTACT_TEMP_PATTERN = /^\.collector-contact\.json\.[A-Za-z0-9._-]{1,64}\.tmp$/u;
@@ -374,11 +389,28 @@ async function requireRecognizedExtensionContent(context: Context, directory: st
 }
 
 /**
+ * Ownership evidence: a readable, valid `integration-state.json` (a plain file) in the program
+ * folder. Callers have already verified that the folder is a safe, protected directory.
+ */
+async function hasValidStateFile(context: Context): Promise<boolean> {
+  const { fileSystem } = context.deps;
+  try {
+    const entry = await fileSystem.stat(context.paths.statePath);
+    if (entry === null || entry.isReparsePoint || entry.kind !== "file") return false;
+    const read = await fileSystem.readSmallFile(context.paths.statePath, MAX_STATE_BYTES);
+    if (read.kind !== "ok") return false;
+    return parseIntegrationStateFile(new TextDecoder("utf-8", { fatal: true }).decode(read.bytes)) !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Before the first write: refuse when a folder we are about to reuse or replace holds anything we
  * cannot account for. Host slots are always checked against the fixed names. The extension
- * folders are checked against the descriptor unless ownership is CONFIRMED (registration ours,
- * a valid state file and a generated manifest on disk): only then is the previous extension tree
- * ours to replace wholesale.
+ * folders are checked against the descriptor unless ownership is CONFIRMED by a valid state file
+ * (see `hasValidStateFile`): only then is the previous extension tree, whatever version it came
+ * from, ours to replace wholesale.
  */
 async function requireRecognizedContent(context: Context, descriptor: CollectorPayloadDescriptor, ownershipConfirmed: boolean): Promise<void> {
   for (const slot of COLLECTOR_HOST_SLOTS) await requireRecognizedSlotContent(context, slot);
@@ -549,9 +581,9 @@ async function slotHostFilesMatch(context: Context, slot: CollectorHostSlot, des
 // ----- Extension folder (design 4.5, 6.4) ---------------------------------------------------
 
 /**
- * Returns `false` when a leftover `extension.prev` could not be cleaned up (a locked file): that
- * is a warning, not an error, and the caller skips this swap only (design 6.4). A restore of an
- * interrupted swap is still strict.
+ * Returns `false` when a leftover `extension.prev` could not be cleaned up (a locked file). The
+ * current extension folder cannot then be moved out of the way, so the caller must NOT report the
+ * extension as updated (see `swapExtension`). A restore of an interrupted swap stays strict.
  */
 async function recoverPendingExtensionSwap(context: Context): Promise<boolean> {
   const { fileSystem } = context.deps;
@@ -567,12 +599,8 @@ async function recoverPendingExtensionSwap(context: Context): Promise<boolean> {
     return true;
   }
   try {
-    if ((await removeTree(context, previous, false, { locked: false })) === "leftover") {
-      warn(context, "previous-extension-retained");
-      return false;
-    }
+    if ((await removeTree(context, previous, false, { locked: false })) === "leftover") return false;
   } catch {
-    warn(context, "previous-extension-retained");
     return false;
   }
   return true;
@@ -627,9 +655,11 @@ async function swapExtension(context: Context, descriptor: CollectorPayloadDescr
   const staging = join(paths.programFolder, COLLECTOR_EXTENSION_STAGING_NAME);
   const previous = join(paths.programFolder, COLLECTOR_EXTENSION_PREVIOUS_NAME);
   // A locked `extension.prev` cannot be cleaned, and the current folder cannot be moved on top of
-  // it: skip the swap (warning). The state file still records the new payload, so the next
-  // inspection reports the stale extension and one repair finishes the swap.
-  if (!(await recoverPendingExtensionSwap(context))) return;
+  // it. The extension would stay at the old version while the run claims the new one, so the run
+  // FAILS (`file-locked`) here, before the manifest switch and before the state file is written:
+  // nothing the previous installation depends on has changed, and the next refresh / repair
+  // retries from the same point.
+  if (!(await recoverPendingExtensionSwap(context))) throw new Abort("file-locked");
   await stageExtension(context, descriptor, staging);
 
   const current = await fileSystem.stat(paths.extensionFolder);
@@ -719,7 +749,9 @@ async function runSelfCheck(context: Context, slot: CollectorHostSlot, descripto
     if (!sameLocation(resolved, expected)) return false;
     const entry = await deps.fileSystem.stat(expected);
     if (entry === null || entry.kind !== "file" || entry.isReparsePoint) return false;
-    // Re-hash immediately before spawning: the bytes about to run are the verified bytes.
+    // Re-hash immediately before spawning. The hash is taken by path and the spawn is by path, so
+    // this only narrows the window for a same-user swap of the file (accepted, design 8.3); it is
+    // not an atomic bind between the verified bytes and the process.
     if (!(await slotHostFilesMatch(context, slot, descriptor))) return false;
     const result = await deps.runHostSelfCheck({ executablePath: expected, allowedOrigin: COLLECTOR_ALLOWED_ORIGINS[0] as string });
     if (result.status !== "ok" || result.protocol !== COLLECTOR_PROTOCOL) return false;
@@ -844,8 +876,7 @@ async function converge(
     await guard(context, initialRegistration, { folderExists: false });
     await ensureProgramFolder(context);
     await refuseLinkedNames(context);
-    const confirmed = initialRegistration === "ours" && first.installed.activeSlot !== null && (await readManifestSlot(context)) !== null;
-    await requireRecognizedContent(context, descriptor, confirmed);
+    await requireRecognizedContent(context, descriptor, await hasValidStateFile(context));
     wrote = true;
     await ensureIntegrationDirectory(context);
     await guard(context, initialRegistration, { folderExists: true });
@@ -943,13 +974,27 @@ async function removeNamedExtensionFiles(
   context: Context,
   directory: string,
   descriptor: CollectorPayloadDescriptor | null,
+  owned: boolean,
   tally: { locked: boolean; leftover: boolean },
 ): Promise<void> {
   const { fileSystem } = context.deps;
   try {
     const root = await fileSystem.stat(directory);
     if (root === null) return;
-    if (root.isReparsePoint || root.kind !== "directory" || descriptor === null) {
+    if (root.isReparsePoint || root.kind !== "directory") {
+      tally.leftover = true; // never followed
+      return;
+    }
+    if (owned) {
+      // A valid state file marks the folder as ours, whichever version's files it holds. Links
+      // and unusual entries inside are skipped (the folder then stays), never followed.
+      const state = { locked: false };
+      const outcome = await removeTree(context, directory, false, state);
+      if (state.locked) tally.locked = true;
+      if (outcome === "leftover") tally.leftover = true;
+      return;
+    }
+    if (descriptor === null) {
       tally.leftover = true; // not provably ours by name: it stays
       return;
     }
@@ -1012,6 +1057,7 @@ async function remove(
   const { fileSystem } = deps;
   const tally = { locked: false, leftover: false };
   let folderIsSafe = true;
+  let unregistered = false;
   try {
     const folder = await fileSystem.stat(paths.programFolder);
     let registration: HostRegistrationOwnership;
@@ -1036,6 +1082,7 @@ async function remove(
       }
       if (outcome === "foreign") warn(context, "foreign-registration-left");
       else if (outcome !== "ok" && outcome !== "not-registered") return result(deps, "remove", "failed", "unregister-failed", context.warnings, "skipped");
+      else if (outcome === "ok") unregistered = true;
     }
 
     // 2. Only then decide whether the folder may be touched at all.
@@ -1054,6 +1101,9 @@ async function remove(
     return result(deps, "remove", "failed", "write-failed", [], "skipped");
   }
   if (!folderIsSafe) {
+    // Nothing on disk was touched. If the registration was removed, that much was done: `partial`.
+    // If nothing at all changed (absent or foreign registration), this is a plain refusal.
+    if (!unregistered) return result(deps, "remove", "refused", "program-folder-unsafe", context.warnings, "skipped");
     warn(context, "leftovers-remain");
     return result(deps, "remove", "partial", "program-folder-unsafe", context.warnings, "skipped");
   }
@@ -1061,6 +1111,7 @@ async function remove(
   // 3. Names we own, inside the program folder only. Nothing is deleted by listing a folder and
   //    removing what is found: unknown names (user files) stay and make the outcome `partial`.
   const descriptor = await packagedDescriptorOrNull(deps);
+  const owned = await hasValidStateFile(context);
   try {
     if ((await fileSystem.stat(paths.programFolder)) !== null) {
       await removeFixedFile(context, paths.manifestPath, tally);
@@ -1072,7 +1123,7 @@ async function remove(
       }
       for (const slot of COLLECTOR_HOST_SLOTS) await removeSlot(context, slot, tally);
       for (const name of [COLLECTOR_EXTENSION_FOLDER_NAME, COLLECTOR_EXTENSION_STAGING_NAME, COLLECTOR_EXTENSION_PREVIOUS_NAME]) {
-        await removeNamedExtensionFiles(context, join(paths.programFolder, name), descriptor, tally);
+        await removeNamedExtensionFiles(context, join(paths.programFolder, name), descriptor, owned, tally);
       }
       // The state file goes last so that an interrupted removal can still be recognized as ours.
       if (!tally.leftover) {

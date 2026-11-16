@@ -213,9 +213,21 @@ describe("remove (design 3.5, 8.5)", () => {
     fixture.registry.registration = "foreign";
     fixture.securityFacts.set(fakeKey(fixture.programFolder), { ...safeFacts(true), ownerSid: "S-1-5-21-9-9-9-9" } as never);
     const result = await run(fixture, { action: "remove" });
-    expect(result).toMatchObject({ outcome: "partial", reason: "program-folder-unsafe" });
+    // nothing at all changed: a refusal, not a `partial` that claims work was done
+    expect(result).toMatchObject({ outcome: "refused", reason: "program-folder-unsafe" });
     expect(result.warnings).toContain("foreign-registration-left");
+    expect(result.warnings).not.toContain("leftovers-remain");
     expect(fixture.registry.registration).toBe("foreign");
+    expect(fixture.fileSystem.mutations).toEqual([]);
+  });
+
+  it("an unsafe program folder with no registration at all is a plain refusal", async () => {
+    const fixture = await installed(createApplyFixture());
+    fixture.registry.registration = "absent";
+    fixture.securityFacts.set(fakeKey(fixture.programFolder), { ...safeFacts(true), ownerSid: "S-1-5-21-9-9-9-9" } as never);
+    const result = await run(fixture, { action: "remove" });
+    expect(result).toMatchObject({ outcome: "refused", reason: "program-folder-unsafe" });
+    expect(result.warnings).toEqual([]);
     expect(fixture.fileSystem.mutations).toEqual([]);
   });
 
@@ -239,8 +251,21 @@ describe("remove (design 3.5, 8.5)", () => {
     expect(fixture.fileSystem.has(p(fixture, "host-b"))).toBe(false);
   });
 
-  it("deletes only names the descriptor lists: an unlisted file in a matching, correctly owned extension folder stays (partial)", async () => {
+  it("with a valid state file the extension folder is ours: files of an older version and user files in it are removed", async () => {
+    for (const registration of ["ours", "absent", "foreign"] as const) {
+      const fixture = await installed(createApplyFixture());
+      fixture.registry.registration = registration;
+      fixture.fileSystem.addFile(p(fixture, "extension", "old", "deep", "legacy.js"), "x");
+      fixture.fileSystem.addFile(p(fixture, "extension", "old.js"), "x");
+      const result = await run(fixture, { action: "remove" });
+      expect(result.outcome, registration).toBe("applied");
+      expect(everythingUnder(fixture), registration).toEqual([]);
+    }
+  });
+
+  it("without a valid state file only descriptor-listed names are deleted: an unlisted file in a matching extension folder stays (partial)", async () => {
     const fixture = await installed(createApplyFixture());
+    await fixture.fileSystem.removeFile(p(fixture, "integration-state.json"));
     fixture.fileSystem.addFile(p(fixture, "extension", "old", "deep", "legacy.js"), "x");
     fixture.fileSystem.addFile(p(fixture, "extension", "my-notes.txt"), "mine");
     const result = await run(fixture, { action: "remove" });
@@ -250,12 +275,21 @@ describe("remove (design 3.5, 8.5)", () => {
     expect(fixture.fileSystem.text(p(fixture, "extension", "old", "deep", "legacy.js"))).toBe("x");
     // the listed names are gone, the state file stays so that a retry can recognize the folder
     expect(fixture.fileSystem.has(p(fixture, "extension", "manifest.json"))).toBe(false);
-    expect(fixture.fileSystem.has(p(fixture, "integration-state.json"))).toBe(true);
     expect(fixture.fileSystem.has(p(fixture, "org.maginalia.collector.json"))).toBe(false);
+  });
+
+  it("an invalid state file is no ownership evidence either", async () => {
+    const fixture = await installed(createApplyFixture());
+    fixture.fileSystem.setBytes(p(fixture, "integration-state.json"), "{ not json");
+    fixture.fileSystem.addFile(p(fixture, "extension", "my-notes.txt"), "mine");
+    const result = await run(fixture, { action: "remove" });
+    expect(result.outcome).toBe("partial");
+    expect(fixture.fileSystem.text(p(fixture, "extension", "my-notes.txt"))).toBe("mine");
   });
 
   it("without a usable descriptor the extension folder is not provably ours: it stays (partial)", async () => {
     const fixture = await installed(createApplyFixture());
+    await fixture.fileSystem.removeFile(p(fixture, "integration-state.json"));
     fixture.payload = { broken: true };
     const result = await run(fixture, { action: "remove" });
     expect(result.outcome).toBe("partial");

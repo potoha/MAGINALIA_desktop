@@ -638,6 +638,56 @@ describe("Host slots (design 8.3)", () => {
     expect(fixture.fileSystem.text(p(fixture, "extension", "user-notes.txt"))).toBe("precious");
   });
 
+  describe("an older version's files do not trap the installation (valid state file = ownership)", () => {
+    /** v1 installed, then the packaged payload moves to v2, whose descriptor no longer lists `old.js`. */
+    async function withLeftoverOldFile(): Promise<ApplyFixture> {
+      const fixture = await outdated(createApplyFixture());
+      fixture.fileSystem.addFile(p(fixture, "extension", "old.js"), "from v1");
+      fixture.fileSystem.addFile(p(fixture, "extension", "legacy", "deep.js"), "from v1");
+      return fixture;
+    }
+
+    it("repair from registration-missing succeeds", async () => {
+      const fixture = await withLeftoverOldFile();
+      fixture.registry.registration = "absent";
+      expect((await inspectCollectorIntegration(fixture.deps)).state).toBe("registration-missing");
+      const result = await run(fixture, { action: "repair" });
+      expect(result).toMatchObject({ outcome: "applied", state: "ready" });
+      expect(fixture.fileSystem.has(p(fixture, "extension", "old.js"))).toBe(false);
+    });
+
+    it("repair of a foreign registration (confirmed) succeeds", async () => {
+      const fixture = await withLeftoverOldFile();
+      fixture.registry.registration = "foreign";
+      const result = await run(fixture, { action: "repair", confirmReplaceForeign: true });
+      expect(result).toMatchObject({ outcome: "applied", state: "ready" });
+      expect(fixture.fileSystem.has(p(fixture, "legacy"))).toBe(false);
+    });
+
+    it("repair from a damaged installation without a manifest succeeds", async () => {
+      const fixture = await withLeftoverOldFile();
+      await fixture.fileSystem.removeFile(p(fixture, "org.maginalia.collector.json"));
+      expect((await inspectCollectorIntegration(fixture.deps)).state).toBe("damaged");
+      const result = await run(fixture, { action: "repair" });
+      expect(result).toMatchObject({ outcome: "applied", state: "ready" });
+    });
+
+    it("without a valid state file the same unknown files are still refused and never deleted", async () => {
+      for (const prepare of [
+        (fixture: ApplyFixture) => fixture.fileSystem.removeFile(p(fixture, "integration-state.json")),
+        (fixture: ApplyFixture) => { fixture.fileSystem.setBytes(p(fixture, "integration-state.json"), "{ not json"); },
+      ]) {
+        const fixture = await withLeftoverOldFile();
+        fixture.registry.registration = "absent";
+        await prepare(fixture);
+        const result = await run(fixture, { action: "setup" }); // no usable state file: the folder reads as not set up
+        expect(result).toMatchObject({ outcome: "refused", reason: "program-folder-unrecognized-content" });
+        expect(fixture.fileSystem.text(p(fixture, "extension", "old.js"))).toBe("from v1");
+        expect(fixture.fileSystem.text(p(fixture, "extension", "legacy", "deep.js"))).toBe("from v1");
+      }
+    });
+  });
+
   it("a user file in a slot of an installation that IS ours is still never deleted", async () => {
     const fixture = await outdated(createApplyFixture());
     fixture.fileSystem.addFile(p(fixture, "host-b", "user.txt"), "precious");
@@ -920,24 +970,38 @@ describe("single run guard", () => {
 });
 
 describe("extension.prev that cannot be cleaned (design 6.4)", () => {
-  it("a locked leftover extension.prev skips that swap with a warning instead of failing the whole run", async () => {
+  it("a locked leftover extension.prev FAILS the run (file-locked) before the manifest switch; nothing of the old installation changes; a retry succeeds", async () => {
     const fixture = await outdated(createApplyFixture());
     fixture.fileSystem.addFile(p(fixture, "extension.prev", "old.txt"), "old");
     fixture.fileSystem.lock(p(fixture, "extension.prev"));
+    const manifestBefore = fixture.fileSystem.text(p(fixture, "org.maginalia.collector.json"));
+    const stateBefore = fixture.fileSystem.text(p(fixture, "integration-state.json"));
     const result = await run(fixture, { action: "refresh" });
-    expect(result.outcome).toBe("applied");
-    expect(result.reason).toBeNull();
-    expect(result.warnings).toContain("previous-extension-retained");
-    // the current extension folder was neither moved nor replaced; no staging folder is left behind
-    expect(fixture.fileSystem.has(p(fixture, "extension", "manifest.json"))).toBe(true);
+    expect(result).toMatchObject({ outcome: "failed", reason: "file-locked", selfCheck: "skipped" });
+    expect(result.outcome).not.toBe("applied");
+    // manifest and state file are untouched: the state does NOT claim the new extension version
+    expect(fixture.fileSystem.text(p(fixture, "org.maginalia.collector.json"))).toBe(manifestBefore);
+    expect(fixture.fileSystem.text(p(fixture, "integration-state.json"))).toBe(stateBefore);
     expect(JSON.parse(fixture.fileSystem.text(p(fixture, "extension", "manifest.json"))).version).toBe("0.3.0");
     expect(fixture.fileSystem.has(p(fixture, "extension.next"))).toBe(false);
-    // the Host slot did switch, and the stale extension is reported so that one repair finishes the swap
-    expect(result.inspection.installed.activeSlot).toBe("b");
-    expect(result.state).toBe("damaged");
+    // the slot Chrome runs is complete, and the previous installation is still the one reported
+    expect(result.inspection.installed.activeSlot).toBe("a");
+    expect(result.state).toBe("outdated");
+    expect(fixture.fileSystem.text(p(fixture, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME))).toBe("host-executable-bytes");
+    // retry once the lock is gone (the same slot is rewritten)
     fixture.fileSystem.locked.clear();
-    expect((await run(fixture, { action: "repair" })).outcome).toBe("applied");
-    expect((await inspectCollectorIntegration(fixture.deps)).state).toBe("ready");
+    expect(await run(fixture, { action: "refresh" })).toMatchObject({ outcome: "applied", state: "ready" });
+    expect(JSON.parse(fixture.fileSystem.text(p(fixture, "extension", "manifest.json"))).version).toBe("0.4.0");
+  });
+
+  it("a locked extension.prev during a repair is also a failure that a retry fixes", async () => {
+    const fixture = await installed(createApplyFixture());
+    fixture.fileSystem.setBytes(p(fixture, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME), "tampered");
+    fixture.fileSystem.addFile(p(fixture, "extension.prev", "old.txt"), "old");
+    fixture.fileSystem.lock(p(fixture, "extension.prev"));
+    expect(await run(fixture, { action: "repair" })).toMatchObject({ outcome: "failed", reason: "file-locked" });
+    fixture.fileSystem.locked.clear();
+    expect(await run(fixture, { action: "repair" })).toMatchObject({ outcome: "applied", state: "ready" });
   });
 });
 

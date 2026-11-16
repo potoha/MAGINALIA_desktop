@@ -138,10 +138,18 @@ export type CollectorApplyWarning =
  *   not counted, so a refusal may leave that one empty folder.) Also `busy`: another apply is running.
  * - `failed`: a step failed after that point; `reason` says which class and `inspection` shows what
  *   is on disk now. A failure after the manifest switch is never rolled back (design 6.3): the
- *   files stay, the previous slot is intact, and a repair converges.
+ *   files stay, the previous slot is intact, and a repair converges. A `file-locked` failure of the
+ *   extension swap happens BEFORE the manifest switch and leaves the previous installation, its
+ *   state file included, untouched; the next refresh / repair retries it. Callers must not show
+ *   "updated" for anything but `applied`.
  * - `partial`: remove deleted what it could; `warnings` contains `leftovers-remain`. The registration
  *   may already be gone (remove unregisters first, even from an unsafe folder: `reason` is then
- *   `program-folder-unsafe` and nothing on disk was touched).
+ *   `program-folder-unsafe` and nothing on disk was touched). When nothing at all changed, remove
+ *   from an unsafe folder is `refused` instead.
+ *
+ * For `reason: "busy"` the `state` and `inspection` are a snapshot taken while another apply is
+ * writing and may be transient or inconsistent: callers must ignore them and retry later. (Chosen
+ * over omitting the fields because it keeps the result type unchanged for every caller.)
  */
 export type CollectorApplyOutcome = "applied" | "noop" | "refused" | "failed" | "partial";
 
