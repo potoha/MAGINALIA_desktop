@@ -1,6 +1,7 @@
 !include "nsDialogs.nsh"
 !include "LogicLib.nsh"
 !include "${PROJECT_DIR}\\packaging\\runtime\\ndlocr-installer-size.nsh"
+!include "${PROJECT_DIR}\\packaging\\collector-uninstall.nsh"
 
 # α1 display name. Only used to retire the α1 Desktop shortcut on upgrade.
 !define MAGINALIA_LEGACY_NAME "MAGINALIA desktop α1"
