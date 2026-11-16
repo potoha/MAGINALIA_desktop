@@ -21,6 +21,9 @@
  *    which would be a false alarm.
  *  - After the user asked for `remove` (`removeRequested`, persisted) no refresh and no repair
  *    notice happen until a setup or repair is applied (`recordApplyResult`).
+ *  - Notice state is read and written through one serialized chain; an apply never runs inside it.
+ *  - The alpha1 notice is held back (not even persisted as `shown`) until the renderer asked for notices
+ *    (`markNoticeSurfaceReady`); refresh and repair notices do not wait for that.
  *  - alpha1 notice (design 5, owner decision): once, whenever the user has not opted in, the state is
  *    `not-set-up` and the notice was never shown. Only the Desktop notice state (userData) is written.
  *    Other states (foreign-registration etc.) never raise it; the repair notice owns those.
@@ -78,6 +81,12 @@ export interface CollectorStartupRefresh {
   reconcile(): Promise<readonly CollectorNotice[]>;
   /** Closes one notice (`maginalia.collector.dismissNotice`). Never throws. */
   dismiss(noticeId: string): Promise<readonly CollectorNotice[]>;
+  /**
+   * The renderer can show notices now (it asked for them at least once). Until then the one-time
+   * alpha1 notice is neither persisted as `shown` nor shown; everything else runs independently.
+   * Returns the active notices. Never throws.
+   */
+  markNoticeSurfaceReady(): Promise<readonly CollectorNotice[]>;
   /** Tells the orchestrator about an apply a user started (setup / repair / remove). Never throws. */
   recordApplyResult(result: CollectorApplyResult): Promise<void>;
   currentNotices(): readonly CollectorNotice[];
@@ -89,16 +98,36 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
   const active = new Map<string, CollectorNotice>();
   const dismissedForSession = new Set<string>();
   let running: Promise<CollectorStartupResult> | undefined;
+  /** The renderer has asked for the notices at least once, so something can show them. */
+  let surfaceReady = false;
+  /** The alpha1 notice is due but was held back until a surface exists. */
+  let alpha1Pending = false;
 
   const snapshot = (): readonly CollectorNotice[] => Object.freeze([...active.values()]);
 
-  async function persist(next: CollectorNoticeState): Promise<boolean> {
-    try {
-      await deps.noticeStore.write(next);
-      return true;
-    } catch {
-      return false;
-    }
+  // Every read-modify-write of the notice state goes through this one chain, so a reconcile, a
+  // dismissal, an apply record and the startup run can never overwrite each other with a stale copy.
+  // Applies and inspections are NOT run inside it (an apply may wait for a user dialog).
+  let stateChain: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Reads the current state, lets `update` return the next one (or `undefined` for "no change") and
+   * persists it. `state` is the state after the update even when the write failed (`persisted: false`).
+   */
+  function mutate(update: (state: CollectorNoticeState) => CollectorNoticeState | undefined): Promise<{ readonly state: CollectorNoticeState; readonly persisted: boolean }> {
+    const run = stateChain.then(async () => {
+      const current = await deps.noticeStore.read();
+      const next = update(current);
+      if (next === undefined) return { state: current, persisted: false };
+      try {
+        await deps.noticeStore.write(next);
+        return { state: next, persisted: true };
+      } catch {
+        return { state: next, persisted: false };
+      }
+    });
+    stateChain = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   async function inspectSafely(): Promise<CollectorIntegrationInspection | undefined> {
@@ -127,13 +156,12 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
     return Number.isFinite(contactedAt) && Number.isFinite(createdAt) && contactedAt >= createdAt;
   }
 
-  /** Drops the pending "updated" notice when a matching contact exists. Returns the (possibly new) state. */
-  async function clearUpdatedIfSatisfied(state: CollectorNoticeState, inspection: CollectorIntegrationInspection): Promise<CollectorNoticeState> {
-    if (state.updated === null || !updatedPendingIsSatisfied(state.updated, inspection)) return state;
-    const next: CollectorNoticeState = { ...state, updated: null };
-    active.delete(COLLECTOR_NOTICE_IDS.updated);
-    await persist(next); // a failed write only means the notice is re-evaluated (and cleared again) next time
-    return next;
+  /** Drops the pending "updated" notice when a matching contact exists (decided on the freshest state). */
+  async function clearUpdatedIfSatisfied(inspection: CollectorIntegrationInspection): Promise<CollectorNoticeState> {
+    const result = await mutate((state) => state.updated !== null && updatedPendingIsSatisfied(state.updated, inspection) ? { ...state, updated: null } : undefined);
+    // a failed write only means the notice is re-evaluated (and cleared again) next time
+    if (result.state.updated === null) active.delete(COLLECTOR_NOTICE_IDS.updated);
+    return result.state;
   }
 
   function showUpdated(state: CollectorNoticeState): void {
@@ -141,8 +169,19 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
     active.set(COLLECTOR_NOTICE_IDS.updated, buildUpdatedNotice(state.updated.extensionVersion, state.updated.createdAt));
   }
 
+  /**
+   * The one-time alpha1 notice: remembered (`shown`) before it is shown, and only once a surface can
+   * show it. A notice that could not be remembered stays hidden. A leftover "updated" entry of a
+   * removed installation is dropped with the same write.
+   */
+  async function showAlpha1(): Promise<void> {
+    const result = await mutate((state) => state.alpha1 === "unseen" ? { ...state, alpha1: "shown" as const, updated: null } : undefined);
+    if (result.persisted) active.set(COLLECTOR_NOTICE_IDS.alpha1Migration, buildAlpha1MigrationNotice());
+  }
+
   async function execute(): Promise<CollectorStartupResult> {
     active.clear();
+    alpha1Pending = false;
     const finish = (outcome: CollectorStartupRefreshOutcome): CollectorStartupResult => Object.freeze({ outcome, notices: snapshot() });
     if (deps.e2eIsolationActive) return finish("skipped-e2e-isolation");
     if (deps.payloadUnavailable === true) return finish("skipped-no-payload");
@@ -150,14 +189,13 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
     const inspection = await inspectSafely();
     if (inspection === undefined) return finish("inspection-failed");
     const optedIn = await probe(deps.hasOptedIn);
-    let state = await deps.noticeStore.read();
+    let state = (await mutate(() => undefined)).state;
 
     if (!optedIn) {
-      // Nothing is refreshed or repaired. A leftover "updated" notice of a removed installation is dropped.
-      if (state.updated !== null) state = { ...state, updated: null };
+      // Nothing is refreshed or repaired.
       if (inspection.state === "not-set-up" && state.alpha1 === "unseen") {
-        // Shown once: remembered before it is shown. A notice that could not be remembered stays hidden.
-        if (await persist({ ...state, alpha1: "shown" })) active.set(COLLECTOR_NOTICE_IDS.alpha1Migration, buildAlpha1MigrationNotice());
+        if (surfaceReady) await showAlpha1();
+        else alpha1Pending = true; // nothing could show it yet: do not spend the one-time notice
       }
       return finish("not-opted-in");
     }
@@ -165,10 +203,9 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
     if (state.removeRequested) {
       if (inspection.state === "ready") {
         // The installation is complete again (a setup happened outside `recordApplyResult`): lift the flag.
-        state = { ...state, removeRequested: false };
-        await persist(state);
+        state = (await mutate((current) => ({ ...current, removeRequested: false }))).state;
       } else {
-        if (state.updated !== null) await persist({ ...state, updated: null });
+        await mutate((current) => current.updated !== null ? { ...current, updated: null } : undefined);
         return finish("remove-requested");
       }
     }
@@ -178,25 +215,23 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
       return finish("inspection-incomplete");
     }
 
-    state = await clearUpdatedIfSatisfied(state, inspection);
+    state = await clearUpdatedIfSatisfied(inspection);
 
     if (inspection.state === "outdated") {
       const result = await applyRefresh();
+      // The apply may have waited behind a user action: decide on the state as it is now.
       if (result === undefined) {
-        showUpdated(state);
+        showUpdated((await mutate(() => undefined)).state);
         return finish("refresh-failed");
       }
       if (result.outcome === "applied") {
         const createdAt = deps.now().toISOString();
         const extensionVersion = result.inspection.installed.extensionVersion;
-        if (extensionVersion !== null) {
-          state = { ...state, updated: { extensionVersion, createdAt } };
-          await persist(state);
-        }
-        showUpdated(state);
+        const after = await mutate((current) => extensionVersion !== null ? { ...current, updated: { extensionVersion, createdAt } } : undefined);
+        showUpdated(after.state);
         return finish("refreshed");
       }
-      showUpdated(state);
+      showUpdated((await mutate(() => undefined)).state);
       // `busy` is another apply running right now: its snapshot is transient. Everything else retries next launch.
       return finish(result.reason === "busy" ? "refresh-retry-later" : "refresh-failed");
     }
@@ -224,13 +259,29 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
       return running;
     },
 
+    async markNoticeSurfaceReady(): Promise<readonly CollectorNotice[]> {
+      try {
+        if (deps.e2eIsolationActive || deps.payloadUnavailable === true) return snapshot();
+        surfaceReady = true;
+        if (running !== undefined) await running.catch(() => undefined); // a run in progress sees the flag itself, or leaves `alpha1Pending`
+        if (alpha1Pending) {
+          alpha1Pending = false;
+          const optedIn = await probe(deps.hasOptedIn);
+          if (!optedIn) await showAlpha1();
+        }
+      } catch {
+        // keep what is shown
+      }
+      return snapshot();
+    },
+
     async reconcile(): Promise<readonly CollectorNotice[]> {
       try {
         if (deps.e2eIsolationActive) return snapshot();
-        const state = await deps.noticeStore.read();
+        const state = (await mutate(() => undefined)).state;
         if (state.updated === null) return snapshot();
         const inspection = await inspectSafely();
-        if (inspection !== undefined) await clearUpdatedIfSatisfied(state, inspection);
+        if (inspection !== undefined) await clearUpdatedIfSatisfied(inspection);
       } catch {
         // keep the notice
       }
@@ -239,13 +290,12 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
 
     async dismiss(noticeId: string): Promise<readonly CollectorNotice[]> {
       try {
-        const state = await deps.noticeStore.read();
         if (noticeId === COLLECTOR_NOTICE_IDS.updated) {
           active.delete(noticeId);
-          if (state.updated !== null) await persist({ ...state, updated: null });
+          await mutate((state) => state.updated !== null ? { ...state, updated: null } : undefined);
         } else if (noticeId === COLLECTOR_NOTICE_IDS.alpha1Migration) {
           active.delete(noticeId);
-          if (state.alpha1 !== "dismissed") await persist({ ...state, alpha1: "dismissed" });
+          await mutate((state) => state.alpha1 !== "dismissed" ? { ...state, alpha1: "dismissed" as const } : undefined);
         } else if (noticeId === COLLECTOR_NOTICE_IDS.repair) {
           active.delete(noticeId);
           dismissedForSession.add(noticeId);
@@ -258,18 +308,21 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
 
     async recordApplyResult(result: CollectorApplyResult): Promise<void> {
       try {
-        if (deps.e2eIsolationActive || result.reason === "busy") return;
-        const state = await deps.noticeStore.read();
+        // `refused` changed nothing (`busy` is a transient snapshot): it is not a completed user request.
+        if (deps.e2eIsolationActive || result.outcome === "refused") return;
         if (result.action === "remove") {
-          // Whatever the outcome, the user asked for it: stay quiet (a `partial` removal still looks damaged).
+          // Whatever else happened, the user asked for it: stay quiet (a `partial` removal still looks damaged).
           active.delete(COLLECTOR_NOTICE_IDS.repair);
           active.delete(COLLECTOR_NOTICE_IDS.updated);
-          if (!state.removeRequested || state.updated !== null) await persist({ ...state, removeRequested: true, updated: null });
+          await mutate((state) => !state.removeRequested || state.updated !== null ? { ...state, removeRequested: true, updated: null } : undefined);
         } else if ((result.action === "setup" || result.action === "repair") && (result.outcome === "applied" || result.outcome === "noop")) {
           active.delete(COLLECTOR_NOTICE_IDS.repair);
           active.delete(COLLECTOR_NOTICE_IDS.alpha1Migration);
-          const next: CollectorNoticeState = { ...state, removeRequested: false, alpha1: state.alpha1 === "unseen" ? "dismissed" : state.alpha1 };
-          if (next.removeRequested !== state.removeRequested || next.alpha1 !== state.alpha1) await persist(next);
+          alpha1Pending = false;
+          await mutate((state) => {
+            const next: CollectorNoticeState = { ...state, removeRequested: false, alpha1: state.alpha1 === "unseen" ? "dismissed" : state.alpha1 };
+            return next.removeRequested !== state.removeRequested || next.alpha1 !== state.alpha1 ? next : undefined;
+          });
         }
       } catch {
         // best effort

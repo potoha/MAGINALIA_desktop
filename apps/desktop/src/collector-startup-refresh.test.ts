@@ -189,9 +189,12 @@ describe("opt-in and isolation", () => {
     for (const state of ["outdated", "damaged", "registration-missing", "ready", "not-set-up", "policy-blocked"] as const) {
       const r = rig(state);
       r.optedIn = false;
-      const result = await createCollectorStartupRefresh(r.deps).runStartup();
+      const startup = createCollectorStartupRefresh(r.deps);
+      const result = await startup.runStartup();
       expect(result.outcome).toBe("not-opted-in");
-      expect(kinds(result.notices)).toEqual(state === "not-set-up" ? ["alpha1-migration"] : []);
+      expect(result.notices).toEqual([]);
+      expect(r.store.writes).toHaveLength(0); // nothing is written before a surface exists
+      expect(kinds(await startup.markNoticeSurfaceReady())).toEqual(state === "not-set-up" ? ["alpha1-migration"] : []);
       expect(r.applies).toEqual([]);
       expect(r.store.writes).toHaveLength(state === "not-set-up" ? 1 : 0);
     }
@@ -274,14 +277,69 @@ describe("alpha1 to alpha2 notice (design 5)", () => {
   it("is shown once on a fresh userData for a user without the integration", async () => {
     const r = rig("not-set-up");
     r.optedIn = false;
-    const first = await createCollectorStartupRefresh(r.deps).runStartup();
-    expect(kinds(first.notices)).toEqual(["alpha1-migration"]);
-    const notice = first.notices[0] as CollectorNotice;
+    const startup = createCollectorStartupRefresh(r.deps);
+    expect((await startup.runStartup()).notices).toEqual([]);
+    const shown = await startup.markNoticeSurfaceReady();
+    expect(kinds(shown)).toEqual(["alpha1-migration"]);
+    const notice = shown[0] as CollectorNotice;
     expect(notice.actions.map((action) => action.commandId)).toEqual([COLLECTOR_SETUP_COMMAND_ID, COLLECTOR_DISMISS_NOTICE_COMMAND_ID]);
     expect(notice.actions[0]?.closesNoticeId).toBe(COLLECTOR_NOTICE_IDS.alpha1Migration);
     expect(r.store.state.alpha1).toBe("shown");
     expect(r.applies).toEqual([]);
-    expect((await createCollectorStartupRefresh(r.deps).runStartup()).notices).toEqual([]);
+    const second = createCollectorStartupRefresh(r.deps);
+    await second.runStartup();
+    expect(await second.markNoticeSurfaceReady()).toEqual([]);
+  });
+
+  it("is not persisted as shown before a notice surface exists, and is spent exactly once after it appears", async () => {
+    const r = rig("not-set-up");
+    r.optedIn = false;
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.runStartup();
+    expect(r.store.state.alpha1).toBe("unseen");
+    expect(r.store.writes).toEqual([]);
+    expect(kinds(await startup.markNoticeSurfaceReady())).toEqual(["alpha1-migration"]);
+    expect(r.store.state.alpha1).toBe("shown");
+    expect(r.store.writes).toHaveLength(1);
+    await startup.markNoticeSurfaceReady();
+    expect(r.store.writes).toHaveLength(1);
+  });
+
+  it("a user who never opens a surface keeps the notice for the next launch", async () => {
+    const r = rig("not-set-up");
+    r.optedIn = false;
+    await createCollectorStartupRefresh(r.deps).runStartup();
+    const next = createCollectorStartupRefresh(r.deps);
+    await next.runStartup();
+    expect(kinds(await next.markNoticeSurfaceReady())).toEqual(["alpha1-migration"]);
+  });
+
+  it("a surface that appears before the startup run finishes still gets the notice once", async () => {
+    const r = rig("not-set-up");
+    r.optedIn = false;
+    const startup = createCollectorStartupRefresh(r.deps);
+    const run = startup.runStartup();
+    const ready = startup.markNoticeSurfaceReady();
+    await run;
+    expect(kinds(await ready)).toEqual(["alpha1-migration"]);
+    expect(r.store.writes).toHaveLength(1);
+  });
+
+  it("repair and update notices do not wait for the surface", async () => {
+    const r = rig("damaged");
+    expect(kinds((await createCollectorStartupRefresh(r.deps).runStartup()).notices)).toEqual(["repair"]);
+    const outdated = rig("outdated");
+    expect(kinds((await createCollectorStartupRefresh(outdated.deps).runStartup()).notices)).toEqual(["updated"]);
+  });
+
+  it("a setup applied while the notice is pending spends it without ever showing it", async () => {
+    const r = rig("not-set-up");
+    r.optedIn = false;
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.runStartup();
+    await startup.recordApplyResult(applyResult("applied", null, "setup"));
+    expect(await startup.markNoticeSurfaceReady()).toEqual([]);
+    expect(r.store.state.alpha1).toBe("dismissed");
   });
 
   it("is not shown for an opted-in user, for ready, or for foreign / damaged / outdated states", async () => {
@@ -357,6 +415,7 @@ describe("remove requested", () => {
     const r = rig("damaged");
     const startup = createCollectorStartupRefresh(r.deps);
     await startup.recordApplyResult(applyResult("refused", "busy", "remove"));
+    await startup.recordApplyResult(applyResult("refused", "wrong-state", "remove"));
     expect(r.store.state.removeRequested).toBe(false);
     await startup.recordApplyResult(removed());
     await startup.recordApplyResult(applyResult("failed", "write-failed", "setup"));
@@ -368,6 +427,37 @@ describe("remove requested", () => {
     r.store.state = { ...DEFAULT_COLLECTOR_NOTICE_STATE, removeRequested: true };
     await createCollectorStartupRefresh(r.deps).runStartup();
     expect(r.store.state.removeRequested).toBe(false);
+  });
+});
+
+describe("notice state serialization", () => {
+  it("concurrent record / dismiss / reconcile never overwrite each other with a stale copy", async () => {
+    const r = rig("ready");
+    r.store.state = { ...DEFAULT_COLLECTOR_NOTICE_STATE, alpha1: "shown", updated: { extensionVersion: "0.4.0", createdAt: T0 } };
+    const slowRead = r.store.read.bind(r.store);
+    r.store.read = async () => { const value = await slowRead(); await new Promise((resolve) => setTimeout(resolve, 5)); return value; };
+    const startup = createCollectorStartupRefresh(r.deps);
+    await Promise.all([
+      startup.recordApplyResult(applyResult("applied", null, "remove")),
+      startup.dismiss(COLLECTOR_NOTICE_IDS.alpha1Migration),
+      startup.dismiss(COLLECTOR_NOTICE_IDS.updated),
+    ]);
+    expect(r.store.state).toEqual({ ...DEFAULT_COLLECTOR_NOTICE_STATE, removeRequested: true, alpha1: "dismissed", updated: null });
+  });
+
+  it("the startup refresh decides on the state after its apply, not on the one read before it", async () => {
+    const r = rig("outdated");
+    const startup = createCollectorStartupRefresh({
+      ...r.deps,
+      apply: async (request) => {
+        // a user removal completes while the refresh is waiting
+        await startup.recordApplyResult(applyResult("applied", null, "remove"));
+        return r.deps.apply(request);
+      },
+    });
+    await startup.runStartup();
+    expect(r.store.state.removeRequested).toBe(true);
+    expect(r.store.state.updated).not.toBeNull(); // the refresh result itself is still recorded, nothing was lost
   });
 });
 

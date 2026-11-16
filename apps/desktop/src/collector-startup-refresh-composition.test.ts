@@ -50,7 +50,9 @@ describe("startup refresh composition (unwired)", () => {
     const startup = createCollectorStartupRefreshFromParts(parts(m));
     const result = await startup.runStartup();
     expect(result.outcome).toBe("not-opted-in");
-    expect(result.notices.map((notice) => notice.kind)).toEqual(["alpha1-migration"]);
+    expect(result.notices).toEqual([]);
+    expect(await readdir(m.root)).toEqual(["Local", "Programs"]); // nothing, not even userData, before a surface exists
+    expect((await startup.markNoticeSurfaceReady()).map((notice) => notice.kind)).toEqual(["alpha1-migration"]);
     expect(await readdir(m.root)).toEqual(["Local", "Programs", "userData"]);
     expect(await readdir(m.registry.knownFolders.LocalAppData)).toEqual([]);
     expect(await readdir(m.registry.knownFolders.UserProgramFiles)).toEqual([]);
@@ -69,10 +71,12 @@ describe("startup refresh composition (unwired)", () => {
 
   it("shows the alpha1 notice only once", async () => {
     const m = await machine();
-    const first = await createCollectorStartupRefreshFromParts(parts(m)).runStartup();
-    expect(first.notices.map((notice) => notice.kind)).toEqual(["alpha1-migration"]);
-    const second = await createCollectorStartupRefreshFromParts(parts(m)).runStartup();
-    expect(second.notices).toEqual([]);
+    const firstRun = createCollectorStartupRefreshFromParts(parts(m));
+    await firstRun.runStartup();
+    expect((await firstRun.markNoticeSurfaceReady()).map((notice) => notice.kind)).toEqual(["alpha1-migration"]);
+    const secondRun = createCollectorStartupRefreshFromParts(parts(m));
+    await secondRun.runStartup();
+    expect(await secondRun.markNoticeSurfaceReady()).toEqual([]);
   });
 
   it("without an embedded payload: a development build is inert, a packaged app fails loudly", async () => {
