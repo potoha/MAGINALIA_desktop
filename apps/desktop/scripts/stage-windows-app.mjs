@@ -6,6 +6,7 @@ import { stageShelfMutexAddon } from "./shelf-mutex-addon.mjs";
 import { stageWindowsIntegrationAddon } from "./windows-integration-addon.mjs";
 import { parseCollectorZipFlag } from "./collector-payload.mjs";
 import { stageCollectorPayload } from "./stage-collector-payload.mjs";
+import { embedCollectorPayload } from "./embed-collector-payload.mjs";
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const desktopRoot = path.resolve(scriptDirectory, "..");
@@ -64,6 +65,8 @@ const stagedManifest = {
 };
 await writeFile(path.join(stageRoot, "package.json"), `${JSON.stringify(stagedManifest, null, 2)}\n`, "utf8");
 await cp(path.join(desktopRoot, "dist"), path.join(stageRoot, "dist"), { recursive: true });
+// WP-5c: the descriptor is a compiled constant of the STAGED main bundle (design 2.1); fails the stage when it cannot be embedded.
+await embedCollectorPayload({ distMainDirectory: path.join(stageRoot, "dist", "main"), descriptor: collector.descriptor });
 await runCaptured(process.execPath, [process.env.npm_execpath, "install", "--omit=dev", "--no-audit", "--no-fund", "--ignore-scripts"], stageRoot);
 await writeThirdPartyNotices();
 process.stdout.write(`Allowlisted app staged in ${stageRoot}\n`);

@@ -7,7 +7,9 @@ import { createHash, generateKeyPairSync } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
+import { parseCollectorPayloadDescriptor } from "./collector-payload.js";
 import * as zlib from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import Ajv2020 from "ajv/dist/2020";
@@ -434,6 +436,48 @@ describe("staging and packaged-tree verification", () => {
     for (const [name, hash] of Object.entries(descriptorOnDisk.extension.files as Record<string, string>)) {
       expect(sha256(await readFile(path.join(resources, "collector-extension", name)))).toBe(hash);
     }
+  });
+
+  it("embeds the staged descriptor as the compiled constant, identical to collector-payload.json and valid for the app parser", async () => {
+    const { embedCollectorPayload } = await load("embed-collector-payload.mjs");
+    const { resources, result } = await stagedResources();
+    const distMain = path.join(root, "stage", "dist", "main");
+    await mkdir(distMain, { recursive: true });
+    // the unembedded stub as tsc emits it from src/collector-payload-compiled.ts
+    await writeFile(path.join(distMain, "collector-payload-compiled.js"), "\"use strict\";\nexports.COLLECTOR_PAYLOAD_EMBEDDED = false;\nexports.COMPILED_COLLECTOR_PAYLOAD = null;\n");
+    await embedCollectorPayload({ distMainDirectory: distMain, descriptor: result.descriptor });
+    const compiled = createRequire(import.meta.url)(path.join(distMain, "collector-payload-compiled.js")) as { COLLECTOR_PAYLOAD_EMBEDDED: boolean; COMPILED_COLLECTOR_PAYLOAD: unknown };
+    expect(compiled.COLLECTOR_PAYLOAD_EMBEDDED).toBe(true);
+    const onDisk = JSON.parse(await readFile(path.join(resources, "collector-payload.json"), "utf8"));
+    expect(compiled.COMPILED_COLLECTOR_PAYLOAD).toEqual(onDisk);
+    expect(Object.isFrozen(compiled.COMPILED_COLLECTOR_PAYLOAD)).toBe(true);
+    expect(parseCollectorPayloadDescriptor(compiled.COMPILED_COLLECTOR_PAYLOAD).ok).toBe(true);
+  });
+
+  it("refuses to embed into a missing, already embedded or foreign module, and an invalid descriptor", async () => {
+    const { embedCollectorPayload } = await load("embed-collector-payload.mjs");
+    const { result } = await stagedResources();
+    const distMain = path.join(root, "stage2", "dist", "main");
+    await mkdir(distMain, { recursive: true });
+    await expect(embedCollectorPayload({ distMainDirectory: distMain, descriptor: result.descriptor })).rejects.toThrow(/not emitted/u);
+    const file = path.join(distMain, "collector-payload-compiled.js");
+    await writeFile(file, "exports.SOMETHING = 1;\n");
+    await expect(embedCollectorPayload({ distMainDirectory: distMain, descriptor: result.descriptor })).rejects.toThrow(/stub/u);
+    await writeFile(file, "exports.COLLECTOR_PAYLOAD_EMBEDDED = true;\nexports.COMPILED_COLLECTOR_PAYLOAD = {};\n");
+    await expect(embedCollectorPayload({ distMainDirectory: distMain, descriptor: result.descriptor })).rejects.toThrow(/stub/u);
+    await writeFile(file, "exports.COLLECTOR_PAYLOAD_EMBEDDED = false;\nexports.COMPILED_COLLECTOR_PAYLOAD = null;\n");
+    await expect(embedCollectorPayload({ distMainDirectory: distMain, descriptor: { ...result.descriptor, protocol: "x" } })).rejects.toThrow();
+  });
+
+  it("keeps the source stub unembedded, the stage script wired to embed, and the stub in the main build", async () => {
+    const stub = await readFile(path.join(desktopRoot, "src", "collector-payload-compiled.ts"), "utf8");
+    expect(stub).toMatch(/COLLECTOR_PAYLOAD_EMBEDDED: boolean = false/u);
+    expect(stub).toMatch(/COMPILED_COLLECTOR_PAYLOAD: unknown = null/u);
+    expect(await readFile(path.join(desktopRoot, "scripts", "stage-windows-app.mjs"), "utf8")).toContain("embedCollectorPayload");
+    expect(await readFile(path.join(desktopRoot, "tsconfig.main.json"), "utf8")).toContain("src/collector-payload-compiled.ts");
+    // PAYLOAD_VERSION and the package version stay tied (buildDescriptor refuses otherwise)
+    const { PAYLOAD_VERSION } = await load("collector-payload.mjs");
+    expect(JSON.parse(await readFile(path.join(desktopRoot, "package.json"), "utf8")).version).toBe(PAYLOAD_VERSION);
   });
 
   it("refuses to stage a tampered local ZIP and a Host addon that differs from the staged Shelf mutex", async () => {
