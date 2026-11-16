@@ -403,7 +403,16 @@ describe("connection summary", () => {
     expect(summarizeConnection(inspection("ready", { contact: { status: "absent" } }))).toEqual({ state: "waiting" });
     expect(summarizeConnection(inspection("ready", { contact: { status: "unavailable", violation: "null-dacl" } }))).toEqual({ state: "unavailable" });
     expect(summarizeConnection(inspection("ready", { contact: { status: "invalid", reason: "wrong-protocol" } }))).toEqual({ state: "protocol-differs" });
-    expect(summarizeConnection(inspection("ready", { contact: { status: "invalid", reason: "not-json" } }))).toEqual({ state: "unavailable" });
+    for (const reason of ["unreadable", "too-large", "not-json", "not-an-object", "unexpected-fields", "wrong-version", "invalid-host-version", "invalid-extension-version", "invalid-timestamp", "future-timestamp"] as const) {
+      expect(summarizeConnection(inspection("ready", { contact: { status: "invalid", reason } }))).toEqual({ state: "waiting" });
+    }
+    expect(summarizeConnection(inspection("ready", { contact: { status: "invalid", reason: "reparse-point" } }))).toEqual({ state: "unavailable" });
+    for (const vs of ["newer", "unparseable"] as const) {
+      expect(summarizeConnection(inspection("ready", { contact: { status: "present", record, extensionVersionVsPlaced: vs, hostVersionVsPayload: "equal" } })))
+        .toEqual({ state: "extension-version-differs", loadedVersion: "0.4.0", placedVersion: "0.4.0" });
+    }
+    expect(summarizeConnection(inspection("ready", { installed: { payloadId: null, activeSlot: null, hostVersion: null, extensionVersion: null }, contact: { status: "present", record, extensionVersionVsPlaced: "not-placed", hostVersionVsPayload: "no-payload" } })))
+      .toEqual({ state: "extension-version-differs", loadedVersion: "0.4.0", placedVersion: null });
     expect(summarizeConnection(inspection("ready", { contact: { status: "present", record, extensionVersionVsPlaced: "equal", hostVersionVsPayload: "equal" } })))
       .toEqual({ state: "connected", extensionVersion: "0.4.0", hostVersion: "1.3.0", contactedAt: record.contactedAt });
     expect(summarizeConnection(inspection("ready", { contact: { status: "present", record, extensionVersionVsPlaced: "older", hostVersionVsPayload: "equal" } })))

@@ -106,12 +106,12 @@ export interface CollectorIntegrationStatus {
 }
 
 export type CollectorConnectionSummary =
-  /** No contact record yet (or one that cannot be read as a valid record). */
+  /** No contact record yet, or one that cannot be read or parsed right now (treated as transient). */
   | { readonly state: "waiting" }
   | { readonly state: "connected"; readonly extensionVersion: string; readonly hostVersion: string; readonly contactedAt: string }
   | { readonly state: "extension-version-differs"; readonly loadedVersion: string; readonly placedVersion: string | null }
   | { readonly state: "protocol-differs" }
-  /** The integration folder cannot be trusted or read: the wizard falls back to user confirmation. */
+  /** The integration folder cannot be trusted (ACL) or the record is a reparse point: the wizard falls back to user confirmation. */
   | { readonly state: "unavailable" };
 
 export type CollectorIntegrationUnavailableReason = "e2e-isolation" | "payload-unavailable" | "startup-failed";

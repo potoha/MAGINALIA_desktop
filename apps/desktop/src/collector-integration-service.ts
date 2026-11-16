@@ -136,8 +136,14 @@ export function summarizeConnection(inspection: CollectorIntegrationInspection):
   const contact = inspection.contact;
   if (contact.status === "absent") return { state: "waiting" };
   if (contact.status === "unavailable") return { state: "unavailable" };
-  if (contact.status === "invalid") return contact.reason === "wrong-protocol" ? { state: "protocol-differs" } : { state: "unavailable" };
-  if (contact.extensionVersionVsPlaced === "equal" || contact.extensionVersionVsPlaced === "newer") {
+  if (contact.status === "invalid") {
+    // A record that cannot be read or parsed right now is treated as transient (the Host rewrites it
+    // atomically); only a protocol mismatch or a reparse point is a standing condition.
+    if (contact.reason === "wrong-protocol") return { state: "protocol-differs" };
+    return contact.reason === "reparse-point" ? { state: "unavailable" } : { state: "waiting" };
+  }
+  // Only the exact placed version counts as connected; a newer or unparseable loaded version is a mismatch too.
+  if (contact.extensionVersionVsPlaced === "equal") {
     return { state: "connected", extensionVersion: contact.record.extensionVersion, hostVersion: contact.record.hostVersion, contactedAt: contact.record.contactedAt };
   }
   return { state: "extension-version-differs", loadedVersion: contact.record.extensionVersion, placedVersion: inspection.installed.extensionVersion };
