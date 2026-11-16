@@ -48,8 +48,9 @@ export function createCollectorApplyGate(): CollectorApplyGate {
   let tail: Promise<unknown> = Promise.resolve();
   function enqueue<T>(task: () => Promise<T>): Promise<T> {
     pending += 1; // synchronous: two overlapping callers can never both see an idle gate
-    const result = tail.then(() => task());
-    tail = result.then(() => undefined, () => undefined).finally(() => { pending -= 1; });
+    // The counter drops before the caller's promise settles, so a follow-up call never sees a stale "busy".
+    const result = tail.then(() => task()).finally(() => { pending -= 1; });
+    tail = result.then(() => undefined, () => undefined);
     return result;
   }
   return {

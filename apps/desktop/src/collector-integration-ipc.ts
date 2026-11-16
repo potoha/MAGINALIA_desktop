@@ -60,7 +60,7 @@ export function isCollectorIntegrationRequest(value: unknown): value is Collecto
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record);
   if (!keys.every((key) => (REQUEST_KEYS as readonly string[]).includes(key))) return false;
-  if (typeof record.intent !== "string" || !(COLLECTOR_INTEGRATION_INTENTS as readonly string[]).includes(record.intent)) return false;
+  if (!Object.hasOwn(record, "intent") || typeof record.intent !== "string" || !(COLLECTOR_INTEGRATION_INTENTS as readonly string[]).includes(record.intent)) return false;
   for (const flag of ["confirmReplaceForeign", "proceedWithoutChrome"] as const) {
     if (record[flag] !== undefined && typeof record[flag] !== "boolean") return false;
   }

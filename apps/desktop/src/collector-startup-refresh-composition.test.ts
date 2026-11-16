@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { safeFacts } from "./collector-host-fixture.test-helper.js";
 import { payloadDescriptorFixture, stateFileText } from "./collector-integration.test-helper.js";
 import { FakeCollectorRegistryAdapter } from "./collector-registry-adapter.test-helper.js";
-import { CollectorPayloadNotEmbeddedError, createCollectorStartupRefreshFromParts } from "./collector-startup-refresh-composition.js";
+import { CollectorPayloadNotEmbeddedError, createCollectorIntegrationRuntimeFromParts, createCollectorStartupRefreshFromParts } from "./collector-startup-refresh-composition.js";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -89,5 +89,42 @@ describe("startup refresh composition (unwired)", () => {
     expect(() => createCollectorStartupRefreshFromParts(parts(m, { compiledPayload: missing, isPackaged: true, createRegistry }))).toThrow(CollectorPayloadNotEmbeddedError);
     // the default (this unbuilt source tree) is not embedded either
     expect(() => createCollectorStartupRefreshFromParts({ ...parts(m, { isPackaged: true }), compiledPayload: undefined })).toThrow(CollectorPayloadNotEmbeddedError);
+  });
+});
+
+describe("integration runtime (WP-7 slice A)", () => {
+  it("is inert under E2E isolation: no registry, every operation rejects", async () => {
+    const m = await machine();
+    let constructed = 0;
+    const runtime = createCollectorIntegrationRuntimeFromParts(parts(m, { e2eIsolationActive: true, createRegistry: () => { constructed += 1; return m.registry; } }));
+    expect(runtime.mode).toBe("inert-e2e-isolation");
+    await expect(runtime.inspect()).rejects.toThrow();
+    await expect(runtime.apply({ action: "setup" })).rejects.toThrow();
+    await expect(runtime.locateChrome()).rejects.toThrow();
+    expect(constructed).toBe(0);
+    expect(await readdir(m.root)).toEqual(["Local", "Programs"]);
+  });
+
+  it("is inert in a development build without an embedded payload", async () => {
+    const m = await machine();
+    let constructed = 0;
+    const runtime = createCollectorIntegrationRuntimeFromParts(parts(m, { compiledPayload: { embedded: false, value: null }, createRegistry: () => { constructed += 1; return m.registry; } }));
+    expect(runtime.mode).toBe("inert-no-payload");
+    await expect(runtime.apply({ action: "setup" })).rejects.toThrow();
+    expect(constructed).toBe(0);
+  });
+
+  it("an active runtime inspects read-only and hands the startup apply to the injected wrapper", async () => {
+    const m = await machine();
+    let wrapped = 0;
+    const runtime = createCollectorIntegrationRuntimeFromParts(parts(m, {
+      wrapApply: (apply) => { wrapped += 1; return apply; },
+    }));
+    expect(runtime.mode).toBe("active");
+    expect(wrapped).toBe(1);
+    const inspection = await runtime.inspect({ verifyFileHashes: false });
+    expect(inspection.state).toBe("not-set-up");
+    expect((await runtime.locateChrome()).status).toBeDefined();
+    expect(await readdir(m.root)).toEqual(["Local", "Programs"]);
   });
 });
