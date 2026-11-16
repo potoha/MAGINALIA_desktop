@@ -3,9 +3,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { safeFacts } from "./collector-host-fixture.test-helper.js";
-import { stateFileText } from "./collector-integration.test-helper.js";
+import { payloadDescriptorFixture, stateFileText } from "./collector-integration.test-helper.js";
 import { FakeCollectorRegistryAdapter } from "./collector-registry-adapter.test-helper.js";
-import { createCollectorStartupRefreshFromParts } from "./collector-startup-refresh-composition.js";
+import { CollectorPayloadNotEmbeddedError, createCollectorStartupRefreshFromParts } from "./collector-startup-refresh-composition.js";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -28,7 +28,8 @@ const parts = (m: Awaited<ReturnType<typeof machine>>, extra: Partial<Parameters
   inspectPathSecurity: () => safeFacts(true),
   createPrivateDirectory: () => "exists" as const,
   resourcesPath: path.join(m.root, "resources"),
-  readPayloadDescriptor: async () => { throw new Error("no descriptor"); },
+  isPackaged: false,
+  compiledPayload: { embedded: true, value: payloadDescriptorFixture() },
   processEnvironment: { SystemRoot: "C:\Windows" },
   noticeStatePath: m.noticePath,
   ...extra,
@@ -72,5 +73,21 @@ describe("startup refresh composition (unwired)", () => {
     expect(first.notices.map((notice) => notice.kind)).toEqual(["alpha1-migration"]);
     const second = await createCollectorStartupRefreshFromParts(parts(m)).runStartup();
     expect(second.notices).toEqual([]);
+  });
+
+  it("without an embedded payload: a development build is inert, a packaged app fails loudly", async () => {
+    const m = await machine();
+    let constructed = 0;
+    const missing = { embedded: false, value: null };
+    const createRegistry = () => { constructed += 1; return m.registry; };
+    const dev = createCollectorStartupRefreshFromParts(parts(m, { compiledPayload: missing, createRegistry }));
+    const result = await dev.runStartup();
+    expect(result.outcome).toBe("skipped-no-payload");
+    expect(result.notices).toEqual([]);
+    expect(constructed).toBe(0);
+    expect(await readdir(m.root)).toEqual(["Local", "Programs"]);
+    expect(() => createCollectorStartupRefreshFromParts(parts(m, { compiledPayload: missing, isPackaged: true, createRegistry }))).toThrow(CollectorPayloadNotEmbeddedError);
+    // the default (this unbuilt source tree) is not embedded either
+    expect(() => createCollectorStartupRefreshFromParts({ ...parts(m, { isPackaged: true }), compiledPayload: undefined })).toThrow(CollectorPayloadNotEmbeddedError);
   });
 });

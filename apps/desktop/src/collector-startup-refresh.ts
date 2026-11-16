@@ -49,10 +49,13 @@ export interface CollectorStartupRefreshDependencies {
   readonly now: () => Date;
   /** Decided by the composition root (this module reads no environment). */
   readonly e2eIsolationActive: boolean;
+  /** Development build without an embedded payload descriptor: the feature is off (a packaged app fails at composition instead). */
+  readonly payloadUnavailable?: boolean;
 }
 
 export type CollectorStartupRefreshOutcome =
   | "skipped-e2e-isolation"
+  | "skipped-no-payload"
   | "inspection-failed"
   | "inspection-incomplete"
   | "not-opted-in"
@@ -142,6 +145,7 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
     active.clear();
     const finish = (outcome: CollectorStartupRefreshOutcome): CollectorStartupResult => Object.freeze({ outcome, notices: snapshot() });
     if (deps.e2eIsolationActive) return finish("skipped-e2e-isolation");
+    if (deps.payloadUnavailable === true) return finish("skipped-no-payload");
 
     const inspection = await inspectSafely();
     if (inspection === undefined) return finish("inspection-failed");

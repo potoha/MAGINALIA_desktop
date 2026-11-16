@@ -8,10 +8,11 @@
  *
  *  - `e2eIsolationActive`: when true nothing is constructed (`createRegistry` is never called, so
  *    the native addon is not even loaded) and the returned orchestrator does nothing.
- *  - `readPayloadDescriptor`: left to the caller on purpose. The design says the compiled constants
- *    of the main bundle, not the informational `collector-payload.json`, are authoritative
- *    (design 2.1, apply-module note). Those constants do not exist yet (open design point, see the
- *    WP-5c report), so reading the resource file here would silently settle that question.
+ *  - The payload descriptor comes from the compiled constant (`collector-payload-compiled.ts`,
+ *    embedded by `scripts/embed-collector-payload.mjs` when the Windows app is staged), never from
+ *    the informational `collector-payload.json`. Not embedded: a packaged app throws
+ *    `CollectorPayloadNotEmbeddedError` here (fail loudly); a development build gets an inert
+ *    orchestrator (`skipped-no-payload`). Nothing is silently replaced by an empty payload.
  *
  * The opt-in probe (`hasOptedIn`) is read-only.
  */
@@ -31,6 +32,7 @@ import {
 } from "./collector-integration.js";
 import type { CollectorRegistryAdapter } from "./collector-registry-adapter.js";
 import type { PathSecurityInspector } from "./collector-path-security.js";
+import { COLLECTOR_PAYLOAD_EMBEDDED, COMPILED_COLLECTOR_PAYLOAD } from "./collector-payload-compiled.js";
 import { createFileCollectorNoticeStore, type CollectorNoticeStore } from "./collector-integration-notices.js";
 import {
   createCollectorStartupRefresh,
@@ -50,8 +52,10 @@ export interface CollectorStartupCompositionOptions {
   readonly createPrivateDirectory: (target: string) => "created" | "exists" | Promise<"created" | "exists">;
   /** Electron's `process.resourcesPath` (holds `collector-host` and `collector-extension`). */
   readonly resourcesPath: string;
-  /** Returns the parsed payload descriptor; see the module comment. */
-  readonly readPayloadDescriptor: () => Promise<unknown>;
+  /** `app.isPackaged`. A packaged app without an embedded payload is a build defect and throws. */
+  readonly isPackaged: boolean;
+  /** Test seam; default is the compiled constant. */
+  readonly compiledPayload?: { readonly embedded: boolean; readonly value: unknown };
   /** Product: `process.env` (reduced to an allowlist before it reaches the Host). */
   readonly processEnvironment: Readonly<Record<string, string | undefined>>;
   /** Desktop userData file for the notice state. */
@@ -62,19 +66,33 @@ export interface CollectorStartupCompositionOptions {
   readonly randomSuffix?: () => string;
 }
 
-const inertDependencies = (now: () => Date, noticeStore: CollectorNoticeStore): CollectorStartupRefreshDependencies => ({
+export class CollectorPayloadNotEmbeddedError extends Error {
+  public constructor() {
+    super("The packaged app has no embedded Collector payload descriptor (build defect).");
+    this.name = "CollectorPayloadNotEmbeddedError";
+  }
+}
+
+const inertDependencies = (now: () => Date, noticeStore: CollectorNoticeStore, isolated: boolean): CollectorStartupRefreshDependencies => ({
   inspect: () => Promise.reject(new Error("unavailable under E2E isolation")),
   apply: () => Promise.reject(new Error("unavailable under E2E isolation")),
   hasOptedIn: () => Promise.resolve(false),
   noticeStore,
   now,
-  e2eIsolationActive: true,
+  e2eIsolationActive: isolated,
+  payloadUnavailable: !isolated,
 });
 
 export function createCollectorStartupRefreshFromParts(options: CollectorStartupCompositionOptions): CollectorStartupRefresh {
   const now = options.now ?? (() => new Date());
   const noticeStore = options.noticeStore ?? createFileCollectorNoticeStore(options.noticeStatePath);
-  if (options.e2eIsolationActive) return createCollectorStartupRefresh(inertDependencies(now, noticeStore));
+  if (options.e2eIsolationActive) return createCollectorStartupRefresh(inertDependencies(now, noticeStore, true));
+  const compiled = options.compiledPayload ?? { embedded: COLLECTOR_PAYLOAD_EMBEDDED, value: COMPILED_COLLECTOR_PAYLOAD };
+  if (!compiled.embedded || compiled.value === null || compiled.value === undefined) {
+    if (options.isPackaged) throw new CollectorPayloadNotEmbeddedError();
+    return createCollectorStartupRefresh(inertDependencies(now, noticeStore, false));
+  }
+  const compiledValue = compiled.value;
 
   const registry = options.createRegistry();
   const fileSystem = createNodeCollectorApplyFileSystem({ createPrivateDirectory: options.createPrivateDirectory });
@@ -82,7 +100,7 @@ export function createCollectorStartupRefreshFromParts(options: CollectorStartup
     registry,
     fileSystem,
     inspectPathSecurity: options.inspectPathSecurity,
-    readPayloadDescriptor: options.readPayloadDescriptor,
+    readPayloadDescriptor: async () => compiledValue,
     now,
     e2eIsolationActive: false,
     payloadSource: {
