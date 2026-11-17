@@ -197,18 +197,20 @@ describe("wrapper: surface and argument validation", () => {
   });
 
   it("a target the addon reports read-only or absent is refused by the wrapper even if the TS enumeration knows it", () => {
-    // Addon table without edge; chromium read-only: writers only accept chrome.
-    const narrow = [ADDON_TABLE[0], ADDON_TABLE[2]];
+    // Addon table without chromium (a non-writable row may be missing; the writable set must still match the TS table).
+    const narrow = [ADDON_TABLE[0], ADDON_TABLE[1]];
     const { native, calls } = fakeNative({ targets: narrow });
     const wrapper = createWindowsIntegration(native);
     expect(wrapper.registerCollectorHost("chrome")).toBe("ok");
-    expect(() => wrapper.registerCollectorHost("edge")).toThrow(expect.objectContaining({ code: "windows-integration-invalid-argument" }));
-    expect(() => wrapper.inspectCollectorHostRegistration("edge")).toThrow(expect.objectContaining({ code: "windows-integration-invalid-argument" }));
-    expect(wrapper.inspectCollectorHostRegistration("chromium")).toBe("absent");
+    expect(() => wrapper.inspectCollectorHostRegistration("chromium")).toThrow(expect.objectContaining({ code: "windows-integration-invalid-argument" }));
     expect(() => wrapper.unregisterCollectorHost("chromium")).toThrow(WindowsIntegrationError);
     // Vivaldi is in the TS enumeration but not in the addon table (design 3.4): inspect is refused too.
     expect(() => wrapper.inspectCollectorHostRegistration("vivaldi")).toThrow(expect.objectContaining({ code: "windows-integration-invalid-argument" }));
-    expect(calls.map((call) => call.args)).toEqual([["chrome"], ["chromium"]]);
+    expect(calls.map((call) => call.args)).toEqual([["chrome"]]);
+    // An addon whose writable set differs from the TS table (no edge) is not the addon this build expects.
+    expect(() => createWindowsIntegration(fakeNative({ targets: [ADDON_TABLE[0], ADDON_TABLE[2]] }).native)).toThrow(
+      expect.objectContaining({ code: "windows-integration-unavailable" }),
+    );
   });
 
   it("inspect takes exactly one table target id", () => {
@@ -242,7 +244,10 @@ describe("wrapper: surface and argument validation", () => {
     expect(unavailable({ targets: [{ ...ADDON_TABLE[0], writable: "yes" }] })).toBe("windows-integration-unavailable");
     // The TS table says chromium is read-only; an addon that makes it writable is not trusted.
     expect(unavailable({ targets: [{ ...ADDON_TABLE[2], writable: true }] })).toBe("windows-integration-unavailable");
-    expect(unavailable({ targets: [] })).toBe("no error");
+    // The writable set must equal the TS writable set (chrome, edge): `[]` and an edge-less table are not ours.
+    expect(unavailable({ targets: [] })).toBe("windows-integration-unavailable");
+    expect(unavailable({ targets: [ADDON_TABLE[0], ADDON_TABLE[2]] })).toBe("windows-integration-unavailable");
+    expect(unavailable({ targets: [ADDON_TABLE[0], ADDON_TABLE[1]] })).toBe("no error");
   });
 
   it("validates known folder ids and requires a local absolute path back", () => {
@@ -506,6 +511,8 @@ describe("source scan: no environment, cwd, argv or Electron path reads", () => 
       subkey: (match[2] ?? "").replace(/\\\\/gu, "\\"),
       writable: match[3] === "true",
     }));
+    // Every `{` row in the block must have parsed (a malformed row must not be skipped silently).
+    expect(rows.length).toBe(block.split("\n").filter((line) => line.trim().startsWith("{")).length);
     expect(rows.map((row) => row.id)).toEqual(["chrome", "edge", "chromium"]);
     for (const row of rows) {
       const ts = COLLECTOR_REGISTRY_TARGETS.find((target) => target.id === row.id);
@@ -591,22 +598,29 @@ describe("product adapter over a fake native module", () => {
     expect(calls).toEqual([]);
   });
 
-  it("reads the default https ProgId from UserChoiceLatest first, then UserChoice", () => {
+  it("reads the default https ProgId from the UserChoiceLatest\\ProgId subkey first, then UserChoice, and says which", () => {
     const base = "Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\";
-    expect(adapterFor({ values: { [`HKCU|default|${base}UserChoice|ProgId`]: { type: "sz", value: "VivaldiHTM" } } }).readDefaultBrowserProgId()).toBe("VivaldiHTM");
+    // Measured layout: UserChoiceLatest has a `Hash` value and a `ProgId` SUBKEY holding the `ProgId` value.
+    const latest = `HKCU|default|${base}UserChoiceLatest\\ProgId|ProgId`;
+    const older = `HKCU|default|${base}UserChoice|ProgId`;
+    expect(adapterFor({ values: { [older]: { type: "sz", value: "VivaldiHTM" } } }).readDefaultBrowserProgId()).toEqual({ progId: "VivaldiHTM", source: "user-choice" });
+    expect(adapterFor({ values: { [latest]: { type: "sz", value: "MSEdgeHTM" } } }).readDefaultBrowserProgId()).toEqual({ progId: "MSEdgeHTM", source: "user-choice-latest" });
+    // Both present and different: UserChoiceLatest wins and the result says so.
     expect(adapterFor({
       values: {
-        [`HKCU|default|${base}UserChoice|ProgId`]: { type: "sz", value: "VivaldiHTM" },
-        [`HKCU|default|${base}UserChoiceLatest|ProgId`]: { type: "sz", value: "MSEdgeHTM" },
+        [older]: { type: "sz", value: "VivaldiHTM" },
+        [latest]: { type: "sz", value: "MSEdgeHTM" },
       },
-    }).readDefaultBrowserProgId()).toBe("MSEdgeHTM");
+    }).readDefaultBrowserProgId()).toEqual({ progId: "MSEdgeHTM", source: "user-choice-latest" });
     // An unusable newer value falls back to the older key.
     expect(adapterFor({
       values: {
-        [`HKCU|default|${base}UserChoice|ProgId`]: { type: "sz", value: "ChromeHTML" },
-        [`HKCU|default|${base}UserChoiceLatest|ProgId`]: { type: "sz", value: "" },
+        [older]: { type: "sz", value: "ChromeHTML" },
+        [latest]: { type: "sz", value: "" },
       },
-    }).readDefaultBrowserProgId()).toBe("ChromeHTML");
+    }).readDefaultBrowserProgId()).toEqual({ progId: "ChromeHTML", source: "user-choice" });
+    // A `ProgId` value directly under UserChoiceLatest (not the measured layout) is not read.
+    expect(adapterFor({ values: { [`HKCU|default|${base}UserChoiceLatest|ProgId`]: { type: "sz", value: "MSEdgeHTM" } } }).readDefaultBrowserProgId()).toBeNull();
   });
 
   it("reads a ProgId's open command raw (HKCU then HKLM), and treats a ProgId that is not a plain name as no command", () => {
@@ -664,7 +678,7 @@ describe("product adapter over a fake native module", () => {
       { source: "hkcu", value: "C:\\Users\\t\\chrome.exe" },
       { source: "hklm-32", value: "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe" },
     ]);
-    expect(adapter.readDefaultBrowserProgId()).toBe("ChromeHTML");
+    expect(adapter.readDefaultBrowserProgId()).toEqual({ progId: "ChromeHTML", source: "user-choice" });
     expect(adapterFor({}).readDefaultBrowserProgId()).toBeNull();
     expect(adapterFor({}).readChromeAppPaths()).toEqual([]);
   });
@@ -862,7 +876,7 @@ nativeDescribe("native product addon: read-only", () => {
     expect(adapter.readChromePolicies().hklm.hive).toBe("HKLM");
     expect(Array.isArray(adapter.readChromeAppPaths())).toBe(true);
     const progId = adapter.readDefaultBrowserProgId();
-    expect(progId === null || typeof progId === "string").toBe(true);
+    expect(progId === null || typeof progId.progId === "string").toBe(true);
   });
 });
 

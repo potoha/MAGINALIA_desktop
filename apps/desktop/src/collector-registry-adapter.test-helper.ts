@@ -12,7 +12,13 @@
  * reject a target that is not writable (`chromium`, `vivaldi`) and the reader rejects a target
  * the addon's table does not contain (`vivaldi`) with `windows-integration-invalid-argument`.
  */
+import {
+  APP_PATHS_NAME_PATTERN,
+  BROWSER_POLICY_ROOTS,
+  PROG_ID_PATTERN,
+} from "./collector-registry-adapter.js";
 import type {
+  DefaultBrowserProgIdFact,
   BrowserAppPathValue,
   BrowserPolicyRoot,
   BrowserPolicySnapshot,
@@ -96,6 +102,8 @@ export class FakeCollectorRegistryAdapter implements CollectorRegistryAdapter {
   public appPaths: readonly ChromeAppPathValue[] = [];
   public appPathsByName: Record<string, readonly BrowserAppPathValue[]> = {};
   public defaultBrowserProgId: string | null = null;
+  /** Which key `defaultBrowserProgId` is reported as read from. Default: `UserChoice`. */
+  public defaultBrowserProgIdSource: DefaultBrowserProgIdFact["source"] = "user-choice";
   /** `shell\open\command` default value per ProgId. */
   public progIdOpenCommands: Record<string, string> = {};
   /** When set, the next call of that kind throws this error (then clears). */
@@ -178,17 +186,24 @@ export class FakeCollectorRegistryAdapter implements CollectorRegistryAdapter {
 
   public readBrowserPolicies(root: BrowserPolicyRoot): BrowserPolicySnapshot {
     this.enter("readBrowserPolicies");
+    if (typeof root !== "string" || !(BROWSER_POLICY_ROOTS as readonly string[]).includes(root)) {
+      throw new WindowsIntegrationError("windows-integration-invalid-argument", "Invalid browser policy root.");
+    }
     return root === "Microsoft\\Edge" ? this.edgePolicies : this.policies;
   }
 
   public readBrowserAppPaths(appPathsName: string): readonly BrowserAppPathValue[] {
     this.enter("readBrowserAppPaths");
+    if (typeof appPathsName !== "string" || !APP_PATHS_NAME_PATTERN.test(appPathsName)) {
+      throw new WindowsIntegrationError("windows-integration-invalid-argument", "Invalid App Paths name.");
+    }
     if (appPathsName === "chrome.exe" && this.appPathsByName[appPathsName] === undefined) return this.appPaths;
     return this.appPathsByName[appPathsName] ?? [];
   }
 
   public readProgIdOpenCommand(progId: string): string | null {
     this.enter("readProgIdOpenCommand");
+    if (typeof progId !== "string" || !PROG_ID_PATTERN.test(progId)) return null;
     return this.progIdOpenCommands[progId] ?? null;
   }
 
@@ -202,8 +217,8 @@ export class FakeCollectorRegistryAdapter implements CollectorRegistryAdapter {
     return this.appPaths;
   }
 
-  public readDefaultBrowserProgId(): string | null {
+  public readDefaultBrowserProgId(): DefaultBrowserProgIdFact | null {
     this.enter("readDefaultBrowserProgId");
-    return this.defaultBrowserProgId;
+    return this.defaultBrowserProgId === null ? null : { progId: this.defaultBrowserProgId, source: this.defaultBrowserProgIdSource };
   }
 }

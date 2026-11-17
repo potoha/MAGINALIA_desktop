@@ -67,6 +67,12 @@ export type BrowserPolicyRoot = (typeof BROWSER_POLICY_ROOTS)[number];
 export type BrowserPolicySnapshot = ChromePolicySnapshot;
 export type BrowserAppPathValue = ChromeAppPathValue;
 
+/** Where a default-browser ProgId was read from (`UserChoiceLatest` wins over `UserChoice`). */
+export interface DefaultBrowserProgIdFact {
+  readonly progId: string;
+  readonly source: "user-choice-latest" | "user-choice";
+}
+
 export interface CollectorRegistryAdapter {
   /** `SHGetKnownFolderPath` for the fixed folder set; a local-drive absolute path. */
   getKnownFolderPath(id: KnownFolderId): string;
@@ -90,10 +96,10 @@ export interface CollectorRegistryAdapter {
    */
   readBrowserAppPaths(appPathsName: string): readonly BrowserAppPathValue[];
   /**
-   * `ProgId` of the default `https` handler: `UserChoiceLatest` first, then `UserChoice`
-   * (design 2.1), or `null`.
+   * `ProgId` of the default `https` handler and which key it came from: the `ProgId` subkey of
+   * `UserChoiceLatest` first, then `UserChoice` (design 2.1), or `null`.
    */
-  readDefaultBrowserProgId(): string | null;
+  readDefaultBrowserProgId(): DefaultBrowserProgIdFact | null;
   /**
    * The raw `shell\open\command` default value of a ProgId (HKCU `Software\Classes` first, then
    * HKLM), never expanded and never executed; only used to pick between installed candidates
@@ -110,8 +116,12 @@ const POLICY_SUBKEY_PREFIX = "SOFTWARE\\Policies\\";
 const APP_PATHS_HKLM_PREFIX = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\";
 const APP_PATHS_HKCU_PREFIX = "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\";
 const HTTPS_ASSOCIATION_SUBKEY = "Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\";
-const APP_PATHS_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.exe$/u;
-const PROG_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/u;
+/** `UserChoiceLatest` holds a `ProgId` SUBKEY (with a `ProgId` value); `UserChoice` holds the value directly. */
+const USER_CHOICE_LATEST_PROGID_SUBKEY = `${HTTPS_ASSOCIATION_SUBKEY}UserChoiceLatest\\ProgId`;
+const USER_CHOICE_SUBKEY = `${HTTPS_ASSOCIATION_SUBKEY}UserChoice`;
+/** Shared with the test fake so both validate input identically. */
+export const APP_PATHS_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.exe$/u;
+export const PROG_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/u;
 
 function adapterArgumentError(message: string): never {
   throw new WindowsIntegrationError("windows-integration-invalid-argument", message);
@@ -179,11 +189,16 @@ function readAppPaths(integration: WindowsIntegration, name: unknown): readonly 
   return Object.freeze(found);
 }
 
-function readHttpsProgId(integration: WindowsIntegration): string | null {
-  // `UserChoiceLatest` (newer Windows 11 builds) is read first, then `UserChoice` (design 2.1).
-  for (const leaf of ["UserChoiceLatest", "UserChoice"]) {
-    const value = integration.readRegistryValue("HKCU", `${HTTPS_ASSOCIATION_SUBKEY}${leaf}`, "ProgId", "default");
-    if (value !== null && value.type === "sz" && value.value.length > 0) return value.value;
+function readHttpsProgId(integration: WindowsIntegration): DefaultBrowserProgIdFact | null {
+  // Measured on Windows 11: `UserChoiceLatest` has a `Hash` value and a `ProgId` SUBKEY whose `ProgId`
+  // value is the answer; it is read first. Then the older `UserChoice` `ProgId` value (design 2.1).
+  const probes: ReadonlyArray<{ source: DefaultBrowserProgIdFact["source"]; subkey: string }> = [
+    { source: "user-choice-latest", subkey: USER_CHOICE_LATEST_PROGID_SUBKEY },
+    { source: "user-choice", subkey: USER_CHOICE_SUBKEY },
+  ];
+  for (const probe of probes) {
+    const value = integration.readRegistryValue("HKCU", probe.subkey, "ProgId", "default");
+    if (value !== null && value.type === "sz" && value.value.length > 0) return Object.freeze({ progId: value.value, source: probe.source });
   }
   return null;
 }
@@ -225,7 +240,7 @@ export function createCollectorRegistryAdapterOver(integration: WindowsIntegrati
 
     readBrowserPolicies: (root: BrowserPolicyRoot): BrowserPolicySnapshot => readPolicies(integration, root),
     readBrowserAppPaths: (appPathsName: string): readonly BrowserAppPathValue[] => readAppPaths(integration, appPathsName),
-    readDefaultBrowserProgId: (): string | null => readHttpsProgId(integration),
+    readDefaultBrowserProgId: (): DefaultBrowserProgIdFact | null => readHttpsProgId(integration),
     readProgIdOpenCommand: (progId: string): string | null => readOpenCommand(integration, progId),
 
     readChromePolicies: (): ChromePolicySnapshot => readPolicies(integration, "Google\\Chrome"),

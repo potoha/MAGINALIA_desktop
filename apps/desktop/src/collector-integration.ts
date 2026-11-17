@@ -261,7 +261,7 @@ async function detectChrome(
 ): Promise<ChromeDetection> {
   let defaultBrowser: DefaultBrowserKind = "unknown";
   try {
-    defaultBrowser = classifyDefaultBrowser(dependencies.registry.readDefaultBrowserProgId());
+    defaultBrowser = classifyDefaultBrowser(dependencies.registry.readDefaultBrowserProgId()?.progId ?? null);
   } catch {
     defaultBrowser = "unknown"; // tailoring only; never blocks
   }

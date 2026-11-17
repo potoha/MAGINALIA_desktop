@@ -219,7 +219,8 @@ const UNREGISTER_STATUSES = ["ok", "not-registered", "foreign", "access-denied",
 
 /**
  * Validate the addon's table: every row is {id in the enumeration, subkey string, writable boolean},
- * ids are unique, and a row the TS table says is read-only is not writable in the addon. A table
+ * ids are unique, a row the TS table says is read-only is not writable in the addon, and the
+ * writable set equals the TS writable set. A table
  * that violates this means the addon is not the one this build expects.
  */
 function parseTargetTable(raw: unknown): readonly CollectorHostTargetInfo[] {
@@ -237,6 +238,10 @@ function parseTargetTable(raw: unknown): readonly CollectorHostTargetInfo[] {
     seen.add(id);
     rows.push(Object.freeze({ id: id as CollectorRegistryTargetId, subkey, writable }));
   }
+  // The addon must expose exactly the writable set the TS table declares (a `[]` or an edge-less table is not ours).
+  const expectedWritable = COLLECTOR_REGISTRY_TARGETS.filter((target) => target.writable).map((target) => target.id).sort();
+  const actualWritable = rows.filter((row) => row.writable).map((row) => row.id).sort();
+  if (expectedWritable.length !== actualWritable.length || expectedWritable.some((id, index) => id !== actualWritable[index])) return bad();
   return Object.freeze(rows);
 }
 
