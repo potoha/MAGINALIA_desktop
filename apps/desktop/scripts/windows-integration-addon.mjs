@@ -26,6 +26,7 @@ export const PRODUCT_JS_EXPORTS = Object.freeze([
   "apiVersion",
   "getKnownFolderPath",
   "inspectCollectorHostRegistration",
+  "listCollectorHostTargets",
   "readRegistryValue",
   "readRegistryValueNames",
   "registerCollectorHost",

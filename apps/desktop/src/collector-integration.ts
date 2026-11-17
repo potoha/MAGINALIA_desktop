@@ -574,7 +574,7 @@ export async function inspectCollectorIntegration(
 
   let registration: HostRegistrationOwnership | "unknown" = "unknown";
   try {
-    registration = dependencies.registry.readCollectorHostRegistration();
+    registration = dependencies.registry.readCollectorHostRegistration("chrome");
   } catch {
     incomplete("registry-read-failed");
   }

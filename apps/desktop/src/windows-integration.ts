@@ -5,10 +5,13 @@
  * What this module is and is not:
  *
  * - It exposes exactly the addon's functions with validated arguments and mapped errors.
+ *   apiVersion 2 (multi-browser design 3.2): `inspectCollectorHostRegistration`,
  *   `registerCollectorHost`, `unregisterCollectorHost` and
- *   `replaceForeignCollectorHostRegistration` accept NO arguments, here and in the
- *   addon, so no caller can choose a key, a value or a path. Registry reads are
- *   read-only. There is no generic registry write or delete.
+ *   `replaceForeignCollectorHostRegistration` accept exactly ONE argument, a target id from
+ *   a fixed enumeration (`COLLECTOR_REGISTRY_TARGET_IDS`). The writers additionally require a
+ *   target the addon reports as writable (and the TS table agrees is writable). The addon
+ *   maps the id to a compile-time key; no caller can choose a key, a value or a path.
+ *   Registry reads are read-only. There is no generic registry write or delete.
  * - It does not implement the integration state machine, any UI or any file placement
  *   (WP-5a/5b/7); those inject a `CollectorRegistryAdapter` (see
  *   `collector-registry-adapter.ts`).
@@ -19,10 +22,21 @@
  */
 import { lstatSync } from "node:fs";
 import path from "node:path";
+import {
+  COLLECTOR_REGISTRY_TARGETS,
+  COLLECTOR_REGISTRY_TARGET_IDS,
+  type CollectorRegistryTargetId,
+} from "./collector-browser-table.js";
+
+/** The addon API generation this wrapper speaks. Any other `apiVersion` is `windows-integration-unavailable`. */
+export const WINDOWS_INTEGRATION_API_VERSION = 2;
 
 /** The Native Messaging host name (design 3.3, pinned constant). */
 export const COLLECTOR_HOST_NAME = "org.maginalia.collector";
-/** `HKCU` key whose default value is the manifest path. Used only for READING here; the addon owns the write. */
+/**
+ * The Chrome target's `HKCU` key (default value = manifest path). Used only for READING here; the
+ * addon's compile-time table owns every write. Other targets: `COLLECTOR_REGISTRY_TARGETS`.
+ */
 export const COLLECTOR_HOST_REGISTRY_SUBKEY =
   "Software\\Google\\Chrome\\NativeMessagingHosts\\org.maginalia.collector";
 export const COLLECTOR_PROGRAM_FOLDER_NAME = "MAGINALIA Collector";
@@ -47,7 +61,7 @@ export type RegistryValue =
   | { readonly type: "dword"; readonly value: number }
   | { readonly type: "other"; readonly value: null };
 
-/** The single native ownership verdict for the fixed host key (see the addon's InspectExisting). */
+/** The single native ownership verdict for one target's host key (see the addon's InspectExisting). */
 export type HostRegistrationOwnership = "absent" | "ours" | "foreign";
 export type RegisterOutcome = "ok" | "foreign" | "access-denied" | "failed";
 export type UnregisterOutcome = "ok" | "not-registered" | "foreign" | "access-denied" | "failed";
@@ -89,10 +103,18 @@ export interface WindowsIntegrationNative {
   getKnownFolderPath(id: string): unknown;
   readRegistryValue(hive: string, subkey: string, name: string, view: string): unknown;
   readRegistryValueNames(hive: string, subkey: string, view: string): unknown;
-  inspectCollectorHostRegistration(): unknown;
-  registerCollectorHost(): unknown;
-  unregisterCollectorHost(): unknown;
-  replaceForeignCollectorHostRegistration(): unknown;
+  listCollectorHostTargets(): unknown;
+  inspectCollectorHostRegistration(target: string): unknown;
+  registerCollectorHost(target: string): unknown;
+  unregisterCollectorHost(target: string): unknown;
+  replaceForeignCollectorHostRegistration(target: string): unknown;
+}
+
+/** One row of the addon's compile-time target table, as returned by `listCollectorHostTargets`. */
+export interface CollectorHostTargetInfo {
+  readonly id: CollectorRegistryTargetId;
+  readonly subkey: string;
+  readonly writable: boolean;
 }
 
 /** The exact property names the product addon exports (plus `apiVersion`). */
@@ -100,6 +122,7 @@ export const WINDOWS_INTEGRATION_NATIVE_EXPORTS: readonly string[] = Object.free
   "apiVersion",
   "getKnownFolderPath",
   "inspectCollectorHostRegistration",
+  "listCollectorHostTargets",
   "readRegistryValue",
   "readRegistryValueNames",
   "registerCollectorHost",
@@ -114,20 +137,27 @@ export interface WindowsIntegration {
   readRegistryValue(hive: RegistryHive, subkey: string, name: string, view: RegistryView): RegistryValue | null;
   /** Read-only. Value names directly under a key; `null` when the key does not exist. */
   readRegistryValueNames(hive: RegistryHive, subkey: string, view: RegistryView): readonly string[] | null;
+  /** The addon's compile-time target table (read-only; used by the TS<->C++ consistency test). */
+  listCollectorHostTargets(): readonly CollectorHostTargetInfo[];
   /**
-   * No arguments, read-only. Ownership of the fixed key, decided in ONE place (the addon):
-   * `absent` (no key, no default value, or an EMPTY default value, so a cleaner-damaged key is
-   * repairable), `ours` (REG_SZ equal to our manifest path, case-insensitive ordinal), or
-   * `foreign` (anything else, including other types, trailing-slash or `\\?\` variants, oversized
-   * values and registry link keys). No path normalisation is attempted.
+   * Read-only, one target id the addon's table contains (a target such as `vivaldi`, which is not
+   * in the table, is `invalid-argument`). Ownership of that target's key, decided in ONE place
+   * (the addon): `absent` (no key, no default value, or an EMPTY default value, so a
+   * cleaner-damaged key is repairable), `ours` (REG_SZ equal to our manifest path,
+   * case-insensitive ordinal), or `foreign` (anything else, including other types,
+   * trailing-slash or `\\?\` variants, oversized values and registry link keys). No path
+   * normalisation is attempted.
    */
-  inspectCollectorHostRegistration(): HostRegistrationOwnership;
-  /** No arguments. Writes the fixed HKCU key to the fixed manifest path. Never overwrites a foreign value. */
-  registerCollectorHost(): RegisterOutcome;
-  /** No arguments. Deletes the fixed key only when its default value is our manifest path. */
-  unregisterCollectorHost(): UnregisterOutcome;
-  /** No arguments. Same write as `registerCollectorHost`, replacing a foreign value (after user confirmation). */
-  replaceForeignCollectorHostRegistration(): RegisterOutcome;
+  inspectCollectorHostRegistration(target: CollectorRegistryTargetId): HostRegistrationOwnership;
+  /**
+   * One WRITABLE target id. Writes that target's compile-time HKCU key to the fixed manifest path.
+   * Never overwrites a foreign value. A read-only or unknown target is `invalid-argument`.
+   */
+  registerCollectorHost(target: CollectorRegistryTargetId): RegisterOutcome;
+  /** One WRITABLE target id. Deletes that key only when its default value is our manifest path. */
+  unregisterCollectorHost(target: CollectorRegistryTargetId): UnregisterOutcome;
+  /** One WRITABLE target id. Same write as `registerCollectorHost`, replacing a foreign value (after user confirmation). */
+  replaceForeignCollectorHostRegistration(target: CollectorRegistryTargetId): RegisterOutcome;
 }
 
 const MAX_SUBKEY_LENGTH = 1024;
@@ -187,6 +217,29 @@ const INSPECT_STATUSES = ["absent", "ours", "foreign", "access-denied", "failed"
 const REGISTER_STATUSES = ["ok", "foreign", "access-denied", "failed"] as const;
 const UNREGISTER_STATUSES = ["ok", "not-registered", "foreign", "access-denied", "failed"] as const;
 
+/**
+ * Validate the addon's table: every row is {id in the enumeration, subkey string, writable boolean},
+ * ids are unique, and a row the TS table says is read-only is not writable in the addon. A table
+ * that violates this means the addon is not the one this build expects.
+ */
+function parseTargetTable(raw: unknown): readonly CollectorHostTargetInfo[] {
+  const bad = (): never => fail("windows-integration-unavailable", "The Windows integration addon reported an unexpected target table.");
+  if (!Array.isArray(raw)) return bad();
+  const seen = new Set<string>();
+  const rows: CollectorHostTargetInfo[] = [];
+  for (const entry of raw as unknown[]) {
+    if (typeof entry !== "object" || entry === null) return bad();
+    const { id, subkey, writable } = entry as { readonly id?: unknown; readonly subkey?: unknown; readonly writable?: unknown };
+    if (typeof id !== "string" || !(COLLECTOR_REGISTRY_TARGET_IDS as readonly string[]).includes(id) || seen.has(id)) return bad();
+    if (typeof subkey !== "string" || subkey.length === 0 || typeof writable !== "boolean") return bad();
+    const known = COLLECTOR_REGISTRY_TARGETS.find((target) => target.id === id);
+    if (known === undefined || (writable && !known.writable)) return bad();
+    seen.add(id);
+    rows.push(Object.freeze({ id: id as CollectorRegistryTargetId, subkey, writable }));
+  }
+  return Object.freeze(rows);
+}
+
 /** Wrap a native module with argument validation and error mapping. */
 export function createWindowsIntegration(native: WindowsIntegrationNative): WindowsIntegration {
   const guarded = <T>(call: () => T): T => {
@@ -195,6 +248,22 @@ export function createWindowsIntegration(native: WindowsIntegrationNative): Wind
     } catch (error: unknown) {
       throw translateNativeError(error);
     }
+  };
+
+  if (native.apiVersion !== WINDOWS_INTEGRATION_API_VERSION) {
+    fail("windows-integration-unavailable", "The Windows integration addon has an unsupported apiVersion.", `apiVersion ${String(native.apiVersion)}, expected ${WINDOWS_INTEGRATION_API_VERSION}`);
+  }
+  const table = parseTargetTable(guarded(() => native.listCollectorHostTargets()));
+  const inspectable = new Set<string>(table.map((row) => row.id));
+  const writable = new Set<string>(table.filter((row) => row.writable).map((row) => row.id));
+
+  /** Exactly one argument, a table id; the writers also require a writable one. Nothing else reaches the addon. */
+  const checkedTarget = (args: ArrayLike<unknown>, name: string, allowed: ReadonlySet<string>): CollectorRegistryTargetId => {
+    const target = args[0];
+    if (args.length !== 1 || typeof target !== "string" || !(COLLECTOR_REGISTRY_TARGET_IDS as readonly string[]).includes(target) || !allowed.has(target)) {
+      fail("windows-integration-invalid-argument", `${name} takes exactly one ${allowed === writable ? "writable " : ""}target id.`);
+    }
+    return target as CollectorRegistryTargetId;
   };
 
   return Object.freeze({
@@ -235,29 +304,34 @@ export function createWindowsIntegration(native: WindowsIntegrationNative): Wind
       return Object.freeze([...(raw as string[])]);
     },
 
-    inspectCollectorHostRegistration(this: void): HostRegistrationOwnership {
-      if (arguments.length > 0) fail("windows-integration-invalid-argument", "inspectCollectorHostRegistration takes no arguments.");
-      const status = interpretStatus(guarded(() => native.inspectCollectorHostRegistration()), INSPECT_STATUSES, "inspect");
+    listCollectorHostTargets(this: void): readonly CollectorHostTargetInfo[] {
+      if (arguments.length > 0) fail("windows-integration-invalid-argument", "listCollectorHostTargets takes no arguments.");
+      return table;
+    },
+
+    // The four functions below validate `arguments` (exactly one table id) before calling the
+    // addon, so a caller cannot hand a path, key, value or hive to the registry layer.
+    inspectCollectorHostRegistration(this: void, _target: CollectorRegistryTargetId): HostRegistrationOwnership {
+      const target = checkedTarget(arguments, "inspectCollectorHostRegistration", inspectable);
+      const status = interpretStatus(guarded(() => native.inspectCollectorHostRegistration(target)), INSPECT_STATUSES, "inspect");
       if (status === "access-denied") fail("windows-integration-access-denied", "Windows denied access to the registry key.");
       if (status === "failed") fail("windows-integration-failed", "The registration key could not be inspected.");
       return status;
     },
 
-    // These three are declared without parameters and refuse any argument at runtime, so
-    // there is no way to hand a path, key or value to the writer (`arguments` is deliberate).
-    registerCollectorHost(this: void): RegisterOutcome {
-      if (arguments.length > 0) fail("windows-integration-invalid-argument", "registerCollectorHost takes no arguments.");
-      return interpretStatus(guarded(() => native.registerCollectorHost()), REGISTER_STATUSES, "register");
+    registerCollectorHost(this: void, _target: CollectorRegistryTargetId): RegisterOutcome {
+      const target = checkedTarget(arguments, "registerCollectorHost", writable);
+      return interpretStatus(guarded(() => native.registerCollectorHost(target)), REGISTER_STATUSES, "register");
     },
 
-    unregisterCollectorHost(this: void): UnregisterOutcome {
-      if (arguments.length > 0) fail("windows-integration-invalid-argument", "unregisterCollectorHost takes no arguments.");
-      return interpretStatus(guarded(() => native.unregisterCollectorHost()), UNREGISTER_STATUSES, "unregister");
+    unregisterCollectorHost(this: void, _target: CollectorRegistryTargetId): UnregisterOutcome {
+      const target = checkedTarget(arguments, "unregisterCollectorHost", writable);
+      return interpretStatus(guarded(() => native.unregisterCollectorHost(target)), UNREGISTER_STATUSES, "unregister");
     },
 
-    replaceForeignCollectorHostRegistration(this: void): RegisterOutcome {
-      if (arguments.length > 0) fail("windows-integration-invalid-argument", "replaceForeignCollectorHostRegistration takes no arguments.");
-      return interpretStatus(guarded(() => native.replaceForeignCollectorHostRegistration()), REGISTER_STATUSES, "replace");
+    replaceForeignCollectorHostRegistration(this: void, _target: CollectorRegistryTargetId): RegisterOutcome {
+      const target = checkedTarget(arguments, "replaceForeignCollectorHostRegistration", writable);
+      return interpretStatus(guarded(() => native.replaceForeignCollectorHostRegistration(target)), REGISTER_STATUSES, "replace");
     },
   });
 }

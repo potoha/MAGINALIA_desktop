@@ -6,17 +6,22 @@
  *
  * Security properties this file establishes:
  *
- * - The only registry WRITES in the whole binary are `RegSetValueExW` /
- *   `RegDeleteKeyExW` on one compile-time constant key under HKCU
- *   (`Software\Google\Chrome\NativeMessagingHosts\org.maginalia.collector`), with a value
+ * - apiVersion 2 (multi-browser design 3.2, option B). The only registry WRITES in the whole
+ *   binary are `RegCreateKeyExW` / `RegSetValueExW` / `RegDeleteKeyExW` on keys taken from the
+ *   compile-time table `kTargets` ({id, subkey, writable}), all under HKCU, with a value
  *   computed from `FOLDERID_UserProgramFiles` plus a constant suffix. There is no generic
  *   registry write or delete function and no exported function accepts a key, a value, a
  *   hive for writing, or a path for writing.
- * - `registerCollectorHost`, `unregisterCollectorHost` and
- *   `replaceForeignCollectorHostRegistration` read NO arguments (they never call
- *   `napi_get_cb_info`), so a caller cannot influence them.
- * - `inspectCollectorHostRegistration` (no arguments, read-only) is the single ownership
- *   verdict: absent | ours | foreign (see InspectExisting for the exact rules).
+ * - `inspectCollectorHostRegistration`, `registerCollectorHost`,
+ *   `replaceForeignCollectorHostRegistration` and `unregisterCollectorHost` take exactly ONE
+ *   argument: a target id string. It is compared ordinal-exactly with the `id` of each table
+ *   row and converted to a table index; a string that matches no row (or, for the three
+ *   writers, a row that is not writable) throws `invalid-argument`. The argument string itself
+ *   never reaches a registry API: only `kTargets[index].subkey` does.
+ * - `listCollectorHostTargets` (no arguments, read-only) returns the table, for the TS<->C++
+ *   consistency test. Vivaldi is deliberately not in the table until the spike decides (3.4).
+ * - `inspectCollectorHostRegistration` is the single ownership verdict per target:
+ *   absent | ours | foreign (see InspectExisting for the exact rules).
  * - `unregisterCollectorHost` deletes the key only when its default value is a REG_SZ
  *   equal to our manifest path (case-insensitive ordinal), otherwise it reports `foreign`.
  * - Nothing here reads environment variables, the working directory or argv.
@@ -24,9 +29,10 @@
  *   never expand REG_EXPAND_SZ, so no environment variable can influence a result.
  *
  * Test seam: when (and only when) compiled with MAGINALIA_WI_TEST_SEAM (the separate
- * `windows_integration_test` target, never staged or shipped), the constant key becomes a
- * mutable private subkey under `HKCU\Software\MAGINALIA-Tests\`, starts unset (every write
- * refuses until a test root is chosen), and a few test-only exports exist. The product
+ * `windows_integration_test` target, never staged or shipped), every target's key becomes a
+ * private subkey `<root>\<id>\NativeMessagingHosts\org.maginalia.collector` under
+ * `HKCU\Software\MAGINALIA-Tests\`, starts unset (every call refuses until a test root is
+ * chosen), and a few test-only exports exist. The product
  * target contains none of that code; a test checks its export table and strings.
  *
  * N-API only: ABI-stable across Node and Electron versions.
@@ -46,8 +52,23 @@
 
 namespace {
 
-constexpr wchar_t kHostKeyPath[] =
-    L"Software\\Google\\Chrome\\NativeMessagingHosts\\org.maginalia.collector";
+constexpr int kApiVersion = 2;
+
+// The compile-time target table (design 3.2). The ONLY source of registry keys that are written.
+struct Target {
+  const char* id;
+  const wchar_t* subkey;  // below HKCU, 64-bit view
+  bool writable;
+};
+
+constexpr Target kTargets[] = {
+    {"chrome", L"Software\\Google\\Chrome\\NativeMessagingHosts\\org.maginalia.collector", true},
+    {"edge", L"Software\\Microsoft\\Edge\\NativeMessagingHosts\\org.maginalia.collector", true},
+    // Read-only: Edge's second documented lookup location. Inspected, never written or deleted.
+    {"chromium", L"Software\\Chromium\\NativeMessagingHosts\\org.maginalia.collector", false},
+};
+constexpr size_t kTargetCount = sizeof kTargets / sizeof kTargets[0];
+
 constexpr wchar_t kProgramFolderName[] = L"MAGINALIA Collector";
 constexpr wchar_t kManifestFileName[] = L"org.maginalia.collector.json";
 
@@ -58,11 +79,15 @@ constexpr size_t kMaxSubkeyChars = 1024;
 #ifdef MAGINALIA_WI_TEST_SEAM
 constexpr wchar_t kTestRootPrefix[] = L"Software\\MAGINALIA-Tests\\";
 constexpr wchar_t kTestHostSuffix[] = L"\\NativeMessagingHosts\\org.maginalia.collector";
-std::wstring g_testHostKeyPath;  // empty until testSetRoot: every write refuses
-const wchar_t* HostKeyPath() { return g_testHostKeyPath.c_str(); }
-bool HostKeyConfigured() { return !g_testHostKeyPath.empty(); }
+std::wstring g_testRoot;  // empty until testSetRoot: every call refuses
+std::wstring HostKeyPath(size_t index) {
+  std::wstring id;
+  for (const char* c = kTargets[index].id; *c != '\0'; ++c) id.push_back(static_cast<wchar_t>(*c));
+  return g_testRoot + L"\\" + id + kTestHostSuffix;
+}
+bool HostKeyConfigured() { return !g_testRoot.empty(); }
 #else
-const wchar_t* HostKeyPath() { return kHostKeyPath; }
+std::wstring HostKeyPath(size_t index) { return std::wstring(kTargets[index].subkey); }
 bool HostKeyConfigured() { return true; }
 #endif
 
@@ -116,6 +141,32 @@ void SetProperty(napi_env env, napi_value object, const char* name, napi_value v
 }
 
 bool ContainsNul(const std::wstring& text) { return text.find(L'\0') != std::wstring::npos; }
+
+// ----- Target argument ---------------------------------------------------------------------
+
+// Converts the single argument into an index of `kTargets`. The string is compared ordinal-exact
+// with each row's `id`; it is never used for anything else. A writer additionally requires the
+// row to be writable. Throws `invalid-argument` (and returns false) otherwise.
+bool ParseTarget(napi_env env, napi_callback_info info, const char* function, bool requireWritable,
+                 size_t* index) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  std::string id;
+  if (argc == 1 && GetUtf8(env, argv[0], &id)) {
+    for (size_t i = 0; i < kTargetCount; ++i) {
+      if (id == std::string(kTargets[i].id)) {
+        if (requireWritable && !kTargets[i].writable) break;
+        *index = i;
+        return true;
+      }
+    }
+  }
+  ThrowError(env, "invalid-argument",
+             std::string(function) + (requireWritable ? " expects one writable target id."
+                                                       : " expects one target id."));
+  return false;
+}
 
 // ----- Known folders ---------------------------------------------------------------------
 
@@ -404,14 +455,14 @@ bool IsLinkKey(HKEY key) {
 }
 
 // The fixed key is opened with REG_OPTION_OPEN_LINK so a symbolic link is seen, not followed.
-LONG OpenFixedKeyReadOnly(HKEY* key) {
-  return RegOpenKeyExW(HKEY_CURRENT_USER, HostKeyPath(), REG_OPTION_OPEN_LINK,
+LONG OpenFixedKeyReadOnly(size_t target, HKEY* key) {
+  return RegOpenKeyExW(HKEY_CURRENT_USER, HostKeyPath(target).c_str(), REG_OPTION_OPEN_LINK,
                        KEY_QUERY_VALUE | KEY_WOW64_64KEY, key);
 }
 
-Existing InspectExisting(const std::wstring& ours, LONG* error) {
+Existing InspectExisting(size_t target, const std::wstring& ours, LONG* error) {
   HKEY key = nullptr;
-  const LONG opened = OpenFixedKeyReadOnly(&key);
+  const LONG opened = OpenFixedKeyReadOnly(target, &key);
   if (opened == ERROR_FILE_NOT_FOUND || opened == ERROR_PATH_NOT_FOUND) return Existing::kAbsent;
   if (opened != ERROR_SUCCESS) { *error = opened; return Existing::kError; }
   if (IsLinkKey(key)) { RegCloseKey(key); return Existing::kForeign; }
@@ -425,13 +476,15 @@ Existing InspectExisting(const std::wstring& ours, LONG* error) {
   return Existing::kForeign;
 }
 
-// Read-only, no arguments: the single ownership verdict for the fixed key.
-napi_value InspectCollectorHostRegistrationFn(napi_env env, napi_callback_info) {
+// Read-only: the single ownership verdict for one table target's key.
+napi_value InspectCollectorHostRegistrationFn(napi_env env, napi_callback_info info) {
+  size_t target = 0;
+  if (!ParseTarget(env, info, "inspectCollectorHostRegistration", false, &target)) return nullptr;
   if (!HostKeyConfigured()) return MakeResult(env, "failed", ERROR_NOT_READY);
   std::wstring manifest;
   if (!ComputeManifestPath(&manifest)) return MakeResult(env, "failed", ERROR_PATH_NOT_FOUND);
   LONG error = ERROR_SUCCESS;
-  switch (InspectExisting(manifest, &error)) {
+  switch (InspectExisting(target, manifest, &error)) {
     case Existing::kAbsent: return MakeResult(env, "absent", ERROR_SUCCESS);
     case Existing::kOurs: return MakeResult(env, "ours", ERROR_SUCCESS);
     case Existing::kForeign: return MakeResult(env, "foreign", ERROR_SUCCESS);
@@ -439,18 +492,18 @@ napi_value InspectCollectorHostRegistrationFn(napi_env env, napi_callback_info) 
   }
 }
 
-napi_value WriteRegistration(napi_env env, bool replaceForeign) {
+napi_value WriteRegistration(napi_env env, size_t target, bool replaceForeign) {
   if (!HostKeyConfigured()) return MakeResult(env, "failed", ERROR_NOT_READY);
   std::wstring manifest;
   if (!ComputeManifestPath(&manifest)) return MakeResult(env, "failed", ERROR_PATH_NOT_FOUND);
   LONG error = ERROR_SUCCESS;
-  const Existing existing = InspectExisting(manifest, &error);
+  const Existing existing = InspectExisting(target, manifest, &error);
   if (existing == Existing::kError) return MakeResult(env, StatusFor(error), error);
   // `register` never overwrites somebody else's registration; only the explicit
   // `replaceForeign` entry point (called after the user confirmed) does.
   if (existing == Existing::kForeign && !replaceForeign) return MakeResult(env, "foreign", ERROR_SUCCESS);
   HKEY key = nullptr;
-  error = RegCreateKeyExW(HKEY_CURRENT_USER, HostKeyPath(), 0, nullptr, REG_OPTION_NON_VOLATILE,
+  error = RegCreateKeyExW(HKEY_CURRENT_USER, HostKeyPath(target).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
                           KEY_SET_VALUE | KEY_WOW64_64KEY, nullptr, &key, nullptr);
   if (error != ERROR_SUCCESS) return MakeResult(env, StatusFor(error), error);
   error = RegSetValueExW(key, nullptr, 0, REG_SZ, reinterpret_cast<const BYTE*>(manifest.c_str()),
@@ -460,21 +513,26 @@ napi_value WriteRegistration(napi_env env, bool replaceForeign) {
   return MakeResult(env, "ok", ERROR_SUCCESS);
 }
 
-// No arguments are read: napi_get_cb_info is deliberately not called.
-napi_value RegisterCollectorHostFn(napi_env env, napi_callback_info) {
-  return WriteRegistration(env, false);
+napi_value RegisterCollectorHostFn(napi_env env, napi_callback_info info) {
+  size_t target = 0;
+  if (!ParseTarget(env, info, "registerCollectorHost", true, &target)) return nullptr;
+  return WriteRegistration(env, target, false);
 }
 
-napi_value ReplaceForeignCollectorHostRegistrationFn(napi_env env, napi_callback_info) {
-  return WriteRegistration(env, true);
+napi_value ReplaceForeignCollectorHostRegistrationFn(napi_env env, napi_callback_info info) {
+  size_t target = 0;
+  if (!ParseTarget(env, info, "replaceForeignCollectorHostRegistration", true, &target)) return nullptr;
+  return WriteRegistration(env, target, true);
 }
 
-napi_value UnregisterCollectorHostFn(napi_env env, napi_callback_info) {
+napi_value UnregisterCollectorHostFn(napi_env env, napi_callback_info info) {
+  size_t target = 0;
+  if (!ParseTarget(env, info, "unregisterCollectorHost", true, &target)) return nullptr;
   if (!HostKeyConfigured()) return MakeResult(env, "failed", ERROR_NOT_READY);
   std::wstring manifest;
   if (!ComputeManifestPath(&manifest)) return MakeResult(env, "failed", ERROR_PATH_NOT_FOUND);
   LONG error = ERROR_SUCCESS;
-  const Existing existing = InspectExisting(manifest, &error);
+  const Existing existing = InspectExisting(target, manifest, &error);
   if (existing == Existing::kError) return MakeResult(env, StatusFor(error), error);
   if (existing == Existing::kAbsent) return MakeResult(env, "not-registered", ERROR_SUCCESS);
   if (existing == Existing::kForeign) return MakeResult(env, "foreign", ERROR_SUCCESS);
@@ -483,7 +541,7 @@ napi_value UnregisterCollectorHostFn(napi_env env, napi_callback_info) {
   // values under the key are deleted together with it (the key is ours, by value match).
   {
     HKEY key = nullptr;
-    error = OpenFixedKeyReadOnly(&key);
+    error = OpenFixedKeyReadOnly(target, &key);
     if (error != ERROR_SUCCESS) return MakeResult(env, StatusFor(error), error);
     DWORD subkeys = 0;
     error = RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, &subkeys, nullptr, nullptr, nullptr,
@@ -492,10 +550,27 @@ napi_value UnregisterCollectorHostFn(napi_env env, napi_callback_info) {
     if (error != ERROR_SUCCESS) return MakeResult(env, StatusFor(error), error);
     if (subkeys > 0) return MakeResult(env, "failed", ERROR_DIR_NOT_EMPTY);
   }
-  error = RegDeleteKeyExW(HKEY_CURRENT_USER, HostKeyPath(), KEY_WOW64_64KEY, 0);
+  error = RegDeleteKeyExW(HKEY_CURRENT_USER, HostKeyPath(target).c_str(), KEY_WOW64_64KEY, 0);
   if (error == ERROR_FILE_NOT_FOUND) return MakeResult(env, "not-registered", ERROR_SUCCESS);
   if (error != ERROR_SUCCESS) return MakeResult(env, StatusFor(error), error);
   return MakeResult(env, "ok", ERROR_SUCCESS);
+}
+
+// Read-only, no arguments: the compile-time table as [{id, subkey, writable}] (consistency test).
+napi_value ListCollectorHostTargetsFn(napi_env env, napi_callback_info) {
+  napi_value array = nullptr;
+  napi_create_array_with_length(env, kTargetCount, &array);
+  for (size_t i = 0; i < kTargetCount; ++i) {
+    napi_value entry = nullptr;
+    napi_create_object(env, &entry);
+    SetProperty(env, entry, "id", MakeAscii(env, kTargets[i].id));
+    SetProperty(env, entry, "subkey", MakeString(env, kTargets[i].subkey));
+    napi_value writable = nullptr;
+    napi_get_boolean(env, kTargets[i].writable, &writable);
+    SetProperty(env, entry, "writable", writable);
+    napi_set_element(env, array, static_cast<uint32_t>(i), entry);
+  }
+  return array;
 }
 
 #ifdef MAGINALIA_WI_TEST_SEAM
@@ -518,24 +593,36 @@ napi_value TestSetRootFn(napi_env env, napi_callback_info info) {
     ThrowError(env, "invalid-argument", "testSetRoot requires a subkey under Software\\MAGINALIA-Tests\\.");
     return nullptr;
   }
-  g_testHostKeyPath = root + kTestHostSuffix;
-  return MakeString(env, g_testHostKeyPath);
+  g_testRoot = root;
+  // Returns the chrome target's private key path (the other targets differ only in the id segment).
+  return MakeString(env, HostKeyPath(0));
 }
 
-// Seeds the default value of the private test key: (kind, text). kind is one of
+// Resolves a test-seam target id (any table row, including read-only ones) to a table index.
+bool TestTargetIndex(const std::string& id, size_t* index) {
+  for (size_t i = 0; i < kTargetCount; ++i) {
+    if (id == std::string(kTargets[i].id)) { *index = i; return true; }
+  }
+  return false;
+}
+
+// Seeds the default value of one target's private test key: (target, kind, text). kind is one of
 // "sz" | "expand-sz" | "dword" | "binary" | "empty-sz" | "no-default" (key only, no default value).
 napi_value TestSeedValueFn(napi_env env, napi_callback_info info) {
-  size_t argc = 3;
-  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  std::string target;
   std::string kind;
   std::wstring value;
-  if (!HostKeyConfigured() || argc != 2 || !GetUtf8(env, argv[0], &kind) || !GetString(env, argv[1], &value)) {
-    ThrowError(env, "invalid-argument", "testSeedValue requires testSetRoot first and (kind, text).");
+  size_t index = 0;
+  if (!HostKeyConfigured() || argc != 3 || !GetUtf8(env, argv[0], &target) || !TestTargetIndex(target, &index)
+      || !GetUtf8(env, argv[1], &kind) || !GetString(env, argv[2], &value)) {
+    ThrowError(env, "invalid-argument", "testSeedValue requires testSetRoot first and (target, kind, text).");
     return nullptr;
   }
   HKEY key = nullptr;
-  LONG error = RegCreateKeyExW(HKEY_CURRENT_USER, HostKeyPath(), 0, nullptr, REG_OPTION_NON_VOLATILE,
+  LONG error = RegCreateKeyExW(HKEY_CURRENT_USER, HostKeyPath(index).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
                                KEY_SET_VALUE | KEY_WOW64_64KEY, nullptr, &key, nullptr);
   if (error == ERROR_SUCCESS) {
     if (kind == "sz" || kind == "expand-sz") {
@@ -560,9 +647,17 @@ napi_value TestSeedValueFn(napi_env env, napi_callback_info info) {
 }
 
 // Adds a child subkey under the private test key (to test the has-subkeys unregister path).
-napi_value TestSeedSubkeyFn(napi_env env, napi_callback_info) {
-  if (!HostKeyConfigured()) return MakeResult(env, "failed", ERROR_NOT_READY);
-  const std::wstring child = std::wstring(HostKeyPath()) + L"\\child";
+napi_value TestSeedSubkeyFn(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  std::string target;
+  size_t index = 0;
+  if (!HostKeyConfigured() || argc != 1 || !GetUtf8(env, argv[0], &target) || !TestTargetIndex(target, &index)) {
+    ThrowError(env, "invalid-argument", "testSeedSubkey requires testSetRoot first and (target).");
+    return nullptr;
+  }
+  const std::wstring child = HostKeyPath(index) + L"\\child";
   HKEY key = nullptr;
   const LONG error = RegCreateKeyExW(HKEY_CURRENT_USER, child.c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
                                      KEY_SET_VALUE | KEY_WOW64_64KEY, nullptr, &key, nullptr);
@@ -573,11 +668,10 @@ napi_value TestSeedSubkeyFn(napi_env env, napi_callback_info) {
 // Deletes the whole private test tree (root chosen by testSetRoot).
 napi_value TestCleanupFn(napi_env env, napi_callback_info) {
   if (!HostKeyConfigured()) return MakeResult(env, "ok", ERROR_SUCCESS);
-  const std::wstring suffix = kTestHostSuffix;
-  const std::wstring root = g_testHostKeyPath.substr(0, g_testHostKeyPath.size() - suffix.size());
+  const std::wstring root = g_testRoot;
   if (!TestRootAllowed(root)) return MakeResult(env, "failed", ERROR_INVALID_PARAMETER);
   const LONG error = RegDeleteTreeW(HKEY_CURRENT_USER, root.c_str());
-  g_testHostKeyPath.clear();
+  g_testRoot.clear();
   // Remove the shared test parent too when it is now empty (fails harmlessly otherwise).
   RegDeleteKeyExW(HKEY_CURRENT_USER, L"Software\\MAGINALIA-Tests", KEY_WOW64_64KEY, 0);
   return MakeResult(env, error == ERROR_SUCCESS || error == ERROR_FILE_NOT_FOUND ? "ok" : "failed", error);
@@ -590,6 +684,7 @@ napi_value Init(napi_env env, napi_value exports) {
       {"readRegistryValue", nullptr, ReadRegistryValueFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"readRegistryValueNames", nullptr, ReadRegistryValueNamesFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"inspectCollectorHostRegistration", nullptr, InspectCollectorHostRegistrationFn, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"listCollectorHostTargets", nullptr, ListCollectorHostTargetsFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"registerCollectorHost", nullptr, RegisterCollectorHostFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"unregisterCollectorHost", nullptr, UnregisterCollectorHostFn, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"replaceForeignCollectorHostRegistration", nullptr, ReplaceForeignCollectorHostRegistrationFn, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -605,7 +700,7 @@ napi_value Init(napi_env env, napi_value exports) {
     return nullptr;
   }
   napi_value version = nullptr;
-  napi_create_int32(env, 1, &version);
+  napi_create_int32(env, kApiVersion, &version);
   napi_set_named_property(env, exports, "apiVersion", version);
   return exports;
 }

@@ -6,12 +6,16 @@
  * is backed by the addon wrapper in `windows-integration.ts`. Tests inject an in-memory
  * fake (`collector-registry-adapter.test-helper.ts`) so no unit or integration test ever
  * writes to the real HKCU. The adapter exposes no generic registry write: the three
- * mutating methods take no arguments and act on the fixed host key only (design 3.3).
+ * mutating methods take exactly one writable target id (`chrome` | `edge`, validated by the
+ * wrapper and again by the addon's compile-time table) and act on that target's fixed host
+ * key only (multi-browser design 3.2).
  *
  * This module returns raw facts. Interpreting them (policy-blocked, foreign-registration,
  * Chrome candidate validation, ...) belongs to the state machine, not here.
  */
+import type { CollectorRegistryTargetId } from "./collector-browser-table.js";
 import {
+  WindowsIntegrationError,
   loadWindowsIntegration,
   type HostRegistrationOwnership,
   type KnownFolderId,
@@ -53,38 +57,74 @@ export interface ChromeAppPathValue {
   readonly value: string;
 }
 
+/**
+ * Policy root below `SOFTWARE\Policies\` for a browser row (design 1.2 `policyRoot`). A fixed
+ * enumeration: only these two are ever read, and a caller cannot pass a path.
+ */
+export const BROWSER_POLICY_ROOTS = ["Google\\Chrome", "Microsoft\\Edge"] as const;
+export type BrowserPolicyRoot = (typeof BROWSER_POLICY_ROOTS)[number];
+/** Same shape for every policy root. */
+export type BrowserPolicySnapshot = ChromePolicySnapshot;
+export type BrowserAppPathValue = ChromeAppPathValue;
+
 export interface CollectorRegistryAdapter {
   /** `SHGetKnownFolderPath` for the fixed folder set; a local-drive absolute path. */
   getKnownFolderPath(id: KnownFolderId): string;
-  /** Ownership of `HKCU\Software\Google\Chrome\NativeMessagingHosts\org.maginalia.collector`. */
-  readCollectorHostRegistration(): CollectorHostRegistration;
-  /** No arguments; fixed key and value. Never overwrites a foreign registration. */
-  registerCollectorHost(): RegisterOutcome;
-  /** No arguments; value-matched delete of the fixed key. */
-  unregisterCollectorHost(): UnregisterOutcome;
-  /** No arguments; same write as `registerCollectorHost`, after the user confirmed replacing a foreign value. */
-  replaceForeignCollectorHostRegistration(): RegisterOutcome;
-  /** Chrome policy facts from HKCU and HKLM (design 8.4). Read-only. */
-  readChromePolicies(): ChromePolicySnapshot;
-  /** `App Paths\chrome.exe` default values: HKCU, then HKLM 64-bit view, then HKLM 32-bit view (design 4.2). */
-  readChromeAppPaths(): readonly ChromeAppPathValue[];
-  /** `ProgId` of the default `https` handler, or `null` (design 4.2). */
+  /**
+   * Ownership of one target's `HKCU\...\NativeMessagingHosts\org.maginalia.collector` key
+   * (`chrome`, `edge`, `chromium`; `vivaldi` is not in the addon's table yet and is
+   * `invalid-argument`). Decided in the addon, not here.
+   */
+  readCollectorHostRegistration(target: CollectorRegistryTargetId): CollectorHostRegistration;
+  /** One writable target (`chrome` | `edge`); fixed key and value. Never overwrites a foreign registration. */
+  registerCollectorHost(target: CollectorRegistryTargetId): RegisterOutcome;
+  /** One writable target; value-matched delete of that target's fixed key. */
+  unregisterCollectorHost(target: CollectorRegistryTargetId): UnregisterOutcome;
+  /** One writable target; same write as `registerCollectorHost`, after the user confirmed replacing a foreign value. */
+  replaceForeignCollectorHostRegistration(target: CollectorRegistryTargetId): RegisterOutcome;
+  /** Policy facts for one policy root from HKCU and HKLM (design 8.4). Read-only. `root` is one of `BROWSER_POLICY_ROOTS`. */
+  readBrowserPolicies(root: BrowserPolicyRoot): BrowserPolicySnapshot;
+  /**
+   * `App Paths\<appPathsName>` default values: HKCU, then HKLM 64-bit view, then HKLM 32-bit view
+   * (design 1.5). `appPathsName` is a bare `*.exe` file name (no separators). Read-only.
+   */
+  readBrowserAppPaths(appPathsName: string): readonly BrowserAppPathValue[];
+  /**
+   * `ProgId` of the default `https` handler: `UserChoiceLatest` first, then `UserChoice`
+   * (design 2.1), or `null`.
+   */
   readDefaultBrowserProgId(): string | null;
+  /**
+   * The raw `shell\open\command` default value of a ProgId (HKCU `Software\Classes` first, then
+   * HKLM), never expanded and never executed; only used to pick between installed candidates
+   * (design 11.1). A ProgId with characters outside `[A-Za-z0-9._-]` yields `null`.
+   */
+  readProgIdOpenCommand(progId: string): string | null;
+  /** @deprecated Use `readBrowserPolicies("Google\\Chrome")`; kept for WP-5a until S3. */
+  readChromePolicies(): ChromePolicySnapshot;
+  /** @deprecated Use `readBrowserAppPaths("chrome.exe")`; kept for WP-5a until S3. */
+  readChromeAppPaths(): readonly ChromeAppPathValue[];
 }
 
-const CHROME_POLICY_SUBKEY = "SOFTWARE\\Policies\\Google\\Chrome";
-const APP_PATHS_CHROME_SUBKEY = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe";
-const HKCU_APP_PATHS_CHROME_SUBKEY = "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe";
-const HTTPS_USER_CHOICE_SUBKEY = "Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\UserChoice";
+const POLICY_SUBKEY_PREFIX = "SOFTWARE\\Policies\\";
+const APP_PATHS_HKLM_PREFIX = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\";
+const APP_PATHS_HKCU_PREFIX = "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\";
+const HTTPS_ASSOCIATION_SUBKEY = "Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\";
+const APP_PATHS_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.exe$/u;
+const PROG_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/u;
 
-function readDword(integration: WindowsIntegration, hive: RegistryHive, name: string): number | null {
-  const value = integration.readRegistryValue(hive, CHROME_POLICY_SUBKEY, name, "64");
+function adapterArgumentError(message: string): never {
+  throw new WindowsIntegrationError("windows-integration-invalid-argument", message);
+}
+
+function readDword(integration: WindowsIntegration, hive: RegistryHive, policySubkey: string, name: string): number | null {
+  const value = integration.readRegistryValue(hive, policySubkey, name, "64");
   return value !== null && value.type === "dword" ? value.value : null;
 }
 
 /** List policies are stored as values named "1", "2", ... under a subkey named after the policy. */
-function readList(integration: WindowsIntegration, hive: RegistryHive, policy: string): readonly string[] | null {
-  const subkey = `${CHROME_POLICY_SUBKEY}\\${policy}`;
+function readList(integration: WindowsIntegration, hive: RegistryHive, policySubkey: string, policy: string): readonly string[] | null {
+  const subkey = `${policySubkey}\\${policy}`;
   const names = integration.readRegistryValueNames(hive, subkey, "64");
   if (names === null) return null;
   const ordered = [...names].sort((left, right) => {
@@ -100,16 +140,66 @@ function readList(integration: WindowsIntegration, hive: RegistryHive, policy: s
   return Object.freeze(entries);
 }
 
-function readHiveFacts(integration: WindowsIntegration, hive: RegistryHive): ChromePolicyHiveFacts {
+function readHiveFacts(integration: WindowsIntegration, hive: RegistryHive, root: BrowserPolicyRoot): ChromePolicyHiveFacts {
+  const subkey = `${POLICY_SUBKEY_PREFIX}${root}`;
   return Object.freeze({
     hive,
-    nativeMessagingUserLevelHosts: readDword(integration, hive, "NativeMessagingUserLevelHosts"),
-    nativeMessagingBlocklist: readList(integration, hive, "NativeMessagingBlocklist"),
-    nativeMessagingAllowlist: readList(integration, hive, "NativeMessagingAllowlist"),
-    developerToolsAvailability: readDword(integration, hive, "DeveloperToolsAvailability"),
-    extensionInstallBlocklist: readList(integration, hive, "ExtensionInstallBlocklist"),
-    extensionInstallAllowlist: readList(integration, hive, "ExtensionInstallAllowlist"),
+    nativeMessagingUserLevelHosts: readDword(integration, hive, subkey, "NativeMessagingUserLevelHosts"),
+    nativeMessagingBlocklist: readList(integration, hive, subkey, "NativeMessagingBlocklist"),
+    nativeMessagingAllowlist: readList(integration, hive, subkey, "NativeMessagingAllowlist"),
+    developerToolsAvailability: readDword(integration, hive, subkey, "DeveloperToolsAvailability"),
+    extensionInstallBlocklist: readList(integration, hive, subkey, "ExtensionInstallBlocklist"),
+    extensionInstallAllowlist: readList(integration, hive, subkey, "ExtensionInstallAllowlist"),
   });
+}
+
+function readPolicies(integration: WindowsIntegration, root: unknown): BrowserPolicySnapshot {
+  if (typeof root !== "string" || !(BROWSER_POLICY_ROOTS as readonly string[]).includes(root)) {
+    adapterArgumentError("Invalid browser policy root.");
+  }
+  const checked = root as BrowserPolicyRoot;
+  return Object.freeze({ hkcu: readHiveFacts(integration, "HKCU", checked), hklm: readHiveFacts(integration, "HKLM", checked) });
+}
+
+function readAppPaths(integration: WindowsIntegration, name: unknown): readonly BrowserAppPathValue[] {
+  if (typeof name !== "string" || !APP_PATHS_NAME_PATTERN.test(name)) adapterArgumentError("Invalid App Paths name.");
+  const checked = name as string;
+  const found: BrowserAppPathValue[] = [];
+  const probes: ReadonlyArray<{ source: BrowserAppPathValue["source"]; hive: RegistryHive; subkey: string; view: "64" | "32" }> = [
+    { source: "hkcu", hive: "HKCU", subkey: `${APP_PATHS_HKCU_PREFIX}${checked}`, view: "64" },
+    { source: "hklm-64", hive: "HKLM", subkey: `${APP_PATHS_HKLM_PREFIX}${checked}`, view: "64" },
+    { source: "hklm-32", hive: "HKLM", subkey: `${APP_PATHS_HKLM_PREFIX}${checked}`, view: "32" },
+  ];
+  for (const probe of probes) {
+    const value = integration.readRegistryValue(probe.hive, probe.subkey, "", probe.view);
+    if (value !== null && (value.type === "sz" || value.type === "expand-sz") && value.value.length > 0) {
+      found.push(Object.freeze({ source: probe.source, value: value.value }));
+    }
+  }
+  return Object.freeze(found);
+}
+
+function readHttpsProgId(integration: WindowsIntegration): string | null {
+  // `UserChoiceLatest` (newer Windows 11 builds) is read first, then `UserChoice` (design 2.1).
+  for (const leaf of ["UserChoiceLatest", "UserChoice"]) {
+    const value = integration.readRegistryValue("HKCU", `${HTTPS_ASSOCIATION_SUBKEY}${leaf}`, "ProgId", "default");
+    if (value !== null && value.type === "sz" && value.value.length > 0) return value.value;
+  }
+  return null;
+}
+
+function readOpenCommand(integration: WindowsIntegration, progId: unknown): string | null {
+  // The ProgId comes from the registry (untrusted): anything that is not a plain name is "no command".
+  if (typeof progId !== "string" || !PROG_ID_PATTERN.test(progId)) return null;
+  const probes: ReadonlyArray<{ hive: RegistryHive; subkey: string }> = [
+    { hive: "HKCU", subkey: `Software\\Classes\\${progId}\\shell\\open\\command` },
+    { hive: "HKLM", subkey: `SOFTWARE\\Classes\\${progId}\\shell\\open\\command` },
+  ];
+  for (const probe of probes) {
+    const value = integration.readRegistryValue(probe.hive, probe.subkey, "", "64");
+    if (value !== null && (value.type === "sz" || value.type === "expand-sz") && value.value.length > 0) return value.value;
+  }
+  return null;
 }
 
 /** Production adapter over the native addon. Takes no parameters: nothing can redirect it. */
@@ -125,35 +215,20 @@ export function createCollectorRegistryAdapterOver(integration: WindowsIntegrati
   return Object.freeze({
     getKnownFolderPath: (id: KnownFolderId) => integration.getKnownFolderPath(id),
 
-    readCollectorHostRegistration: () => integration.inspectCollectorHostRegistration(),
+    // Target validation (enumeration, writable subset) is done by the wrapper, once.
+    readCollectorHostRegistration: (target: CollectorRegistryTargetId) => integration.inspectCollectorHostRegistration(target),
 
-    registerCollectorHost: () => integration.registerCollectorHost(),
-    unregisterCollectorHost: () => integration.unregisterCollectorHost(),
-    replaceForeignCollectorHostRegistration: () => integration.replaceForeignCollectorHostRegistration(),
+    registerCollectorHost: (target: CollectorRegistryTargetId) => integration.registerCollectorHost(target),
+    unregisterCollectorHost: (target: CollectorRegistryTargetId) => integration.unregisterCollectorHost(target),
+    replaceForeignCollectorHostRegistration: (target: CollectorRegistryTargetId) =>
+      integration.replaceForeignCollectorHostRegistration(target),
 
-    readChromePolicies(): ChromePolicySnapshot {
-      return Object.freeze({ hkcu: readHiveFacts(integration, "HKCU"), hklm: readHiveFacts(integration, "HKLM") });
-    },
+    readBrowserPolicies: (root: BrowserPolicyRoot): BrowserPolicySnapshot => readPolicies(integration, root),
+    readBrowserAppPaths: (appPathsName: string): readonly BrowserAppPathValue[] => readAppPaths(integration, appPathsName),
+    readDefaultBrowserProgId: (): string | null => readHttpsProgId(integration),
+    readProgIdOpenCommand: (progId: string): string | null => readOpenCommand(integration, progId),
 
-    readChromeAppPaths(): readonly ChromeAppPathValue[] {
-      const found: ChromeAppPathValue[] = [];
-      const probes: ReadonlyArray<{ source: ChromeAppPathValue["source"]; hive: RegistryHive; subkey: string; view: "64" | "32" }> = [
-        { source: "hkcu", hive: "HKCU", subkey: HKCU_APP_PATHS_CHROME_SUBKEY, view: "64" },
-        { source: "hklm-64", hive: "HKLM", subkey: APP_PATHS_CHROME_SUBKEY, view: "64" },
-        { source: "hklm-32", hive: "HKLM", subkey: APP_PATHS_CHROME_SUBKEY, view: "32" },
-      ];
-      for (const probe of probes) {
-        const value = integration.readRegistryValue(probe.hive, probe.subkey, "", probe.view);
-        if (value !== null && (value.type === "sz" || value.type === "expand-sz") && value.value.length > 0) {
-          found.push(Object.freeze({ source: probe.source, value: value.value }));
-        }
-      }
-      return Object.freeze(found);
-    },
-
-    readDefaultBrowserProgId(): string | null {
-      const value = integration.readRegistryValue("HKCU", HTTPS_USER_CHOICE_SUBKEY, "ProgId", "default");
-      return value !== null && value.type === "sz" && value.value.length > 0 ? value.value : null;
-    },
+    readChromePolicies: (): ChromePolicySnapshot => readPolicies(integration, "Google\\Chrome"),
+    readChromeAppPaths: (): readonly ChromeAppPathValue[] => readAppPaths(integration, "chrome.exe"),
   });
 }

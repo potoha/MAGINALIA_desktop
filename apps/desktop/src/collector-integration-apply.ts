@@ -334,7 +334,7 @@ async function guard(context: Context, expectedRegistration: HostRegistrationOwn
   }
   let registration: HostRegistrationOwnership;
   try {
-    registration = deps.registry.readCollectorHostRegistration();
+    registration = deps.registry.readCollectorHostRegistration("chrome");
   } catch {
     throw new Abort("inspection-incomplete");
   }
@@ -713,7 +713,7 @@ function writeRegistration(context: Context, initial: HostRegistrationOwnership)
   if (initial === "ours") return "ok";
   let outcome;
   try {
-    outcome = initial === "foreign" ? registry.replaceForeignCollectorHostRegistration() : registry.registerCollectorHost();
+    outcome = initial === "foreign" ? registry.replaceForeignCollectorHostRegistration("chrome") : registry.registerCollectorHost("chrome");
   } catch {
     return "registry-write-failed";
   }
@@ -725,7 +725,7 @@ function writeRegistration(context: Context, initial: HostRegistrationOwnership)
 function readBackRegistration(context: Context): void {
   let verdict: HostRegistrationOwnership;
   try {
-    verdict = context.deps.registry.readCollectorHostRegistration();
+    verdict = context.deps.registry.readCollectorHostRegistration("chrome");
   } catch {
     throw new Abort("registry-readback-mismatch");
   }
@@ -1062,7 +1062,7 @@ async function remove(
     const folder = await fileSystem.stat(paths.programFolder);
     let registration: HostRegistrationOwnership;
     try {
-      registration = deps.registry.readCollectorHostRegistration();
+      registration = deps.registry.readCollectorHostRegistration("chrome");
     } catch {
       return result(deps, "remove", "refused", "inspection-incomplete", [], "skipped", first);
     }
@@ -1076,7 +1076,7 @@ async function remove(
     } else if (registration === "ours") {
       let outcome;
       try {
-        outcome = deps.registry.unregisterCollectorHost();
+        outcome = deps.registry.unregisterCollectorHost("chrome");
       } catch {
         return result(deps, "remove", "failed", "unregister-failed", context.warnings, "skipped");
       }
