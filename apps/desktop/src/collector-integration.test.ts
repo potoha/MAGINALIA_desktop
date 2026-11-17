@@ -4,8 +4,8 @@ import os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { classifyDefaultBrowser } from "./collector-browser-table";
 import {
-  classifyDefaultBrowser,
   evaluateChromePolicies,
   expectedHostManifest,
   inspectCollectorIntegration,
@@ -445,7 +445,11 @@ describe("Chrome policy detection (design 8.4)", () => {
 
   it("an unreadable policy snapshot is reported and never blocks", async () => {
     const fixture = createIntegrationFixture();
-    fixture.registry.failNext.readChromePolicies = new Error("denied");
+    const original = fixture.registry.readBrowserPolicies.bind(fixture.registry);
+    fixture.registry.readBrowserPolicies = (root) => {
+      if (root === "Google\\Chrome") throw new Error("denied");
+      return original(root);
+    };
     const result = await inspect(fixture);
     expect(result.state).toBe("ready");
     expect(result.policy).toMatchObject({ status: "unavailable", blocked: false });
@@ -524,7 +528,7 @@ describe("Chrome locator (design 4.2)", () => {
   it("is not-found when there is no candidate at all, and unknown when the registry read fails", async () => {
     const fixture = setup();
     expect((await locateChromeExecutable(fixture.dependencies)).status).toBe("not-found");
-    fixture.registry.failNext.readChromeAppPaths = new Error("denied");
+    fixture.registry.failNext.readBrowserAppPaths = new Error("denied");
     expect(await locateChromeExecutable(fixture.dependencies)).toEqual({ status: "unknown" });
   });
 
@@ -553,8 +557,8 @@ describe("Chrome locator (design 4.2)", () => {
   });
 
   const progIds: ReadonlyArray<readonly [string | null, string]> = [
-    [null, "unknown"], ["ChromeHTML", "chrome"], ["ChromeHTML.ABC123", "chrome"], ["MSEdgeHTM", "edge"], ["MSEdgeHTM.x", "edge"],
-    ["BraveHTML", "other-chromium"], ["VivaldiHTM", "other-chromium"], ["OperaStable", "other-chromium"],
+    [null, "unknown"], ["ChromeHTML", "chrome"], ["ChromeHTML.ABC123", "chrome"], ["MSEdgeHTM", "edge"], ["MSEdgeHTM.x", "other"], ["MSEdgeBHTML", "other-chromium"],
+    ["BraveHTML", "other-chromium"], ["VivaldiHTM", "vivaldi"], ["VivaldiHTM.ABC", "vivaldi"], ["OperaStable", "other-chromium"],
     ["FirefoxURL-308046B0AF4A39CB", "other"], ["SafariHTML", "other"], ["ChromeHTMLevil", "other"],
   ];
   for (const [progId, kind] of progIds) {
@@ -749,7 +753,7 @@ describe("fail-closed inspection and privacy of the result", () => {
 describe("no-write guarantee", () => {
   it("only read methods are called, across every state", async () => {
     const mutatingRegistryCalls = ["registerCollectorHost", "unregisterCollectorHost", "replaceForeignCollectorHostRegistration"];
-    const readOnlyRegistry = new Set(["getKnownFolderPath", "readCollectorHostRegistration", "readChromePolicies", "readChromeAppPaths", "readDefaultBrowserProgId"]);
+    const readOnlyRegistry = new Set(["getKnownFolderPath", "readCollectorHostRegistration", "readBrowserPolicies", "readBrowserAppPaths", "readDefaultBrowserProgId", "readProgIdOpenCommand"]);
     const arrangements: Array<(f: IntegrationFixture) => void> = [
       () => {},
       (f) => { f.registry.registration = "absent"; },

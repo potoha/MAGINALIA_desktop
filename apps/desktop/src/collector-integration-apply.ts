@@ -327,7 +327,7 @@ async function guard(context: Context, expectedRegistration: HostRegistrationOwn
   const { deps, paths } = context;
   if (deps.e2eIsolationActive) throw new Abort("e2e-isolation");
   try {
-    if (evaluateChromePolicies(deps.registry.readChromePolicies()).blocked) throw new Abort("policy-blocked");
+    if (evaluateChromePolicies(deps.registry.readBrowserPolicies("Google\\Chrome")).blocked) throw new Abort("policy-blocked");
   } catch (error: unknown) {
     if (error instanceof Abort) throw error;
     // Unreadable policies never block by themselves (design 8.4: Chrome is the authority).

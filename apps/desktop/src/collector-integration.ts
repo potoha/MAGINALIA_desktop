@@ -27,7 +27,21 @@
  */
 import * as path from "node:path";
 import { COLLECTOR_HOST_NAME, COLLECTOR_MANIFEST_FILE_NAME, COLLECTOR_PROGRAM_FOLDER_NAME, type HostRegistrationOwnership } from "./windows-integration.js";
-import type { ChromeAppPathValue, ChromePolicyHiveFacts, ChromePolicySnapshot, CollectorRegistryAdapter } from "./collector-registry-adapter.js";
+import type { BrowserAppPathValue, ChromePolicyHiveFacts, ChromePolicySnapshot, CollectorRegistryAdapter } from "./collector-registry-adapter.js";
+import {
+  COLLECTOR_BROWSERS,
+  COLLECTOR_REGISTRY_TARGETS,
+  COLLECTOR_REGISTRY_TARGET_IDS,
+  classifyDefaultBrowser,
+  effectiveRegistration,
+  recommendCollectorBrowser,
+  type CollectorBrowserId,
+  type CollectorBrowserInstalled,
+  type CollectorBrowserSpec,
+  type CollectorKnownFolder,
+  type CollectorRegistryTargetId,
+  type CollectorTargetOwnership,
+} from "./collector-browser-table.js";
 import {
   inspectAndEvaluatePathSecurity,
   type PathSecurityInspector,
@@ -45,12 +59,14 @@ import {
 } from "./collector-payload.js";
 import { compareCollectorVersions, parseCollectorVersion, type VersionComparison } from "./collector-version.js";
 import type {
+  BrowserExecutableSource,
+  BrowserLocation,
+  BrowserRejectedCandidate,
   ChromeCandidateRejection,
   ChromeDetection,
   ChromeLocation,
   ChromePolicyEvaluation,
-  ChromeRejectedCandidate,
-  ChromeSource,
+  CollectorBrowserStatus,
   CollectorContactInvalidReason,
   CollectorContactRecord,
   CollectorContactStatus,
@@ -89,6 +105,8 @@ export interface CollectorIntegrationInspectDependencies {
    * reads no environment). Inspection works unchanged; only `writesAllowed` reflects it.
    */
   readonly e2eIsolationActive: boolean;
+  /** The browser table the inspection reads. Defaults to the product table; tests inject variants (for example with Edge verified). */
+  readonly browserTable?: readonly CollectorBrowserSpec[];
 }
 
 // ----- Paths --------------------------------------------------------------------------------
@@ -166,30 +184,35 @@ export function evaluateChromePolicies(snapshot: ChromePolicySnapshot): ChromePo
   });
 }
 
-// ----- Chrome locator (design 4.2) ----------------------------------------------------------
+// ----- Browser locator (design 1.5, 4.2) ----------------------------------------------------
 
-interface ChromeCandidate {
-  readonly source: ChromeSource;
+interface BrowserCandidate {
+  readonly source: BrowserExecutableSource;
   readonly value: string;
 }
 
-const APP_PATH_SOURCES: Readonly<Record<ChromeAppPathValue["source"], ChromeSource>> = {
+const APP_PATH_SOURCES: Readonly<Record<BrowserAppPathValue["source"], BrowserExecutableSource>> = {
   hkcu: "app-paths-hkcu",
   "hklm-64": "app-paths-hklm-64",
   "hklm-32": "app-paths-hklm-32",
 };
 
-const CHROME_RELATIVE = ["Google", "Chrome", "Application", "chrome.exe"] as const;
+const KNOWN_FOLDER_SOURCES: Readonly<Record<CollectorKnownFolder, BrowserExecutableSource>> = {
+  LocalAppData: "known-local-app-data",
+  ProgramFiles: "known-program-files",
+  ProgramFilesX86: "known-program-files-x86",
+};
 
-async function validateChromeCandidate(
+async function validateBrowserCandidate(
   fileSystem: CollectorIntegrationFileSystem,
   rawValue: string,
+  fileName: string,
 ): Promise<{ readonly ok: true; readonly executablePath: string } | { readonly ok: false; readonly reason: ChromeCandidateRejection }> {
   // App Paths values are sometimes quoted. A REG_EXPAND_SZ value is never expanded here.
   const value = rawValue.length >= 2 && rawValue.startsWith("\"") && rawValue.endsWith("\"") ? rawValue.slice(1, -1) : rawValue;
   if (value.includes("%")) return { ok: false, reason: "unexpanded-variable" };
   if (!isLocalAbsoluteWindowsPath(value)) return { ok: false, reason: "not-absolute-local" };
-  if (path.win32.basename(value).toLowerCase() !== "chrome.exe") return { ok: false, reason: "wrong-basename" };
+  if (path.win32.basename(value).toLowerCase() !== fileName.toLowerCase()) return { ok: false, reason: "wrong-basename" };
   try {
     // Every component below the drive root must exist, be a directory (the last: a regular
     // file) and not be a reparse point.
@@ -211,64 +234,225 @@ async function validateChromeCandidate(
 }
 
 /**
- * Main-process Chrome locator. Candidate order follows design 4.2. Returns the validated
- * path for the main process only: callers must not log it or send it to the renderer.
+ * The executable named by a `shell\open\command` value: up to the closing quote when it starts with
+ * `"`, otherwise up to the first whitespace (design 1.5). Used ONLY to pick between candidates that
+ * were already validated; the string is never launched.
  */
-export async function locateChromeExecutable(
-  dependencies: Pick<CollectorIntegrationInspectDependencies, "registry" | "fileSystem">,
-): Promise<ChromeLocation> {
-  const candidates: ChromeCandidate[] = [];
+function openCommandExecutable(command: string): string | null {
+  const text = command.trim();
+  if (text.startsWith("\"")) {
+    const end = text.indexOf("\"", 1);
+    return end > 1 ? text.slice(1, end) : null;
+  }
+  return /^\S+/u.exec(text)?.[0] ?? null;
+}
+
+const pathKey = (value: string): string => path.win32.normalize(value).toLowerCase();
+
+export interface BrowserLocatorDependencies extends Pick<CollectorIntegrationInspectDependencies, "registry" | "fileSystem"> {
+  /** Defaults to the product table; tests inject variants. */
+  readonly browserTable?: readonly CollectorBrowserSpec[];
+}
+
+export interface BrowserLocatorOptions {
+  /** The default `https` ProgId when the caller already read it (`null`: none). Omitted: read here. */
+  readonly defaultProgId?: string | null;
+}
+
+/**
+ * Main-process locator for one table row. Candidate order (design 1.5): when this browser is the
+ * default and the default ProgId's open command names one of the VALIDATED candidates, that
+ * candidate; otherwise App Paths HKCU, HKLM 64-bit, HKLM 32-bit, then the row's known folders.
+ * Every candidate must pass the same checks (local absolute path, row basename, no reparse point,
+ * regular file). Returns the validated path for the main process only: callers must not log it or
+ * send it to the renderer.
+ */
+export async function locateBrowserExecutable(
+  id: CollectorBrowserId,
+  dependencies: BrowserLocatorDependencies,
+  options: BrowserLocatorOptions = {},
+): Promise<BrowserLocation> {
+  const table = dependencies.browserTable ?? COLLECTOR_BROWSERS;
+  const row = table.find((entry) => entry.id === id);
+  if (row === undefined) return { status: "unknown" };
+  const { fileName, appPathsName, knownFolderCandidates } = row.executable;
+
+  const candidates: BrowserCandidate[] = [];
   try {
-    for (const entry of dependencies.registry.readChromeAppPaths()) {
+    for (const entry of dependencies.registry.readBrowserAppPaths(appPathsName)) {
       candidates.push({ source: APP_PATH_SOURCES[entry.source], value: entry.value });
     }
-    const known: ReadonlyArray<readonly [ChromeSource, "LocalAppData" | "ProgramFiles" | "ProgramFilesX86"]> = [
-      ["known-local-app-data", "LocalAppData"],
-      ["known-program-files", "ProgramFiles"],
-      ["known-program-files-x86", "ProgramFilesX86"],
-    ];
-    for (const [source, id] of known) {
-      const base = dependencies.registry.getKnownFolderPath(id);
-      candidates.push({ source, value: path.win32.join(base, ...CHROME_RELATIVE) });
+    for (const known of knownFolderCandidates) {
+      const base = dependencies.registry.getKnownFolderPath(known.folder);
+      candidates.push({ source: KNOWN_FOLDER_SOURCES[known.folder], value: path.win32.join(base, ...known.relative, fileName) });
     }
   } catch {
     return { status: "unknown" };
   }
-  const rejected: ChromeRejectedCandidate[] = [];
+
+  // The default browser's own open command prefers one of several installs (never launched).
+  let preferred: string | null = null;
+  try {
+    const progId = options.defaultProgId !== undefined ? options.defaultProgId : (dependencies.registry.readDefaultBrowserProgId()?.progId ?? null);
+    if (progId !== null && classifyDefaultBrowser(progId, table) === row.id) {
+      const command = dependencies.registry.readProgIdOpenCommand(progId);
+      const executable = command === null ? null : openCommandExecutable(command);
+      preferred = executable === null ? null : pathKey(executable);
+    }
+  } catch {
+    preferred = null; // tailoring only; never blocks
+  }
+
+  const rejected: BrowserRejectedCandidate[] = [];
+  const valid: Array<{ readonly source: BrowserExecutableSource; readonly executablePath: string }> = [];
   const seen = new Set<string>();
   for (const candidate of candidates) {
     const key = candidate.value.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    const result = await validateChromeCandidate(dependencies.fileSystem, candidate.value);
-    if (result.ok) return { status: "found", source: candidate.source, executablePath: result.executablePath, rejected: Object.freeze(rejected) };
-    rejected.push(Object.freeze({ source: candidate.source, reason: result.reason }));
+    const result = await validateBrowserCandidate(dependencies.fileSystem, candidate.value, fileName);
+    if (!result.ok) {
+      rejected.push(Object.freeze({ source: candidate.source, reason: result.reason }));
+      continue;
+    }
+    valid.push({ source: candidate.source, executablePath: result.executablePath });
+    if (preferred === null) break; // first valid candidate wins; later ones are not examined
+  }
+  const chosen = (preferred === null ? undefined : valid.find((entry) => pathKey(entry.executablePath) === preferred)) ?? valid[0];
+  if (chosen !== undefined) {
+    return { status: "found", source: chosen.source, executablePath: chosen.executablePath, rejected: Object.freeze(rejected) };
   }
   return { status: "not-found", rejected: Object.freeze(rejected) };
 }
 
-/** Classifies the `https` handler ProgId. Only used to tailor copy; never blocks. */
-export function classifyDefaultBrowser(progId: string | null): DefaultBrowserKind {
-  if (progId === null) return "unknown";
-  if (/^ChromeHTML(?:\.|$)/iu.test(progId)) return "chrome";
-  if (/^MSEdge(?:HTM|HTML)(?:\.|$)/iu.test(progId)) return "edge";
-  if (/^(?:BraveHTML|BraveFile|VivaldiHTM|OperaStable|Opera|ChromiumHTM|ArcHTML|ChromeBHTML|ChromeSSHTM|YandexHTML|CocCocHTML)/iu.test(progId)) return "other-chromium";
-  return "other";
+/** Chrome-only entry point kept for the WP-7a service (S7 moves it to `locateBrowserExecutable`). */
+export async function locateChromeExecutable(
+  dependencies: Pick<CollectorIntegrationInspectDependencies, "registry" | "fileSystem">,
+): Promise<ChromeLocation> {
+  return locateBrowserExecutable("chrome", dependencies);
 }
 
-async function detectChrome(
+/** What the inspection learns about one table row (never contains a path). */
+interface DetectedBrowser {
+  readonly installed: CollectorBrowserInstalled;
+  readonly source: BrowserExecutableSource | null;
+  readonly rejected: readonly BrowserRejectedCandidate[];
+  readonly policy: ChromePolicyEvaluation;
+  readonly policyStatus: "read" | "unavailable" | "not-applicable";
+}
+
+const NO_POLICY: ChromePolicyEvaluation = Object.freeze({ userLevelHostsDisabled: false, hostBlocked: false, blocked: false, extensionLoadMayBeBlocked: false });
+
+async function detectBrowsers(
   dependencies: CollectorIntegrationInspectDependencies,
-): Promise<ChromeDetection> {
-  let defaultBrowser: DefaultBrowserKind = "unknown";
-  try {
-    defaultBrowser = classifyDefaultBrowser(dependencies.registry.readDefaultBrowserProgId()?.progId ?? null);
-  } catch {
-    defaultBrowser = "unknown"; // tailoring only; never blocks
+  table: readonly CollectorBrowserSpec[],
+  defaultProgId: string | null,
+): Promise<ReadonlyMap<CollectorBrowserId, DetectedBrowser>> {
+  const detected = new Map<CollectorBrowserId, DetectedBrowser>();
+  for (const row of table) {
+    let policy: ChromePolicyEvaluation = NO_POLICY;
+    let policyStatus: DetectedBrowser["policyStatus"] = "not-applicable";
+    if (row.policyRoot !== null) {
+      try {
+        policy = evaluateChromePolicies(dependencies.registry.readBrowserPolicies(row.policyRoot));
+        policyStatus = "read";
+      } catch {
+        policyStatus = "unavailable"; // the browser stays the authority; this never blocks by itself
+      }
+    }
+    const location = await locateBrowserExecutable(row.id, { ...dependencies, browserTable: table }, { defaultProgId });
+    detected.set(row.id, Object.freeze({
+      installed: location.status,
+      source: location.status === "found" ? location.source : null,
+      rejected: location.status === "unknown" ? Object.freeze([]) : location.rejected,
+      policy,
+      policyStatus,
+    }));
   }
-  const location = await locateChromeExecutable(dependencies);
-  if (location.status === "found") return Object.freeze({ status: "found", source: location.source, rejected: location.rejected, defaultBrowser });
-  if (location.status === "not-found") return Object.freeze({ status: "not-found", source: null, rejected: location.rejected, defaultBrowser });
-  return Object.freeze({ status: "unknown", source: null, rejected: Object.freeze([]), defaultBrowser });
+  return detected;
+}
+
+// ----- Registration targets and the expected set E (design 3.1, 4.2) -------------------------
+
+type TargetOwnerships = Readonly<Partial<Record<CollectorRegistryTargetId, CollectorTargetOwnership>>>;
+
+/**
+ * Per-target ownership for every target some table row looks up or owns (in registry order). A
+ * target no row mentions (`vivaldi` today) is never read: the addon's table does not contain it.
+ */
+function readTargetOwnerships(registry: CollectorRegistryAdapter, table: readonly CollectorBrowserSpec[]): TargetOwnerships {
+  const wanted = new Set<CollectorRegistryTargetId>();
+  for (const row of table) {
+    for (const target of [...row.nativeMessaging.lookupOrder, ...row.nativeMessaging.ownTargets]) wanted.add(target);
+  }
+  const result: Partial<Record<CollectorRegistryTargetId, CollectorTargetOwnership>> = {};
+  for (const target of COLLECTOR_REGISTRY_TARGET_IDS) {
+    if (!wanted.has(target)) continue;
+    try {
+      result[target] = registry.readCollectorHostRegistration(target);
+    } catch {
+      result[target] = "unknown";
+    }
+  }
+  return Object.freeze(result);
+}
+
+/**
+ * The expected set `E`: the writable targets MAGINALIA must have registered. Only `verified` rows
+ * count; a policy-blocked row contributes nothing; a `when-present` row contributes a target only
+ * when the browser was found or the state file says it was registered. Registry order, no duplicates.
+ */
+export function computeExpectedTargets(
+  table: readonly CollectorBrowserSpec[],
+  detected: ReadonlyMap<CollectorBrowserId, Pick<DetectedBrowser, "installed" | "policy">>,
+  registeredTargets: readonly CollectorRegistryTargetId[] | null,
+): readonly CollectorRegistryTargetId[] {
+  const expected = new Set<CollectorRegistryTargetId>();
+  for (const row of table) {
+    if (row.verification !== "verified") continue;
+    const facts = detected.get(row.id);
+    if (facts?.policy.blocked === true) continue;
+    for (const target of row.nativeMessaging.ownTargets) {
+      if (row.nativeMessaging.registration === "always" || facts?.installed === "found" || registeredTargets?.includes(target) === true) {
+        expected.add(target);
+      }
+    }
+  }
+  return Object.freeze(COLLECTOR_REGISTRY_TARGET_IDS.filter((target) => expected.has(target)));
+}
+
+/** Aggregate over `E` (design 4.2): any unknown, else any foreign, else any ours, else absent. */
+function aggregateRegistration(expected: readonly CollectorRegistryTargetId[], ownerships: TargetOwnerships): HostRegistrationOwnership | "unknown" {
+  const values = expected.map((target) => ownerships[target] ?? "unknown");
+  if (values.includes("unknown")) return "unknown";
+  if (values.includes("foreign")) return "foreign";
+  if (values.includes("ours")) return "ours";
+  return "absent";
+}
+
+/** `blocked` only when every verified browser is blocked (design 4.4-1); a partial block stays per browser. */
+function aggregatePolicy(
+  table: readonly CollectorBrowserSpec[],
+  detected: ReadonlyMap<CollectorBrowserId, DetectedBrowser>,
+): ChromePolicyEvaluation & { readonly status: "read" | "unavailable" } {
+  const verified = table.filter((row) => row.verification === "verified").flatMap((row) => {
+    const facts = detected.get(row.id);
+    return facts === undefined ? [] : [facts];
+  });
+  const allBlocked = verified.length > 0 && verified.every((facts) => facts.policy.blocked);
+  const userLevelHostsDisabled = allBlocked && verified.some((facts) => facts.policy.userLevelHostsDisabled);
+  const hostBlocked = allBlocked && verified.some((facts) => facts.policy.hostBlocked);
+  return Object.freeze({
+    userLevelHostsDisabled,
+    hostBlocked,
+    blocked: userLevelHostsDisabled || hostBlocked,
+    extensionLoadMayBeBlocked: verified.some((facts) => facts.policy.extensionLoadMayBeBlocked),
+    status: verified.some((facts) => facts.policyStatus === "unavailable") ? ("unavailable" as const) : ("read" as const),
+  });
+}
+
+function sameTargets(left: readonly CollectorRegistryTargetId[], right: readonly CollectorRegistryTargetId[]): boolean {
+  return left.length === right.length && left.every((target, index) => target === right[index]);
 }
 
 // ----- Contact record (display only) --------------------------------------------------------
@@ -353,15 +537,30 @@ async function readContact(
 
 // ----- Installed state ----------------------------------------------------------------------
 
-interface IntegrationStateFile {
-  readonly version: 1;
+export interface IntegrationStateFile {
+  /** `1` is the pre-multi-browser shape (read only); S4 writes `2` (design 4.3). */
+  readonly version: 1 | 2;
   readonly payloadId: string;
   readonly activeSlot: CollectorHostSlot;
   readonly extensionVersion: string;
   readonly placedAt: string;
+  /** Writable targets the last apply registered, in registry order. A v1 file means `["chrome"]`. */
+  readonly registeredTargets: readonly CollectorRegistryTargetId[];
 }
 
-const STATE_FIELDS = ["version", "payloadId", "activeSlot", "extensionVersion", "placedAt"] as const;
+const STATE_V1_FIELDS = ["version", "payloadId", "activeSlot", "extensionVersion", "placedAt"] as const;
+const STATE_V2_FIELDS = [...STATE_V1_FIELDS, "registeredTargets"] as const;
+const WRITABLE_TARGET_IDS: readonly CollectorRegistryTargetId[] = COLLECTOR_REGISTRY_TARGETS.filter((target) => target.writable).map((target) => target.id);
+
+function parseRegisteredTargets(value: unknown): readonly CollectorRegistryTargetId[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const seen = new Set<string>();
+  for (const entry of value as unknown[]) {
+    if (typeof entry !== "string" || !(WRITABLE_TARGET_IDS as readonly string[]).includes(entry) || seen.has(entry)) return undefined;
+    seen.add(entry);
+  }
+  return Object.freeze(WRITABLE_TARGET_IDS.filter((target) => seen.has(target)));
+}
 
 export function parseIntegrationStateFile(text: string): IntegrationStateFile | undefined {
   let value: unknown;
@@ -372,17 +571,22 @@ export function parseIntegrationStateFile(text: string): IntegrationStateFile | 
   }
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
-  if (Object.keys(record).length !== STATE_FIELDS.length || !STATE_FIELDS.every((field) => Object.hasOwn(record, field))) return undefined;
-  if (record.version !== 1 || typeof record.payloadId !== "string" || !/^[0-9A-Za-z][0-9A-Za-z.-]{0,63}\+[0-9A-Za-z]{1,40}$/u.test(record.payloadId)) return undefined;
+  if (record.version !== 1 && record.version !== 2) return undefined;
+  const fields: readonly string[] = record.version === 1 ? STATE_V1_FIELDS : STATE_V2_FIELDS;
+  if (Object.keys(record).length !== fields.length || !fields.every((field) => Object.hasOwn(record, field))) return undefined;
+  if (typeof record.payloadId !== "string" || !/^[0-9A-Za-z][0-9A-Za-z.-]{0,63}\+[0-9A-Za-z]{1,40}$/u.test(record.payloadId)) return undefined;
   if (record.activeSlot !== "a" && record.activeSlot !== "b") return undefined;
   if (parseCollectorVersion(record.extensionVersion) === undefined) return undefined;
   if (typeof record.placedAt !== "string" || !CONTACT_TIMESTAMP_PATTERN.test(record.placedAt)) return undefined;
+  const registeredTargets = record.version === 1 ? Object.freeze(["chrome" as const]) : parseRegisteredTargets(record.registeredTargets);
+  if (registeredTargets === undefined) return undefined;
   return Object.freeze({
-    version: 1 as const,
+    version: record.version,
     payloadId: record.payloadId,
     activeSlot: record.activeSlot,
     extensionVersion: record.extensionVersion as string,
     placedAt: record.placedAt,
+    registeredTargets,
   });
 }
 
@@ -562,6 +766,7 @@ export async function inspectCollectorIntegration(
   options: CollectorInspectOptions = {},
 ): Promise<CollectorIntegrationInspection> {
   const hashes = options.verifyFileHashes !== false;
+  const table = dependencies.browserTable ?? COLLECTOR_BROWSERS;
   const sink = new ReasonSink();
   let complete = true;
   const incomplete = (reason: CollectorIntegrationReason): void => {
@@ -572,22 +777,30 @@ export async function inspectCollectorIntegration(
   const paths = resolveIntegrationPaths(dependencies.registry);
   if (paths === undefined) incomplete("known-folder-unavailable");
 
-  let registration: HostRegistrationOwnership | "unknown" = "unknown";
+  // Default browser (tailoring only; a failing read yields `unknown` and never blocks).
+  let defaultProgId: string | null = null;
+  let defaultBrowser: DefaultBrowserKind = "unknown";
   try {
-    registration = dependencies.registry.readCollectorHostRegistration("chrome");
+    defaultProgId = dependencies.registry.readDefaultBrowserProgId()?.progId ?? null;
+    defaultBrowser = classifyDefaultBrowser(defaultProgId, table);
   } catch {
-    incomplete("registry-read-failed");
+    defaultProgId = null;
+    defaultBrowser = "unknown";
   }
 
-  let policy: ChromePolicyEvaluation = { userLevelHostsDisabled: false, hostBlocked: false, blocked: false, extensionLoadMayBeBlocked: false };
-  let policyStatus: "read" | "unavailable" = "read";
-  try {
-    policy = evaluateChromePolicies(dependencies.registry.readChromePolicies());
-  } catch {
-    policyStatus = "unavailable"; // Chrome stays the authority; this never blocks by itself
-  }
+  // Per-target ownership (decided in the addon), per-browser detection and policy.
+  const ownerships = readTargetOwnerships(dependencies.registry, table);
+  const detected = await detectBrowsers(dependencies, table, defaultProgId);
+  const policy = aggregatePolicy(table, detected);
 
-  const chrome = await detectChrome(dependencies);
+  // The expected set E and the aggregate over it. `registeredTargets` of a `when-present` row is only
+  // known after the state file is read; E is recomputed then.
+  let expected = computeExpectedTargets(table, detected, null);
+  const noteUnreadable = (targets: readonly CollectorRegistryTargetId[]): void => {
+    if (targets.some((target) => (ownerships[target] ?? "unknown") === "unknown")) incomplete("registry-read-failed");
+  };
+  noteUnreadable(expected);
+  let registration = aggregateRegistration(expected, ownerships);
 
   let payloadStatus: "valid" | "invalid" | "unavailable" = "unavailable";
   let payload: CollectorPayloadDescriptor | null = null;
@@ -657,14 +870,32 @@ export async function inspectCollectorIntegration(
             }
           }
 
-          if (registration === "absent") {
-            if (installedState !== null) {
-              state = "registration-missing";
-              sink.add("registration-absent");
-            } else {
-              state = "not-set-up";
-              sink.add("program-folder-unrecognized");
+          // A `when-present` browser registered earlier can widen E now that the state file is known.
+          if (installedState !== null) {
+            const refined = computeExpectedTargets(table, detected, installedState.registeredTargets);
+            if (!sameTargets(refined, expected)) {
+              expected = refined;
+              noteUnreadable(expected);
+              registration = aggregateRegistration(expected, ownerships);
             }
+          }
+          const registered = installedState?.registeredTargets ?? [];
+          const absentTargets = expected.filter((target) => ownerships[target] === "absent");
+          const missingTargets = absentTargets.filter((target) => registered.includes(target));
+          const addedTargets = absentTargets.filter((target) => !registered.includes(target));
+
+          if (!complete) {
+            state = "damaged";
+          } else if (registration === "foreign") {
+            state = "foreign-registration";
+            sink.add("registration-foreign");
+          } else if (registration === "absent" && installedState === null) {
+            state = "not-set-up";
+            sink.add("program-folder-unrecognized");
+          } else if (registration === "absent" && installedState !== null && missingTargets.length > 0) {
+            // Everything expected is gone but something was registered before: someone removed it.
+            state = "registration-missing";
+            sink.add("registration-absent");
           } else if (installedState === null) {
             state = "damaged";
             sink.add(stateProblem ?? "state-file-invalid");
@@ -677,18 +908,27 @@ export async function inspectCollectorIntegration(
               hostVersionComparison = compareCollectorVersions(hostVersionOf(installedState.payloadId), payload.host.version);
               extensionVersionComparison = compareCollectorVersions(extensionVersionOnDisk ?? installedState.extensionVersion, payload.extension.version);
             }
-            if (sink.reasons.length > 0) {
+            if (sink.reasons.length > 0 || payload === null) {
               state = "damaged"; // structure or payload problems
-            } else if (payload !== null && installedState.payloadId !== payload.payloadId) {
-              state = "outdated";
-              sink.add("payload-id-differs");
-              if (hostVersionComparison === "older" || extensionVersionComparison === "older") sink.add("installed-older");
-              else if (hostVersionComparison === "newer" || extensionVersionComparison === "newer") sink.add("installed-newer");
-              else if (hostVersionComparison === "unparseable" || extensionVersionComparison === "unparseable") sink.add("installed-version-unparseable");
-            } else if (payload !== null) {
-              await verifyAgainstPayload(dependencies.fileSystem, paths, installedState, payload, hashes, sink);
+            } else {
+              const payloadDiffers = installedState.payloadId !== payload.payloadId;
+              if (!payloadDiffers) await verifyAgainstPayload(dependencies.fileSystem, paths, installedState, payload, hashes, sink);
               if (sink.reasons.length > 0) {
                 state = "damaged";
+              } else if (missingTargets.length > 0) {
+                // Healthy installation, but a registration that was made is gone: never repaired silently.
+                state = "registration-missing";
+                sink.add("registration-absent");
+              } else if (payloadDiffers || addedTargets.length > 0) {
+                state = "outdated";
+                if (payloadDiffers) {
+                  sink.add("payload-id-differs");
+                  if (hostVersionComparison === "older" || extensionVersionComparison === "older") sink.add("installed-older");
+                  else if (hostVersionComparison === "newer" || extensionVersionComparison === "newer") sink.add("installed-newer");
+                  else if (hostVersionComparison === "unparseable" || extensionVersionComparison === "unparseable") sink.add("installed-version-unparseable");
+                }
+                // A new version registers more targets, or a `when-present` browser appeared (design 4.4-5).
+                if (addedTargets.length > 0) sink.add("registration-target-added");
               } else {
                 state = "ready";
                 filesVerified = hashes;
@@ -707,11 +947,43 @@ export async function inspectCollectorIntegration(
     ? Object.freeze({ status: "absent" } as const)
     : await readContact(dependencies, paths, installedState?.extensionVersion ?? null, payload);
 
+  const recommendation = recommendCollectorBrowser({
+    defaultBrowser,
+    detections: Object.fromEntries(table.map((row) => {
+      const facts = detected.get(row.id);
+      return [row.id, { installed: facts?.installed ?? "unknown", policyBlocked: facts?.policy.blocked ?? false }];
+    })),
+  }, table);
+  const entries: readonly CollectorBrowserStatus[] = Object.freeze(table.map((row) => {
+    const facts = detected.get(row.id) as DetectedBrowser;
+    return Object.freeze({
+      id: row.id,
+      verification: row.verification,
+      installed: facts.installed,
+      source: facts.source,
+      effective: effectiveRegistration(row.nativeMessaging.lookupOrder, ownerships),
+      policy: Object.freeze({ ...facts.policy, status: facts.policyStatus }),
+    });
+  }));
+  const registrations = Object.freeze(Object.fromEntries(COLLECTOR_REGISTRY_TARGET_IDS.map((target) => [target, ownerships[target] ?? "unknown"]))) as Readonly<Record<CollectorRegistryTargetId, CollectorTargetOwnership>>;
+
+  // Compatibility view of the Chrome row for the pre-multi-browser consumers (WP-7a service, IPC).
+  const chromeFacts = detected.get("chrome");
+  const chrome: ChromeDetection = Object.freeze({
+    status: chromeFacts?.installed ?? "unknown",
+    source: chromeFacts?.source ?? null,
+    rejected: chromeFacts?.rejected ?? Object.freeze([]),
+    defaultBrowser,
+  });
+
   return Object.freeze({
     state,
     reasons: Object.freeze([...sink.reasons]),
     inspectionComplete: complete,
     registration,
+    registrations,
+    expectedTargets: expected,
+    registeredTargets: installedState?.registeredTargets ?? null,
     folderSecurityViolation: folderViolation,
     payload: Object.freeze({ status: payloadStatus, payloadId: payload?.payloadId ?? null }),
     installed: Object.freeze({
@@ -722,7 +994,13 @@ export async function inspectCollectorIntegration(
     }),
     versions: Object.freeze({ host: hostVersionComparison, extension: extensionVersionComparison }),
     filesVerified,
-    policy: Object.freeze({ ...policy, status: policyStatus }),
+    policy,
+    browsers: Object.freeze({
+      defaultBrowser,
+      recommended: recommendation.recommended,
+      recommendationReason: recommendation.reason,
+      entries,
+    }),
     chrome,
     contact,
     extensionFolderDisplay: paths?.extensionFolder ?? null,

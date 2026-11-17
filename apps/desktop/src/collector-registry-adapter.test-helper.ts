@@ -53,8 +53,6 @@ export type FakeAdapterCall =
   | "registerCollectorHost"
   | "unregisterCollectorHost"
   | "replaceForeignCollectorHostRegistration"
-  | "readChromePolicies"
-  | "readChromeAppPaths"
   | "readDefaultBrowserProgId"
   | "readBrowserPolicies"
   | "readBrowserAppPaths"
@@ -205,16 +203,6 @@ export class FakeCollectorRegistryAdapter implements CollectorRegistryAdapter {
     this.enter("readProgIdOpenCommand");
     if (typeof progId !== "string" || !PROG_ID_PATTERN.test(progId)) return null;
     return this.progIdOpenCommands[progId] ?? null;
-  }
-
-  public readChromePolicies(): ChromePolicySnapshot {
-    this.enter("readChromePolicies");
-    return this.policies;
-  }
-
-  public readChromeAppPaths(): readonly ChromeAppPathValue[] {
-    this.enter("readChromeAppPaths");
-    return this.appPaths;
   }
 
   public readDefaultBrowserProgId(): DefaultBrowserProgIdFact | null {

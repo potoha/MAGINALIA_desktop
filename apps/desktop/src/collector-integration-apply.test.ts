@@ -136,7 +136,7 @@ describe("setup from nothing (design 3.5 order of side effects)", () => {
     await run(fixture, { action: "setup" });
     expect(JSON.parse(fixture.fileSystem.text(p(fixture, "org.maginalia.collector.json")))).toEqual(expectedHostManifest("a"));
     const state = parseIntegrationStateFile(fixture.fileSystem.text(p(fixture, "integration-state.json")));
-    expect(state).toEqual({ version: 1, payloadId: "1.2.0+abc1234", activeSlot: "a", extensionVersion: "0.3.0", placedAt: fixture.now.toISOString() });
+    expect(state).toEqual({ version: 1, payloadId: "1.2.0+abc1234", activeSlot: "a", extensionVersion: "0.3.0", placedAt: fixture.now.toISOString(), registeredTargets: ["chrome"] });
   });
 
   it("leaves no temp name behind", async () => {
@@ -306,11 +306,12 @@ describe("preconditions (refuse, write nothing)", () => {
   it("a policy that appears between the inspection and the first write stops the action", async () => {
     const fixture = createApplyFixture();
     let reads = 0;
-    const original = fixture.registry.readChromePolicies.bind(fixture.registry);
-    fixture.registry.readChromePolicies = () => {
+    const original = fixture.registry.readBrowserPolicies.bind(fixture.registry);
+    fixture.registry.readBrowserPolicies = (root) => {
+      if (root !== "Google\\Chrome") return original(root);
       reads += 1;
       if (reads > 1) return { hkcu: { ...EMPTY_CHROME_POLICIES_FOR_HIVE("HKCU"), nativeMessagingUserLevelHosts: 0 }, hklm: EMPTY_CHROME_POLICIES_FOR_HIVE("HKLM") };
-      return original();
+      return original(root);
     };
     const result = await run(fixture, { action: "setup" });
     expect(result).toMatchObject({ outcome: "refused", reason: "policy-blocked" });

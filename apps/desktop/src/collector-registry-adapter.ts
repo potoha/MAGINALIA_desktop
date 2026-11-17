@@ -106,10 +106,6 @@ export interface CollectorRegistryAdapter {
    * (design 11.1). A ProgId with characters outside `[A-Za-z0-9._-]` yields `null`.
    */
   readProgIdOpenCommand(progId: string): string | null;
-  /** @deprecated Use `readBrowserPolicies("Google\\Chrome")`; kept for WP-5a until S3. */
-  readChromePolicies(): ChromePolicySnapshot;
-  /** @deprecated Use `readBrowserAppPaths("chrome.exe")`; kept for WP-5a until S3. */
-  readChromeAppPaths(): readonly ChromeAppPathValue[];
 }
 
 const POLICY_SUBKEY_PREFIX = "SOFTWARE\\Policies\\";
@@ -242,8 +238,5 @@ export function createCollectorRegistryAdapterOver(integration: WindowsIntegrati
     readBrowserAppPaths: (appPathsName: string): readonly BrowserAppPathValue[] => readAppPaths(integration, appPathsName),
     readDefaultBrowserProgId: (): DefaultBrowserProgIdFact | null => readHttpsProgId(integration),
     readProgIdOpenCommand: (progId: string): string | null => readOpenCommand(integration, progId),
-
-    readChromePolicies: (): ChromePolicySnapshot => readPolicies(integration, "Google\\Chrome"),
-    readChromeAppPaths: (): readonly ChromeAppPathValue[] => readAppPaths(integration, "chrome.exe"),
   });
 }

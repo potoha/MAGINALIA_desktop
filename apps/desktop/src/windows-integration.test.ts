@@ -653,7 +653,7 @@ describe("product adapter over a fake native module", () => {
       },
       names: { [`HKLM|64|${policyBase}\\NativeMessagingBlocklist`]: ["10", "2", "1", "junk"], [`HKCU|64|${policyBase}\\NativeMessagingAllowlist`]: [] },
     });
-    const snapshot = adapter.readChromePolicies();
+    const snapshot = adapter.readBrowserPolicies("Google\\Chrome");
     expect(snapshot.hklm.nativeMessagingUserLevelHosts).toBe(0);
     expect(snapshot.hklm.nativeMessagingBlocklist).toEqual(["com.other", "*", "org.maginalia.collector"]);
     expect(snapshot.hkcu.developerToolsAvailability).toBe(2);
@@ -674,13 +674,13 @@ describe("product adapter over a fake native module", () => {
         "HKCU|default|Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\UserChoice|ProgId": { type: "sz", value: "ChromeHTML" },
       },
     });
-    expect(adapter.readChromeAppPaths()).toEqual([
+    expect(adapter.readBrowserAppPaths("chrome.exe")).toEqual([
       { source: "hkcu", value: "C:\\Users\\t\\chrome.exe" },
       { source: "hklm-32", value: "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe" },
     ]);
     expect(adapter.readDefaultBrowserProgId()).toEqual({ progId: "ChromeHTML", source: "user-choice" });
     expect(adapterFor({}).readDefaultBrowserProgId()).toBeNull();
-    expect(adapterFor({}).readChromeAppPaths()).toEqual([]);
+    expect(adapterFor({}).readBrowserAppPaths("chrome.exe")).toEqual([]);
   });
 
   it("delegates the three mutators with exactly the target id, and refuses read-only or unknown targets", () => {
@@ -700,8 +700,6 @@ describe("product adapter over a fake native module", () => {
       "getKnownFolderPath",
       "readBrowserAppPaths",
       "readBrowserPolicies",
-      "readChromeAppPaths",
-      "readChromePolicies",
       "readCollectorHostRegistration",
       "readDefaultBrowserProgId",
       "readProgIdOpenCommand",
@@ -764,9 +762,9 @@ describe("FakeCollectorRegistryAdapter (test helper)", () => {
 
   it("supports fault injection and forced outcomes for state-machine tests", () => {
     const fake = new FakeCollectorRegistryAdapter();
-    fake.failNext.readChromePolicies = new Error("boom");
-    expect(() => fake.readChromePolicies()).toThrow("boom");
-    expect(fake.readChromePolicies().hkcu).toEqual(EMPTY_CHROME_POLICIES_FOR_HIVE("HKCU"));
+    fake.failNext.readBrowserPolicies = new Error("boom");
+    expect(() => fake.readBrowserPolicies("Google\\Chrome")).toThrow("boom");
+    expect(fake.readBrowserPolicies("Google\\Chrome").hkcu).toEqual(EMPTY_CHROME_POLICIES_FOR_HIVE("HKCU"));
     fake.nextRegisterOutcome = "access-denied";
     expect(fake.registerCollectorHost()).toBe("access-denied");
     expect(fake.readCollectorHostRegistration()).toBe("absent");
@@ -873,8 +871,8 @@ nativeDescribe("native product addon: read-only", () => {
     expect(Array.isArray(adapter.readBrowserAppPaths("msedge.exe"))).toBe(true);
     expect(adapter.readBrowserPolicies("Microsoft\\Edge").hkcu.hive).toBe("HKCU");
     expect(adapter.readProgIdOpenCommand("ChromeHTML") === null || typeof adapter.readProgIdOpenCommand("ChromeHTML") === "string").toBe(true);
-    expect(adapter.readChromePolicies().hklm.hive).toBe("HKLM");
-    expect(Array.isArray(adapter.readChromeAppPaths())).toBe(true);
+    expect(adapter.readBrowserPolicies("Google\\Chrome").hklm.hive).toBe("HKLM");
+    expect(Array.isArray(adapter.readBrowserAppPaths("chrome.exe"))).toBe(true);
     const progId = adapter.readDefaultBrowserProgId();
     expect(progId === null || typeof progId.progId === "string").toBe(true);
   });
