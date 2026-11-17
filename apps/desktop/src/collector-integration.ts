@@ -4,8 +4,8 @@
  * `inspectCollectorIntegration()` computes one of the seven states of design 3.5 from
  * injected adapters only:
  *
- * - `CollectorRegistryAdapter`: known folders, the single native registration verdict,
- *   Chrome policies, App Paths and the default-browser ProgId;
+ * - `CollectorRegistryAdapter`: known folders, the native per-target registration verdicts,
+ *   per-browser policies, App Paths and the default-browser ProgId;
  * - `CollectorIntegrationFileSystem`: `lstat`, bounded reads and SHA-256 (read-only);
  * - `PathSecurityInspector` + `evaluatePathSecurity`: the existing ACL checks;
  * - `readPayloadDescriptor()`: the packaged payload descriptor (validated here).
@@ -15,15 +15,21 @@
  * - no environment, cwd, argv or Electron path reads; no write of any kind; no process
  *   spawn; no registry write (the adapter's mutating methods are never referenced);
  * - the result carries opaque reason codes, never paths. The one exception is
- *   `extensionFolderDisplay`. Chrome's real location is returned only by
- *   `locateChromeExecutable()`, for the main process (design 4.5 launches it), never by
+ *   `extensionFolderDisplay`. A browser's real location is returned only by
+ *   `locateBrowserExecutable()`, for the main process (design 4.5 launches it), never by
  *   `inspectCollectorIntegration()`;
  * - the contact record is displayed, never trusted for any decision;
  * - an inspection that cannot finish fails closed to `damaged` with
  *   `inspectionComplete: false`; it never throws.
  *
- * State precedence: `policy-blocked` first (Chrome ignores the registration, and a write
- * cannot fix it), then `foreign-registration`, then the program-folder and file checks.
+ * Multi-browser (design 4, S3): ownership is read per registry target; the expected set `E`
+ * (design 3.1) is derived from the `verified` rows of the browser table; the aggregate
+ * `registration` is taken over `E` only. The seven states and their precedence are unchanged.
+ *
+ * State precedence: `policy-blocked` first (every verified browser ignores the registration, and
+ * a write cannot fix it), then `foreign-registration`, then the program-folder and file checks.
+ * Within a healthy installation, a recorded registration that is gone is `registration-missing`,
+ * and an expected target that was never recorded is `outdated(registration-target-added)`.
  */
 import * as path from "node:path";
 import { COLLECTOR_HOST_NAME, COLLECTOR_MANIFEST_FILE_NAME, COLLECTOR_PROGRAM_FOLDER_NAME, type HostRegistrationOwnership } from "./windows-integration.js";

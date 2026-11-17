@@ -58,8 +58,7 @@ export type FakeAdapterCall =
   | "readBrowserAppPaths"
   | "readProgIdOpenCommand";
 
-/** The targets the real addon's compile-time table contains / allows to be written (S2). */
-const FAKE_INSPECTABLE_TARGETS: readonly CollectorRegistryTargetId[] = ["chrome", "edge", "chromium"];
+/** The targets the real addon's compile-time table allows to be written (S2). */
 const FAKE_WRITABLE_TARGETS: readonly CollectorRegistryTargetId[] = ["chrome", "edge"];
 
 export class FakeCollectorRegistryAdapter implements CollectorRegistryAdapter {
@@ -81,6 +80,11 @@ export class FakeCollectorRegistryAdapter implements CollectorRegistryAdapter {
     vivaldi: "absent",
   };
   /** Shorthand for `registrations.chrome` (the only target the pre-S2 tests use). */
+  /**
+   * The targets the addon's compile-time table contains (S2): `vivaldi` is not in it, so reading it is
+   * `invalid-argument`. A test that models a later addon adds it here.
+   */
+  public inspectableTargets: readonly CollectorRegistryTargetId[] = ["chrome", "edge", "chromium"];
   public get registration(): CollectorHostRegistration {
     return this.registrations.chrome;
   }
@@ -140,7 +144,7 @@ export class FakeCollectorRegistryAdapter implements CollectorRegistryAdapter {
 
   public readCollectorHostRegistration(target: CollectorRegistryTargetId = "chrome"): CollectorHostRegistration {
     this.enter("readCollectorHostRegistration");
-    this.checkTarget("readCollectorHostRegistration", target, FAKE_INSPECTABLE_TARGETS);
+    this.checkTarget("readCollectorHostRegistration", target, this.inspectableTargets);
     return this.registrations[target];
   }
 
