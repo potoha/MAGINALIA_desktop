@@ -511,3 +511,130 @@ describe("design 5.7 scenario 9 / S3 finding (d): the read-only chromium key", (
     expect((await inspect(fixture)).state).toBe("outdated");
   });
 });
+
+// ----- review round: guard abort reporting, filesChanged, pre-write re-read, fail-closed shadow ----
+
+/** Runs `flip` once, the first time `touch` is hit after the converge phase began (the second payload read). */
+function armedFlip(fixture: ApplyFixture, where: "application-root-stat" | "state-read", flip: () => void): ApplyFixture["deps"] {
+  let reads = 0;
+  let armed = false;
+  const stat = fixture.fileSystem.stat.bind(fixture.fileSystem);
+  const readSmallFile = fixture.fileSystem.readSmallFile.bind(fixture.fileSystem);
+  if (where === "application-root-stat") {
+    fixture.fileSystem.stat = async (target) => { if (armed && target === fixture.applicationRoot) { armed = false; flip(); } return stat(target); };
+  } else {
+    fixture.fileSystem.readSmallFile = async (target, max) => { if (armed && target.endsWith("integration-state.json")) { armed = false; flip(); } return readSmallFile(target, max); };
+  }
+  return { ...fixture.deps, readPayloadDescriptor: async () => { reads += 1; if (reads === 2) armed = true; return fixture.payload; } };
+}
+
+describe("review: a guard abort is reported as refused, not as written (wrote is set after the second guard)", () => {
+  it("full path: a target that changes before the second guard is a refusal; nothing of the installation is written", async () => {
+    const fixture = createApplyFixture({ browserTable: CHROME_EDGE });
+    const deps = armedFlip(fixture, "application-root-stat", () => { fixture.registry.registrations.chrome = "foreign"; });
+    const result = await applyCollectorIntegration({ action: "setup" }, deps);
+    expect(result).toMatchObject({ outcome: "refused", reason: "registration-changed", filesChanged: false });
+    expect(fixture.fileSystem.mutations.some((entry) => /^(copy|rename|write)/u.test(entry))).toBe(false);
+    expect(fixture.fileSystem.registryLog).toEqual([]);
+    expect(fixture.registry.registrations.chrome).toBe("foreign");
+  });
+
+  it("registration-only refresh: the same flip between its two guards is a refusal with zero mutations", async () => {
+    const fixture = await rc3Installation();
+    const deps = armedFlip(fixture, "state-read", () => { fixture.registry.registrations.chrome = "foreign"; });
+    const before = fixture.fileSystem.mutationCount;
+    const result = await applyCollectorIntegration({ action: "refresh" }, deps);
+    expect(result).toMatchObject({ outcome: "refused", reason: "registration-changed", filesChanged: false });
+    expect(fixture.fileSystem.mutationCount).toBe(before);
+  });
+});
+
+describe("review: filesChanged is true only once a Host file was written", () => {
+  it("a failure before the first slot write is failed with filesChanged false and no slot file", async () => {
+    const probe = createApplyFixture();
+    await run(probe, { action: "setup" });
+    const firstCopy = probe.fileSystem.mutations.findIndex((entry) => entry.startsWith("copy")) + 1; // 1-based; no registry write precedes it
+    expect(firstCopy).toBeGreaterThan(0);
+    const fixture = createApplyFixture();
+    fixture.fileSystem.failAt = firstCopy;
+    const result = await run(fixture, { action: "setup" });
+    expect(result).toMatchObject({ outcome: "failed", filesChanged: false });
+    expect(fixture.fileSystem.has(p(fixture, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME))).toBe(false);
+  });
+
+  it("a failure after the first slot file is failed with filesChanged true", async () => {
+    const probe = createApplyFixture();
+    await run(probe, { action: "setup" });
+    const secondCopy = probe.fileSystem.mutations.reduce<number[]>((all, entry, index) => (entry.startsWith("copy") ? [...all, index + 1] : all), [])[1] as number;
+    const fixture = createApplyFixture();
+    fixture.fileSystem.failAt = secondCopy;
+    const result = await run(fixture, { action: "setup" });
+    expect(result).toMatchObject({ outcome: "failed", filesChanged: true });
+  });
+
+  it("a full refresh that placed files and then met a denied registry key is failed with filesChanged true", async () => {
+    const fixture = await rc3Installation();
+    newerPayload(fixture);
+    fixture.registry.registerOutcomes.edge = "access-denied";
+    const result = await run(fixture, { action: "refresh" });
+    expect(result).toMatchObject({ outcome: "failed", reason: "registry-write-denied", filesChanged: true });
+    expect(result.inspection.installed.payloadId).toBe("1.3.0+def5678");
+  });
+});
+
+describe("review: a target is re-read right before it is written (S4 minor 1, 8)", () => {
+  function flipAt(fixture: ApplyFixture, label: string): void {
+    const gate = fixture.registry.mutationGate as (label: string) => void;
+    fixture.registry.mutationGate = (current) => {
+      gate(current);
+      if (current === label) fixture.registry.registrations.edge = "foreign";
+    };
+  }
+
+  it("absent -> foreign after the last guard but before the registry write: aborted before the write, never overwritten", async () => {
+    const fixture = createApplyFixture({ browserTable: CHROME_EDGE });
+    flipAt(fixture, "register chrome"); // runs while Chrome is written, i.e. before Edge is
+    const result = await run(fixture, { action: "setup" });
+    expect(result).toMatchObject({ outcome: "failed", reason: "registration-changed" });
+    expect(fixture.registry.registrations.edge).toBe("foreign");
+    expect(fixture.fileSystem.registryLog).toEqual(["register chrome"]); // no write was even attempted for Edge
+    expect(fixture.registry.targetCalls.filter((entry) => entry.target === "edge" && entry.call === "registerCollectorHost")).toEqual([]);
+  });
+
+  it("the flip at the write itself is refused by the addon (value-matched register) and aborts the run", async () => {
+    const fixture = createApplyFixture({ browserTable: CHROME_EDGE });
+    flipAt(fixture, "register edge");
+    const result = await run(fixture, { action: "setup" });
+    expect(result).toMatchObject({ outcome: "failed", reason: "registration-changed" });
+    expect(fixture.registry.registrations.edge).toBe("foreign");
+  });
+
+  it("a confirmed replace re-reads the target too: it must still be foreign", async () => {
+    const fixture = createApplyFixture({ browserTable: CHROME_EDGE });
+    fixture.registry.registrations.edge = "foreign";
+    const gate = fixture.registry.mutationGate as (label: string) => void;
+    fixture.registry.mutationGate = (current) => { gate(current); if (current === "register chrome") fixture.registry.registrations.edge = "absent"; };
+    const result = await run(fixture, { action: "setup", confirmReplaceForeign: true });
+    expect(result).toMatchObject({ outcome: "failed", reason: "registration-changed" });
+    expect(fixture.fileSystem.registryLog).toEqual(["register chrome"]);
+  });
+});
+
+describe("review: an unreadable fallback key fails closed (design 4.4)", () => {
+  it("unreadable chromium + Edge key to add: foreign-registration (never an automatic refresh); the user-confirmed repair still registers Edge", async () => {
+    const fixture = await rc3Installation();
+    fixture.registry.unreadableTargets.add("chromium");
+    const first = await inspect(fixture);
+    expect(first).toMatchObject({ state: "foreign-registration", reasons: ["registration-foreign"], inspectionComplete: true });
+    expect(await run(fixture, { action: "refresh" })).toMatchObject({ outcome: "refused", reason: "wrong-state" });
+    expect(fixture.registry.registrations.edge).toBe("absent");
+    const repaired = await run(fixture, { action: "repair", confirmReplaceForeign: true });
+    expect(repaired.outcome).toBe("applied");
+    expect(fixture.registry.registrations.edge).toBe("ours");
+  });
+
+  it("control: a readable absent chromium key keeps the automatic refresh", async () => {
+    const fixture = await rc3Installation();
+    expect(await inspect(fixture)).toMatchObject({ state: "outdated" });
+  });
+});

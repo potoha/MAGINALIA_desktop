@@ -80,7 +80,7 @@ function assertPointedSlotComplete(fixture: ApplyFixture, label: string, tolerat
   }
 }
 
-function assertInvariants(fixture: ApplyFixture, before: Map<string, string>, label: string, tolerated: readonly string[] = []): void {
+function assertInvariants(fixture: ApplyFixture, before: Map<string, string>, label: string, tolerated: readonly string[] = [], foreignAllowed: readonly (typeof WRITABLE_TARGETS)[number][] = []): void {
   assertPointedSlotComplete(fixture, label, tolerated);
   // (b) manifest and state under their final names are always complete and valid
   const manifestPath = p(fixture, "org.maginalia.collector.json");
@@ -100,13 +100,14 @@ function assertInvariants(fixture: ApplyFixture, before: Map<string, string>, la
     expect(fixture.fileSystem.snapshot().has(key), `${label}: lost ${key}`).toBe(true);
   }
   // the registry only ever holds our value or nothing, never a foreign one (these scenarios seed no foreign key)
-  for (const target of WRITABLE_TARGETS) expect(fixture.registry.registrations[target], `${label}: ${target}`).not.toBe("foreign");
+  // (a target the scenario itself seeded as foreign and the user confirmed replacing may still be foreign until it is replaced)
+  for (const target of WRITABLE_TARGETS) if (!foreignAllowed.includes(target)) expect(fixture.registry.registrations[target], `${label}: ${target}`).not.toBe("foreign");
   // the read-only lookup key is never written
   expect(fixture.registry.registrations.chromium, label).toBe("absent");
 }
 
 /** The single deterministic recovery step for whatever state the fault left behind. */
-async function recover(fixture: ApplyFixture, label: string): Promise<void> {
+async function recover(fixture: ApplyFixture, label: string, confirmReplaceForeign = false): Promise<void> {
   fixture.fileSystem.crashAfter = null;
   fixture.fileSystem.failAt = null;
   const inspection = await inspectCollectorIntegration(fixture.deps);
@@ -115,11 +116,12 @@ async function recover(fixture: ApplyFixture, label: string): Promise<void> {
     "registration-missing": "repair",
     damaged: "repair",
     outdated: "refresh",
+    "foreign-registration": confirmReplaceForeign ? "repair" : null, // only the confirmed-replace scenario may end here
     ready: null,
   } as Record<string, CollectorApplyRequest["action"] | null>)[inspection.state] ?? null;
-  expect(["not-set-up", "registration-missing", "damaged", "outdated", "ready"], `${label}: state ${inspection.state}`).toContain(inspection.state);
+  expect(["not-set-up", "registration-missing", "damaged", "outdated", "ready", ...(confirmReplaceForeign ? ["foreign-registration"] : [])], `${label}: state ${inspection.state}`).toContain(inspection.state);
   if (action !== null) {
-    const result = await run(fixture, { action });
+    const result = await run(fixture, action === "setup" || action === "repair" ? { action, confirmReplaceForeign } : { action });
     expect(result.outcome, `${label}: ${action} from ${inspection.state} -> ${result.reason}`).toBe("applied");
   }
   const final = await inspectCollectorIntegration(fixture.deps);
@@ -558,6 +560,11 @@ describe("scenario 5: remove across targets", () => {
       const label = `S5 crash after mutation ${step}`;
       expect(["applied", "failed", "partial", "refused", "noop"], label).toContain(result.outcome);
       assertPointedSlotComplete(fixture, label);
+      // a key that is still ours always has its manifest and a Host to start (as in scenario 1)
+      if (WRITABLE_TARGETS.some((target) => fixture.registry.registrations[target] === "ours")) {
+        expect(fixture.fileSystem.has(p(fixture, "org.maginalia.collector.json")), `${label}: manifest of a key that is still ours`).toBe(true);
+        expect(fixture.fileSystem.has(p(fixture, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME)), `${label}: Host of a key that is still ours`).toBe(true);
+      }
       expect(fixture.registry.registrations.chromium, label).toBe("absent");
       // nothing outside the program folder and the integration folders changed
       for (const [key, value] of fixture.fileSystem.snapshot()) {
@@ -584,5 +591,60 @@ describe("scenario 5: remove across targets", () => {
     assertPointedSlotComplete(fixture, "after denied unregister");
     delete fixture.registry.unregisterOutcomes.chrome;
     expect((await run(fixture, { action: "remove" })).outcome).toBe("applied");
+  });
+});
+
+describe("scenario 5 (order): every unregister precedes the first file removal", () => {
+  it("in a fault-free remove, all registry unregisters come before any file or folder removal", async () => {
+    const fixture = await installedBoth();
+    fixture.fileSystem.timeline.length = 0;
+    expect((await run(fixture, { action: "remove" })).outcome).toBe("applied");
+    const unregisters = fixture.fileSystem.timeline.flatMap((entry, index) => (entry.startsWith("registry unregister") ? [index] : []));
+    const removals = fixture.fileSystem.timeline.flatMap((entry, index) => (/^remove-(file|dir)/u.test(entry) ? [index] : []));
+    expect(unregisters).toHaveLength(2);
+    expect(removals.length).toBeGreaterThan(0);
+    expect(Math.max(...unregisters)).toBeLessThan(Math.min(...removals));
+  });
+});
+
+describe("scenario 6 (confirmed replace): crash at every mutation, including between register chrome and replace edge", () => {
+  const seeded = (): ApplyFixture => {
+    const fixture = bothFixture();
+    fixture.registry.registrations.edge = "foreign";
+    return fixture;
+  };
+
+  it("the confirmed foreign Edge key is replaced only by the user-confirmed run; every crash point keeps I' and recovers with one confirmed repair", async () => {
+    const total = await countMutations(async () => seeded(), { action: "setup", confirmReplaceForeign: true });
+    const single = await countMutations(async () => bothFixture(), { action: "setup" });
+    expect(total).toBe(single); // `replace edge` replaces `register edge`: same number of mutations
+    for (let step = 0; step < total; step += 1) {
+      const fixture = seeded();
+      const before = fixture.fileSystem.snapshot();
+      fixture.fileSystem.crashAfter = step;
+      const result = await run(fixture, { action: "setup", confirmReplaceForeign: true });
+      const label = `S6 confirmed-replace crash after mutation ${step}`;
+      expect(["applied", "failed", "refused"], label).toContain(result.outcome);
+      assertInvariants(fixture, before, label, [], ["edge"]);
+      // the foreign Edge value is only ever replaced AFTER Chrome's key, manifest and Host are complete
+      if (fixture.registry.registrations.edge !== "foreign") {
+        expect(fixture.registry.registrations.chrome, label).toBe("ours");
+        expect(fixture.fileSystem.has(p(fixture, "org.maginalia.collector.json")), label).toBe(true);
+      }
+      await recover(fixture, label, true);
+      expect(fixture.registry.registrations, label).toMatchObject({ chrome: "ours", edge: "ours" });
+    }
+    expect(single).toBeGreaterThan(20);
+  });
+
+  it("the crash between `register chrome` and `replace edge` leaves Chrome ours and Edge still foreign (never half-replaced)", async () => {
+    const total = await countMutations(async () => seeded(), { action: "setup", confirmReplaceForeign: true });
+    const fixture = seeded();
+    fixture.fileSystem.crashAfter = total - 3; // after `register chrome`, before `replace edge`
+    await run(fixture, { action: "setup", confirmReplaceForeign: true });
+    expect(fixture.fileSystem.registryLog).toEqual(["register chrome"]);
+    expect(fixture.registry.registrations).toMatchObject({ chrome: "ours", edge: "foreign" });
+    expect(await inspectCollectorIntegration(fixture.deps)).toMatchObject({ state: "foreign-registration" });
+    await recover(fixture, "between register chrome and replace edge", true);
   });
 });

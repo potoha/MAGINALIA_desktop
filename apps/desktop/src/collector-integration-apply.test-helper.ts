@@ -37,6 +37,8 @@ export class FakeApplyFileSystem extends FakeCollectorFileSystem implements Coll
   public readonly mutations: string[] = [];
   /** Registry writes (`register edge`, `unregister chrome`, ...) in order; they count as mutations for `crashAfter` / `failAt`. */
   public readonly registryLog: string[] = [];
+  /** Every mutation AND registry write in the order they ran (`registry unregister chrome`, `remove-file ...`). */
+  public readonly timeline: string[] = [];
   /** The Nth mutation (1-based) throws before running; one shot. */
   public failAt: number | null = null;
   /** After the Nth mutation ran, every later mutation throws (the process "died"). */
@@ -81,6 +83,7 @@ export class FakeApplyFileSystem extends FakeCollectorFileSystem implements Coll
       }
     }
     this.mutations.push(`${op} ${targets.map(fakeKey).join(" -> ")}`);
+    this.timeline.push(`${op} ${targets.map(fakeKey).join(" -> ")}`);
   }
 
   /**
