@@ -212,7 +212,8 @@ release gate（§9 S10）で `evidence` が `"measured"` になっているこ�
 1. そのブラウザーが既定ブラウザーなら、既定の ProgId の open command から exe を求め、
    それが **検証済み候補のどれかと一致したとき** だけ、その候補を使う（利用者がふだん
    起動している install を選ぶため）。
-   - ProgId は `^[A-Za-z0-9._-]{1,64}$` を満たすときだけ subkey に使う（`..\` 等の注入防止）。
+   - ProgId は `^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$` を満たすときだけ subkey に使う（`..\` 等の注入防止。
+     実装 S2、`PROG_ID_PATTERN`。先頭が英数字なので `.` 始まりは通らない）。
    - 読む値: `HKCU\Software\Classes\<ProgId>\shell\open\command`（既定値）、無ければ
      `HKLM\SOFTWARE\Classes\<ProgId>\shell\open\command`。
    - 先頭が `"` ならその次の `"` まで、そうでなければ最初の空白までを exe とする。
@@ -234,10 +235,13 @@ release gate（§9 S10）で `evidence` が `"measured"` になっているこ�
 
 ### 2.1 読み取り
 
-- ProgId: `HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoiceLatest\ProgId`
-  を先に読み、無ければ `...\https\UserChoice\ProgId`。どちらも読み取りのみ。
-  `UserChoiceLatest` の存在と意味は非公式情報（§0.3）なので、spike でテスト機の両方の値を
-  記録する。テスト機の `UserChoice` は `VivaldiHTM` [実測]。
+- ProgId: `HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\` 配下を読む。
+  先に **`UserChoiceLatest\ProgId` サブキーの値 `ProgId`**、無ければ **`UserChoice` の値 `ProgId`**
+  （`UserChoice` は ProgId を直接持つ）。どちらも読み取りのみ。実測（S2 実装時、Windows 11）:
+  `UserChoiceLatest` は `Hash` 値と `ProgId` サブキーを持ち、答えはそのサブキーの `ProgId` 値。
+  `UserChoiceLatest` の意味は非公式情報（§0.3）なので、spike でテスト機の両方の値を記録する
+  （実ブラウザーでの値の食い違いは UNVERIFIED）。テスト機の `UserChoice` は
+  `VivaldiHTM` [実測]。
 - 分類（`classifyDefaultBrowser` を表駆動に置き換え）:
   - 表の行の `progIdPattern` に一致 → `{ kind: "table", id }`（`verification` は別に見る）。
   - 既知の未検証 Chromium（Brave、Opera、Arc、Yandex、Chromium、Chrome Beta/Dev/Canary、
@@ -484,6 +488,10 @@ export interface CollectorIntegrationInspection {
 - どれかが `foreign` → `foreign`。
 - どれかが `ours` → `ours`（一部 `absent` を含む「混在」もここ）。
 - 全部 `absent`（`E` が空のときも）→ `absent`。
+- **policy-blocked のときの集計（実装 S3）:** 全ブラウザーが policy でブロックされると `E` は空になるが、
+  こちらの登録が残っていることがある。このとき `registration` の集計と「読めない target」による
+  `inspectionComplete` の判定は、`E` ではなく **`E_all`**（`verified` 行の `ownTargets` ∪
+  state の `registeredTargets`、policy・検出を無視）で行う。`E` の定義（§3.1）は変えない。
 
 ### 4.3 state file v2
 
@@ -494,8 +502,16 @@ export interface CollectorIntegrationInspection {
   "placedAt": "...", "registeredTargets": ["chrome", "edge"] }
 ```
 
-- `registeredTargets`: 直近の apply が書いて read-back で `ours` を確認した writable target
-  （表順、重複なし、既知の id のみ）。
+- `registeredTargets`: 直近の apply が書く writable target（表順、重複なし、既知の id のみ）。
+  - **実装（S4）との差:** 当初案は「read-back で `ours` を確認した target」だが、実装は
+    **「apply が責任を持った `E`（書込みが拒否・失敗した target も含む）∪ 直前の `registeredTargets`」**
+    を書く（試行した expected set。増える方向にのみ変わる。`ours` の確認とは別）。理由は、拒否された
+    書込みが次回 `outdated(registration-target-added)` になって、通知なしに起動のたびに自動 refresh を
+    繰り返すのを避け、`registration-missing`（repair 通知）に留めるため。
+  - **残る課題（M2、S10 前に解決）:** `when-present` 行の `E` への算入は `registeredTargets` を
+    見る（§3.1）ので、「試行した」が「登録済み」と混ざり、検出されなくなったブラウザーの行が `E` に
+    残り続ける恐れがある。S10 で `when-present` 行を有効にする前に、attempted（試行した `E`）と
+    confirmed（read-back で `ours`）を分ける必要がある。分け方は本書では決めない。
 - v1（5 フィールド）は読める: `registeredTargets = ["chrome"]` とみなす。書くのは常に v2。
 - パスも Shelf 情報も含まない（親設計 §8.6 を維持）。NSIS の検証も v1/v2 の両方を受ける（§6）。
 
@@ -516,6 +532,18 @@ export interface CollectorIntegrationInspection {
      増えた、または `when-present` のブラウザーが新しく入った）。WP-5c の自動 refresh が
      追加登録する（オーナー判断 Q2）。
    - 両方あれば `registration-missing` を優先（user-confirmed repair が両方を直す）。
+   - **foreign-registration 分岐（実装 S3/S4 判断 d）:** 追加される target（`registeredTargets` に無い
+     absent）を登録すると、あるブラウザーが現在使っている **foreign の登録を覆う** 場合
+     （Edge キーが absent で、foreign の Chromium フォールバックキー
+     `HKCU\Software\Chromium\...` がある。Edge の探索順は Edge → Chromium → Chrome）、
+     状態は `outdated` ではなく `foreign-registration`（reason `registration-foreign`）にする。
+     自動 refresh（Q2）はこの場合 payload も更新しない。repair 通知が出て、利用者が確認ダイアログで
+     切り替えるまで自動更新は止まる。判定は `registrationWouldShadowForeign`。探索順で最初に
+     present の鍵だけを見る。読めない鍵は foreign 扱い（fail closed、`damaged` にはしない）。
+   - **オーナー向け注記:** 現状 Edge 行は `unverified` なので `E` は Chrome のみで、この分岐は
+     働かない。**スパイク待ち**で Edge が `verified` になった時点で、Chromium キーに foreign を持つ
+     環境の更新は、repair 通知 → 確認が 1 回出るまで止まる。Edge を verified に切り替えるときに、
+     この挙動をオーナーに伝える。
 6. `ready` は「構造健全・payload 一致・ハッシュ一致・`E` が全部 ours」。
 
 reason の追加: `registration-target-added`（outdated 系）。`registration-absent` は既存。
@@ -540,6 +568,9 @@ reason の追加: `registration-target-added`（outdated 系）。`registration-
   出してはいけない。orchestrator は「apply 前後で `installed.payloadId` が変わったか」で
   updated 通知を決める（refresh 結果に `filesChanged: boolean` を足す案でもよい。前者を推奨:
   型を増やさない）。
+  - **実装（S6）:** `payloadId` の前後比較を採用。updated 通知は `payloadId` が変わったときだけ。
+    registration-only refresh（同じ payload）では出ず、保留中の updated 通知もそのまま残る。
+    apply 結果の `filesChanged`（S4 で追加）は S6 では使っていない。
 - 通知文言の「Chrome」をブラウザー名に置き換える（§7.5）。どのブラウザーかは Desktop が
   覚えている「最後に選んだブラウザー」（§7.4）を使い、無ければ「ブラウザー」と書く。
 - α1 通知: 「Chrome で読んでいる Web ページの引用を…」→「{対応ブラウザー一覧} で読んでいる
@@ -551,6 +582,9 @@ reason の追加: `registration-target-added`（outdated 系）。`registration-
   `removeRequested: true` を書き、`applied`/`partial` 以外（`refused`）で戻す
   （WP-7a の小改修、§9 S6）。単一キーの現行にも同じ穴があるので、本書の範囲では
   「推奨」として明記し、実施はオーナー判断 Q9。
+- **S6 の未実装分（S7 と連動する後続）:** 通知文言のブラウザー名化（現状の通知は「Chrome」のまま）、
+  通知状態 v2（`browser`）と v1→v2 の読み込み、Q9 の `removeRequested` 先行記録。
+  いずれも「最後に選んだブラウザー」（§7.4）が S7 で入ってから行う。
 
 ---
 
@@ -576,8 +610,12 @@ reason の追加: `registration-target-added`（outdated 系）。`registration-
   したがって **target 数が増えても、slot・manifest の書込み順（現行）を変えなければ I′ は
   すべてのクラッシュ点で保たれる**。
 - 追加の不変条件:
-  > **K:** `registeredTargets` ⊆ state file を書いた時点で ours だった target。
-  state file は registry 書込みと read-back の後に書くので成り立つ。registry 書込みの後・
+  > **K（当初案）:** `registeredTargets` ⊆ state file を書いた時点で ours だった target。
+  >
+  > **K（実装 S4）:** `registeredTargets` = 試行した `E` ∪ 直前の値。`ours` の部分集合では**ない**
+  > （書込みが拒否された target も入る。§4.3 の M2 を参照）。I′/J には影響しない
+  > （I′/J は registry の `ours` だけを見る）。
+  state file は registry 書込みと read-back の後に書く。registry 書込みの後・
   state file の前に落ちると「ours だが `registeredTargets` に無い」target ができるが、
   §4.4 の規則は absent の target にしか `registeredTargets` を見ないので無害。
 
@@ -600,6 +638,11 @@ extension、manifest 切替）。
    失敗した target は含めない（§4.4 により次回 `outdated(registration-target-added)` →
    自動 refresh で 1 回ずつ再試行される。再試行が拒否され続ける場合は、その refresh の
    `failed` が WP-5c で repair 通知になる）。
+   - **実装（S4）は上記と異なる:** `registeredTargets` = `E` 全体（拒否・失敗した target を含む）∪
+     直前の `registeredTargets`。拒否された target は次回 `registration-missing`（repair 通知、
+     自動 refresh しない）になり、「毎起動の無通知 refresh」を避ける。§4.3 / §5.1 K の注記を参照。
+     §5.3 の表で「一部の target を書いた後」の `outdated` 列も、拒否された target については
+     `registration-missing` と読み替える。
 10. self-check（現行どおり。1 回だけ）。
 
 結果（`CollectorApplyResult`）に追加:
@@ -635,6 +678,8 @@ readonly targets: readonly { readonly target: CollectorRegistryTargetId; readonl
   `installed.payloadId === descriptor.payloadId` のとき、step 5〜7（slot・extension・manifest）を
   省き、step 8〜10 だけを行う（「registration-only refresh」）。
   - 理由: 不要な slot 書込み・extension swap を避け、updated 通知の誤表示を避ける（§4.6）。
+  - 実装（S4/S6）: 結果は `filesChanged: false`。updated 通知は `payloadId` の変化だけで決まるので、
+    registration-only refresh では出ない。
   - `activeSlot`・`extensionVersion` は現行 state file の値を引き継ぎ、`placedAt` は更新しない
     （ファイルを置いていないため）。
 - payload も変わっているときは通常の refresh（step 1〜10）で、step 8 で同時に target を足す。
@@ -657,6 +702,11 @@ readonly targets: readonly { readonly target: CollectorRegistryTargetId; readonl
 4. 途中で落ちた場合: 一部の target が absent、state file は有効 → `registration-missing`。
    §4.6 の `removeRequested` 先行記録があれば repair 通知は出ない。利用者が remove をもう一度
    実行すれば収束する（残り target を消し、ファイルを消す）。
+5. **実装（S4）の確認と既知の未解決（記録のみ）:** remove が触るのは **writable target だけ**
+   （`chrome`, `edge`。表の `writable: true` から導出）。read-only target（`chromium` 等）は読みもしない。
+   read-only 側に `ours` があっても消さず、**警告も出さない**（コードに警告は無い）。
+   unregister が 1 つ失敗しても残りの target は試し、失敗が 1 つでもあればファイルは触らず
+   `failed`/`unregister-failed`。
 
 ### 5.6 guard と precondition
 
@@ -664,6 +714,10 @@ readonly targets: readonly { readonly target: CollectorRegistryTargetId; readonl
   `registration-changed` 相当の `expected-targets-changed` で止める。reason を 1 つ追加）、
   (c) 全 target の verdict snapshot 一致、(d) program folder の安全性、を検査する。
 - precondition の `foreign-confirmation-required` は「`E` に foreign があり、確認なし」。
+- **既知の未解決（記録のみ、S4）:** `guard` が比べるのは policy のブロック集合と、precondition で
+  読めた target ごとの verdict snapshot である。**検出（detection）由来の `E` の変化**（`when-present`
+  行のブラウザーが precondition の後に入った、等）は再確認しない。`when-present` 行が writable に
+  なるまで休眠しており（現状の writable な verified 行は `always` だけ）、S10 で足すときに再検討する。
 
 ### 5.7 フォールト注入テストの拡張（`collector-integration-apply-fault.test.ts`）
 
@@ -715,6 +769,10 @@ readonly targets: readonly { readonly target: CollectorRegistryTargetId; readonl
   `registeredTargets` は既知 id の重複なし配列、長さ ≤ writable 数）の両方を受けるように変える。
 - `${isUpdated}` ガードと `installMode == "CurrentUser"` だけで実行する規則は維持
   （all-users では何もしない）。
+- **実装（S5、`codex/mb-s5-nsis` ce75ffe）:** `apps/desktop/packaging/collector-uninstall.nsh`
+  （WP-8 の行の場所）に `MAGINALIA_COLLECTOR_HOST_KEY_CHROME` と `..._EDGE` を直書きし、Chrome と Edge の
+  両方を値一致で解除する。`un.MAGINALIA_HasValidState` は state v1（5 フィールド）と v2（+
+  `registeredTargets`）を受理する。整合テストは `collector-uninstall.test.ts`（§6.2）。
 
 ### 6.2 表を NSIS にどう持つか
 
@@ -859,7 +917,7 @@ readonly browsers: {
 | --- | --- | --- | --- | --- | --- |
 | **S0** | O | — | spike Phase 1（§10）: Edge と Chrome の確認、Vivaldi の探索順、UI ラベル撮影、既定ブラウザー値。 | §10.6 の記録が埋まる。PASS/FAIL/NOT VERIFIED。 | WP-2 の延長 |
 | **S1** | D | — | `collector-browser-table.ts`（純粋データ、§1.2〜1.4。Vivaldi は `unverified`）、`classifyDefaultBrowser` の表駆動化、`recommendCollectorBrowser`、`effectiveRegistration(lookupOrder, ownerships)` の純粋関数。配線はしない。 | 表の型・freeze・`verified` 行に `unverified` evidence が無いこと、ProgId 分類（`VivaldiHTM`, `MSEdgeHTM`, `ChromeHTML.X`, `MSEdgeBHTML`, `FirefoxURL-…`）、おすすめの全 `reason`、Edge の fallback 計算。import が無いことの source-scan。 | WP-5a（一部） |
-| **S2** | D | S1 | addon apiVersion 2（§3.2、target 表 `chrome`/`edge` writable、`chromium` read-only）、wrapper、adapter（`readCollectorHostRegistration(target)` 等、`readBrowserPolicies(root)`、`readBrowserAppPaths(appPathsName)`、`readDefaultBrowserProgId()` を `UserChoiceLatest` → `UserChoice` に、`readProgIdOpenCommand(progId)`）、fake adapter の target 化、TS↔C++ 整合テスト。 | 書込み関数は列挙外・read-only target を `invalid-argument`。product addon に test seam が無い（既存 test）。test seam target で register/inspect/unregister の値一致（現行 native test を target 別に）。CRT import 検査は現行どおり。 | WP-3 |
+| **S2** | D | S1 | addon apiVersion 2（§3.2、target 表 `chrome`/`edge` writable、`chromium` read-only）、wrapper、adapter（`readCollectorHostRegistration(target)` 等、`readBrowserPolicies(root)`、`readBrowserAppPaths(appPathsName)`、`readDefaultBrowserProgId()` を `UserChoiceLatest\ProgId` サブキー → `UserChoice` 値に、`readProgIdOpenCommand(progId)`）、fake adapter の target 化、TS↔C++ 整合テスト。 | 書込み関数は列挙外・read-only target を `invalid-argument`。product addon に test seam が無い（既存 test）。test seam target で register/inspect/unregister の値一致（現行 native test を target 別に）。CRT import 検査は現行どおり。 | WP-3 |
 | **S3** | D | S2 | `inspect` 改修（§4）: target 別所有、`E` の計算、集約規則、ブラウザー別検出（`locateBrowserExecutable`、§1.5 の優先規則）、行別 policy、state file v2 parse（v1 互換）、新 reason。`CollectorIntegrationInspection` の型変更。 | 7 状態すべてに到達する表駆動テストを target 別に拡張。§4.4 の 1〜6 の各分岐、v1 state + Chrome のみ → `outdated(registration-target-added)`、`registeredTargets` 内の absent → `registration-missing`、Edge の fallback 表示、Vivaldi 両 install で ProgId command が候補と一致するときその候補、一致しないとき HKCU App Paths。no env/cwd/argv の source-scan 維持。 | WP-5a |
 | **S4** | D | S3 | apply 改修（§5）: step 8/9、registration-only refresh、remove の target 別、guard snapshot、`targets` 結果、新 reason `expected-targets-changed`、state v2 書込み。フォールト注入の拡張（§5.7）。 | §5.7 のシナリオ 1〜9 が PASS。既存 apply テストが型変更以外で無変更に通る。 | WP-5b |
 | **S5** | D | S2, S4 | NSIS（§6）: Edge キーの値一致削除、state v1/v2 検証、3 言語整合テスト。 | `collector-uninstall.test.ts` に Edge ブロック・v2 受理・不正 v2（未知 id、重複、7 フィールド）拒否・整合テスト。`isUpdated`/`CurrentUser` ガードの既存検査を維持。 | WP-8 |
@@ -870,6 +928,19 @@ readonly browsers: {
 | **S10** | D (+C) | S0 Phase 2 | Vivaldi 有効化: 行の確定（§3.4 の 3 通りのどれか）、必要なら addon・NSIS に `vivaldi` target 追加、`ui.*` 確定、`verified` へ。全行の `ui.*` evidence を `measured` に。 | 表の release gate テストが通る。S2/S5 の整合テストが新 target を含めて通る。 | WP-3/5a/8 |
 | **S11** | D+O | S1〜S10 | E2E（親設計 §9.1 を 3 ブラウザーへ）: 各ブラウザーで setup→読み込み→接続確認→Desktop 停止中の保存、RC3 からの更新で Edge キー自動追加、remove、uninstall。 | PASS/FAIL/NOT VERIFIED を記録。モックで代替しない。 | WP-9 |
 | **S12** | I | S11 | plan 30・α profile・親設計への書き戻し（§12）。 | 実際の結果だけを DONE にする。 | WP-0/WP-10 |
+
+**S3〜S6 の実装状況（write-back。実装は各ブランチ。実ブラウザーでの確認はスパイク前なので UNVERIFIED）:**
+
+- S3 `codex/mb-s3-inspect` 1c3171a、S4 `codex/mb-s4-apply` 0eda4e1、S5 `codex/mb-s5-nsis` ce75ffe、
+  S6 `codex/mb-s6-notices` df3c66a（積み上げ式）。
+- S3/S4 で確定: `registeredTargets` は試行した `E`（§4.3。M2: S10 前に attempted と confirmed を分ける）、
+  foreign の Chromium フォールバックキーがあるときの `foreign-registration` 分岐（§4.4、判断 d）、
+  policy-blocked 時の `E_all` 集計（§4.2）。
+- S5: NSIS は Chrome・Edge の値一致解除、state v1/v2 受理（§6.1）。
+- S6 完了分: updated 通知は `payloadId` 変化時のみ（§4.6）。**未実装分**（通知文言のブラウザー名化、
+  通知状態 v2 `browser` と v1→v2 読み込み、Q9 の `removeRequested` 先行記録）は S7 と連動する後続。
+- Edge 行は `unverified` のまま（スパイク待ち）。Vivaldi の結論もスパイク待ち。
+- 既知の未解決: §5.5（read-only target の ours は消さず警告も無い）、§5.6（検出由来の `E` 変化の再確認なし）。
 
 順序の提案: **S0 と S1 を並行** → S2 → S3 → S4 → S5 と S6（並行可）→ S7 → S8・S9（並行）→
 S10 → S11 → S12。Chrome+Edge は Edge が文書で裏付けられているので S0 を待たずに S2〜S7 を
