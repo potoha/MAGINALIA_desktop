@@ -15,7 +15,7 @@ import { applyCollectorIntegration } from "./collector-integration-apply";
 import type { CollectorApplyRequest, CollectorApplyResult } from "./collector-integration-apply-types";
 import { expectedHostManifest, inspectCollectorIntegration, parseIntegrationStateFile } from "./collector-integration";
 import { COLLECTOR_HOST_EXECUTABLE_NAME } from "./collector-payload";
-import { HOST_SOURCE_FILES, SOURCE_EXTENSION_FOLDER, SOURCE_HOST_FOLDER, applyDescriptor, createApplyFixture, extensionSourceFiles, type ApplyFixture } from "./collector-integration-apply.test-helper";
+import { HOST_SOURCE_FILES, SOURCE_EXTENSION_FOLDER, SOURCE_HOST_FOLDER, applyDescriptor, createApplyFixture, extensionSourceFiles, tableWithVerified, type ApplyFixture } from "./collector-integration-apply.test-helper";
 import { fakeKey, sha256 } from "./collector-integration.test-helper";
 import { COLLECTOR_HOST_ADDON_NAME } from "./collector-payload";
 
@@ -53,6 +53,8 @@ function allowedRoots(fixture: ApplyFixture): string[] {
   return [fakeKey(fixture.programFolder), fakeKey(fixture.applicationRoot)];
 }
 
+const WRITABLE_TARGETS = ["chrome", "edge"] as const;
+
 /** Contents a Host file may legitimately have at any point: the packaged bytes of either payload. */
 const HOST_BYTES_ACCEPTABLE = [HOST_SOURCE_FILES[COLLECTOR_HOST_EXECUTABLE_NAME] as string, "host-executable-bytes-v2", HOST_SOURCE_FILES[COLLECTOR_HOST_ADDON_NAME] as string];
 
@@ -63,7 +65,8 @@ const HOST_BYTES_ACCEPTABLE = [HOST_SOURCE_FILES[COLLECTOR_HOST_EXECUTABLE_NAME]
  * scenario started (for example a tampered file that a repair is meant to fix).
  */
 function assertPointedSlotComplete(fixture: ApplyFixture, label: string, tolerated: readonly string[] = []): void {
-  if (fixture.registry.registration !== "ours") return;
+  // Design 5.1, I': ANY target that is ours (J: every ours value is the same manifest path, so one manifest decides).
+  if (!WRITABLE_TARGETS.some((target) => fixture.registry.registrations[target] === "ours")) return;
   const manifestPath = p(fixture, "org.maginalia.collector.json");
   if (!fixture.fileSystem.has(manifestPath)) return;
   const manifest = JSON.parse(fixture.fileSystem.text(manifestPath)) as unknown;
@@ -96,8 +99,10 @@ function assertInvariants(fixture: ApplyFixture, before: Map<string, string>, la
     if (allowedRoots(fixture).some((root) => key === root || key.startsWith(`${root}\\`))) continue;
     expect(fixture.fileSystem.snapshot().has(key), `${label}: lost ${key}`).toBe(true);
   }
-  // the registry only ever holds our value or nothing, never a foreign one
-  expect(fixture.registry.registration, label).not.toBe("foreign");
+  // the registry only ever holds our value or nothing, never a foreign one (these scenarios seed no foreign key)
+  for (const target of WRITABLE_TARGETS) expect(fixture.registry.registrations[target], `${label}: ${target}`).not.toBe("foreign");
+  // the read-only lookup key is never written
+  expect(fixture.registry.registrations.chromium, label).toBe("absent");
 }
 
 /** The single deterministic recovery step for whatever state the fault left behind. */
@@ -383,5 +388,201 @@ describe("faults around the registry", () => {
     expect(inspection.state).toBe("damaged");
     expect(inspection.reasons).toContain("extension-version-mismatch");
     await recover(fixture, "between swap and manifest");
+  });
+});
+
+// ----- Multi-browser (design 5.7 scenarios 1, 3, 4, 5): Chrome + Edge verified ---------------------
+// The fake registry counts every register / unregister as a mutation (`registryMutation`), so a crash
+// or a single failure can land between two registry writes, or between a registry write and the state file.
+
+const CHROME_EDGE = tableWithVerified("chrome", "edge");
+const bothFixture = (): ApplyFixture => createApplyFixture({ browserTable: CHROME_EDGE });
+const slotOrExtensionOrManifest = /host-[ab]|extension|org\.maginalia\.collector\.json/u;
+
+async function installedBoth(): Promise<ApplyFixture> {
+  const fixture = bothFixture();
+  expect((await run(fixture, { action: "setup" })).outcome).toBe("applied");
+  return fixture;
+}
+
+/** An RC3 installation (Chrome only, v1 state) after the table grew to Chrome + Edge. */
+async function rc3(): Promise<ApplyFixture> {
+  const fixture = createApplyFixture();
+  expect((await run(fixture, { action: "setup" })).outcome).toBe("applied");
+  const state = JSON.parse(fixture.fileSystem.text(p(fixture, "integration-state.json"))) as Record<string, unknown>;
+  delete state.registeredTargets;
+  fixture.fileSystem.setBytes(p(fixture, "integration-state.json"), `${JSON.stringify({ ...state, version: 1 }, null, 2)}\n`);
+  fixture.browserTable = CHROME_EDGE;
+  return fixture;
+}
+
+async function rc3WithNewerPayload(): Promise<ApplyFixture> {
+  const fixture = await rc3();
+  fixture.fileSystem.setBytes(path.win32.join(SOURCE_HOST_FOLDER, COLLECTOR_HOST_EXECUTABLE_NAME), "host-executable-bytes-v2");
+  fixture.payload = applyDescriptor({ payloadId: "1.3.0+def5678", hostVersion: "1.3.0", extensionVersion: "0.4.0", host: { ...HOST_SOURCE_FILES, [COLLECTOR_HOST_EXECUTABLE_NAME]: "host-executable-bytes-v2" } });
+  for (const [name, content] of Object.entries(extensionSourceFiles("0.4.0"))) fixture.fileSystem.setBytes(path.win32.join(SOURCE_EXTENSION_FOLDER, ...name.split("/")), content);
+  return fixture;
+}
+
+describe("scenario 1: first setup (Chrome + Edge), a crash or failure at every mutation including the two registry writes", () => {
+  it("crash after each mutation: invariant I' holds and one step recovers", async () => {
+    const total = await countMutations(async () => bothFixture(), { action: "setup" });
+    const single = await countMutations(async () => createApplyFixture(), { action: "setup" });
+    expect(total).toBe(single + 1); // exactly one more mutation: the Edge registry write
+    for (let step = 0; step < total; step += 1) {
+      const fixture = bothFixture();
+      const before = fixture.fileSystem.snapshot();
+      fixture.fileSystem.crashAfter = step;
+      const result = await run(fixture, { action: "setup" });
+      const label = `S1 crash after mutation ${step}`;
+      expect(["applied", "failed", "refused"], label).toContain(result.outcome);
+      assertInvariants(fixture, before, label);
+      // a browser only ever sees a registration once manifest and slot are complete
+      if (WRITABLE_TARGETS.some((target) => fixture.registry.registrations[target] === "ours")) {
+        expect(fixture.fileSystem.has(p(fixture, "org.maginalia.collector.json")), label).toBe(true);
+        expect(fixture.fileSystem.has(p(fixture, "host-a", COLLECTOR_HOST_EXECUTABLE_NAME)), label).toBe(true);
+      }
+      const state = (await inspectCollectorIntegration(fixture.deps)).state;
+      expect(["not-set-up", "damaged", "registration-missing"], `${label}: ${state}`).toContain(state);
+      await recover(fixture, label);
+      expect(fixture.registry.registrations, label).toMatchObject({ chrome: "ours", edge: "ours" });
+    }
+  });
+
+  it("the crash between the two registry writes leaves Chrome ours, Edge absent and no state file: repaired in one step", async () => {
+    const fixture = bothFixture();
+    fixture.fileSystem.crashAfter = (await countMutations(async () => bothFixture(), { action: "setup" })) - 3; // after `register chrome`
+    const result = await run(fixture, { action: "setup" });
+    expect(result.outcome).toBe("failed");
+    expect(fixture.fileSystem.registryLog).toEqual(["register chrome"]);
+    expect(fixture.registry.registrations).toMatchObject({ chrome: "ours", edge: "absent" });
+    const inspection = await inspectCollectorIntegration(fixture.deps);
+    expect(inspection).toMatchObject({ state: "damaged", reasons: ["state-file-missing"] });
+    await recover(fixture, "between the registry writes");
+  });
+
+  it("a single failed mutation at each step is reported, leaves valid files, and a second run converges", async () => {
+    const total = await countMutations(async () => bothFixture(), { action: "setup" });
+    for (let step = 1; step <= total; step += 1) {
+      const fixture = bothFixture();
+      const before = fixture.fileSystem.snapshot();
+      fixture.fileSystem.failAt = step;
+      const result = await run(fixture, { action: "setup" });
+      const label = `S1 failure of mutation ${step}`;
+      expect(["applied", "failed", "refused"], label).toContain(result.outcome);
+      assertInvariants(fixture, before, label);
+      if (result.outcome === "failed") expect(result.reason, label).not.toBeNull();
+      await recover(fixture, label);
+    }
+  });
+});
+
+describe("scenario 3: RC3 installation (v1 state, Chrome only) gains the Edge target by a registration-only refresh", () => {
+  it("crash after each mutation: no slot / extension / manifest mutation ever happens and one step recovers", async () => {
+    const total = await countMutations(rc3, { action: "refresh" });
+    expect(total).toBe(3); // register edge, state temp write, state rename
+    for (let step = 0; step < total; step += 1) {
+      const fixture = await rc3();
+      const before = fixture.fileSystem.snapshot();
+      fixture.fileSystem.mutations.length = 0;
+      fixture.fileSystem.crashAfter = fixture.fileSystem.mutationCount + step;
+      const result = await run(fixture, { action: "refresh" });
+      const label = `S3 crash after mutation ${step}`;
+      expect(["applied", "failed", "refused"], label).toContain(result.outcome);
+      assertInvariants(fixture, before, label);
+      expect(result.filesChanged, label).toBe(false);
+      expect(fixture.fileSystem.mutations.some((entry) => slotOrExtensionOrManifest.test(entry)), label).toBe(false);
+      // Chrome kept its key and its Host the whole time
+      expect(fixture.registry.registrations.chrome, label).toBe("ours");
+      await recover(fixture, label);
+      expect(fixture.registry.registrations.edge, label).toBe("ours");
+    }
+  });
+
+  it("a single failed mutation at each step converges with the next run", async () => {
+    const total = await countMutations(rc3, { action: "refresh" });
+    for (let step = 1; step <= total; step += 1) {
+      const fixture = await rc3();
+      const before = fixture.fileSystem.snapshot();
+      fixture.fileSystem.failAt = fixture.fileSystem.mutationCount + step;
+      await run(fixture, { action: "refresh" });
+      assertInvariants(fixture, before, `S3 failure of mutation ${step}`);
+      await recover(fixture, `S3 failure of mutation ${step}`);
+    }
+  });
+});
+
+describe("scenario 4: a payload update and a new target in the same refresh", () => {
+  it("crash after each mutation: the previous Host keeps working until the manifest switch, and one step recovers", async () => {
+    const total = await countMutations(rc3WithNewerPayload, { action: "refresh" });
+    expect(total).toBeGreaterThan(20);
+    for (let step = 0; step < total; step += 1) {
+      const fixture = await rc3WithNewerPayload();
+      const before = fixture.fileSystem.snapshot();
+      fixture.fileSystem.crashAfter = fixture.fileSystem.mutationCount + step;
+      const result = await run(fixture, { action: "refresh" });
+      const label = `S4 crash after mutation ${step}`;
+      expect(["applied", "failed", "refused"], label).toContain(result.outcome);
+      assertInvariants(fixture, before, label);
+      expect(fixture.registry.registrations.chrome, label).toBe("ours"); // never removed, never rolled back
+      await recover(fixture, label);
+      expect((await inspectCollectorIntegration(fixture.deps)).installed.payloadId, label).toBe("1.3.0+def5678");
+      expect(fixture.registry.registrations.edge, label).toBe("ours");
+    }
+  }, 120_000);
+
+  it("a single failed mutation at each step never loses the previous extension folder and converges", async () => {
+    const total = await countMutations(rc3WithNewerPayload, { action: "refresh" });
+    for (let step = 1; step <= total; step += 1) {
+      const fixture = await rc3WithNewerPayload();
+      const before = fixture.fileSystem.snapshot();
+      fixture.fileSystem.failAt = fixture.fileSystem.mutationCount + step;
+      await run(fixture, { action: "refresh" });
+      const label = `S4 failure of mutation ${step}`;
+      assertInvariants(fixture, before, label);
+      expect(fixture.fileSystem.has(p(fixture, "extension", "manifest.json")) || fixture.fileSystem.has(p(fixture, "extension.prev", "manifest.json")), label).toBe(true);
+      await recover(fixture, label);
+    }
+  }, 120_000);
+});
+
+describe("scenario 5: remove across targets", () => {
+  it("crash after each mutation (including between the two unregisters): a key that is still ours always has a complete Host, and a second remove converges", async () => {
+    const total = await countMutations(installedBoth, { action: "remove" });
+    expect(total).toBeGreaterThan(5);
+    for (let step = 0; step < total; step += 1) {
+      const fixture = await installedBoth();
+      const before = fixture.fileSystem.snapshot();
+      fixture.fileSystem.crashAfter = fixture.fileSystem.mutationCount + step;
+      const result = await run(fixture, { action: "remove" });
+      const label = `S5 crash after mutation ${step}`;
+      expect(["applied", "failed", "partial", "refused", "noop"], label).toContain(result.outcome);
+      assertPointedSlotComplete(fixture, label);
+      expect(fixture.registry.registrations.chromium, label).toBe("absent");
+      // nothing outside the program folder and the integration folders changed
+      for (const [key, value] of fixture.fileSystem.snapshot()) {
+        if (allowedRoots(fixture).some((root) => key === root || key.startsWith(`${root}\\`))) continue;
+        expect(before.get(key), `${label}: ${key}`).toBe(value);
+      }
+      fixture.fileSystem.crashAfter = null;
+      fixture.fileSystem.failAt = null;
+      const again = await run(fixture, { action: "remove" });
+      expect(["applied", "noop"], `${label}: second remove -> ${again.outcome}/${again.reason}`).toContain(again.outcome);
+      expect(fixture.registry.registrations, label).toMatchObject({ chrome: "absent", edge: "absent" });
+      expect(fixture.fileSystem.has(fixture.programFolder), label).toBe(false);
+    }
+  });
+
+  it("the second unregister denied: files untouched, the first key stays removed, the second remove converges", async () => {
+    const fixture = await installedBoth();
+    fixture.registry.unregisterOutcomes.chrome = "access-denied"; // Chrome is unregistered last (reverse order)
+    const snapshot = fixture.fileSystem.snapshot();
+    const result = await run(fixture, { action: "remove" });
+    expect(result).toMatchObject({ outcome: "failed", reason: "unregister-failed" });
+    expect(fixture.registry.registrations).toMatchObject({ chrome: "ours", edge: "absent" });
+    expect(fixture.fileSystem.snapshot()).toEqual(snapshot);
+    assertPointedSlotComplete(fixture, "after denied unregister");
+    delete fixture.registry.unregisterOutcomes.chrome;
+    expect((await run(fixture, { action: "remove" })).outcome).toBe("applied");
   });
 });
