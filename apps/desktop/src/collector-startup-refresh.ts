@@ -225,6 +225,13 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
         return finish("refresh-failed");
       }
       if (result.outcome === "applied") {
+        // Announce only when the placed payload changed (design 4.6 / 5.4). A registration-only refresh
+        // adds registry keys and leaves the payloadId alone: nothing new to tell the user, and any
+        // pending "updated" notice stays as it is.
+        if (result.inspection.installed.payloadId === inspection.installed.payloadId) {
+          showUpdated((await mutate(() => undefined)).state);
+          return finish("refreshed");
+        }
         const createdAt = deps.now().toISOString();
         const extensionVersion = result.inspection.installed.extensionVersion;
         const after = await mutate((current) => extensionVersion !== null ? { ...current, updated: { extensionVersion, createdAt } } : undefined);

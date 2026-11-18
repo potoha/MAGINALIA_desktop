@@ -117,6 +117,46 @@ describe("automatic refresh (design 6.2)", () => {
     expect(r.store.state.updated).toEqual({ extensionVersion: "0.4.0", createdAt: T0 });
   });
 
+  describe("registration-only refresh (payloadId unchanged, multi-browser S6)", () => {
+    const sameInstalled = { payloadId: "1.2.0+abc1234", activeSlot: "a", hostVersion: "1.2.0", extensionVersion: "0.3.0" } as const;
+    function registrationOnly(): Rig {
+      const r = rig("outdated");
+      r.current = inspection("outdated", { installed: sameInstalled });
+      r.applyOutcome = { ...applyResult("applied"), inspection: inspection("ready", { installed: sameInstalled }) };
+      return r;
+    }
+
+    it("applies but raises no updated notice and persists nothing", async () => {
+      const r = registrationOnly();
+      const result = await createCollectorStartupRefresh(r.deps).runStartup();
+      expect(r.applies).toEqual([{ action: "refresh" }]);
+      expect(result.outcome).toBe("refreshed");
+      expect(kinds(result.notices)).toEqual([]);
+      expect(r.store.state.updated).toBeNull();
+      expect(r.store.writes).toEqual([]);
+    });
+
+    it("stays quiet across repeated starts", async () => {
+      const r = registrationOnly();
+      for (let launch = 0; launch < 3; launch += 1) {
+        r.current = inspection("outdated", { installed: sameInstalled });
+        const result = await createCollectorStartupRefresh(r.deps).runStartup();
+        expect(kinds(result.notices)).toEqual([]);
+      }
+      expect(r.applies).toHaveLength(3);
+      expect(r.store.state.updated).toBeNull();
+    });
+
+    it("keeps an already pending updated notice as it was, without renewing it", async () => {
+      const r = registrationOnly();
+      const pending = { extensionVersion: "0.3.0", createdAt: "2026-11-15T09:00:00.000Z" };
+      r.store.state = { ...DEFAULT_COLLECTOR_NOTICE_STATE, updated: pending };
+      const result = await createCollectorStartupRefresh(r.deps).runStartup();
+      expect(kinds(result.notices)).toEqual(["updated"]);
+      expect(r.store.state.updated).toEqual(pending);
+    });
+  });
+
   it.each(["foreign-registration", "registration-missing", "damaged"] as const)("never refreshes or repairs %s by itself; it raises a repair notice", async (state) => {
     const r = rig(state);
     const result = await createCollectorStartupRefresh(r.deps).runStartup();
