@@ -36,7 +36,7 @@ function inspection(state: CollectorIntegrationState = "ready", overrides: Parti
 
 function applyResult(action: CollectorApplyResult["action"], outcome: CollectorApplyResult["outcome"] = "applied", reason: CollectorApplyResult["reason"] = null): CollectorApplyResult {
   const post = inspection(action === "remove" ? "not-set-up" : "ready");
-  return { action, outcome, reason, warnings: [], state: post.state, selfCheck: "skipped", inspection: post };
+  return { action, outcome, reason, warnings: [], targets: [], filesChanged: false, state: post.state, selfCheck: "skipped", inspection: post };
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {

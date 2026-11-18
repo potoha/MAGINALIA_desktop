@@ -475,6 +475,31 @@ function aggregatePolicy(
   });
 }
 
+/**
+ * Would registering `target` make some verified row stop using a FOREIGN registration it uses today?
+ * (Edge looks up its own key first, then the Chromium key, then the Chrome key; a foreign Chromium
+ * key is what Edge uses while its own key is absent.) Only the first present key after `target` in
+ * a row's lookup order counts, exactly as the browser reads it. Setup/repair accept this shadowing
+ * after the user confirmed (design 11.1); an automatic refresh must not do it silently.
+ */
+export function registrationWouldShadowForeign(
+  table: readonly CollectorBrowserSpec[],
+  target: CollectorRegistryTargetId,
+  ownerships: TargetOwnerships,
+): boolean {
+  for (const row of table) {
+    if (row.verification !== "verified" || !row.nativeMessaging.ownTargets.includes(target)) continue;
+    const order = row.nativeMessaging.lookupOrder;
+    for (const next of order.slice(order.indexOf(target) + 1)) {
+      const ownership = ownerships[next] ?? "unknown";
+      if (ownership === "absent") continue;
+      if (ownership === "foreign") return true;
+      break;
+    }
+  }
+  return false;
+}
+
 function sameTargets(left: readonly CollectorRegistryTargetId[], right: readonly CollectorRegistryTargetId[]): boolean {
   return left.length === right.length && left.every((target, index) => target === right[index]);
 }
@@ -946,6 +971,12 @@ export async function inspectCollectorIntegration(
                 // Healthy installation, but a registration that was made is gone: never repaired silently.
                 state = "registration-missing";
                 sink.add("registration-absent");
+              } else if (addedTargets.some((target) => registrationWouldShadowForeign(table, target, ownerships))) {
+                // The new registration would take over from a foreign one that a browser uses now
+                // (Edge key absent, a foreign Chromium key present). Never done by an automatic refresh:
+                // the repair notice asks first (design 11.1; S4 decision d).
+                state = "foreign-registration";
+                sink.add("registration-foreign");
               } else if (payloadDiffers || addedTargets.length > 0) {
                 state = "outdated";
                 if (payloadDiffers) {

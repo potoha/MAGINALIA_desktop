@@ -131,12 +131,15 @@ describe("setup from nothing (design 3.5 order of side effects)", () => {
     expect(fixture.registry.registration).toBe("ours");
   });
 
-  it("writes the generated manifest and a state file of exactly five fields", async () => {
+  it("writes the generated manifest and a v2 state file of exactly six fields", async () => {
     const fixture = createApplyFixture();
     await run(fixture, { action: "setup" });
     expect(JSON.parse(fixture.fileSystem.text(p(fixture, "org.maginalia.collector.json")))).toEqual(expectedHostManifest("a"));
+    expect(JSON.parse(fixture.fileSystem.text(p(fixture, "integration-state.json")))).toEqual({
+      version: 2, payloadId: "1.2.0+abc1234", activeSlot: "a", extensionVersion: "0.3.0", placedAt: fixture.now.toISOString(), registeredTargets: ["chrome"],
+    });
     const state = parseIntegrationStateFile(fixture.fileSystem.text(p(fixture, "integration-state.json")));
-    expect(state).toEqual({ version: 1, payloadId: "1.2.0+abc1234", activeSlot: "a", extensionVersion: "0.3.0", placedAt: fixture.now.toISOString(), registeredTargets: ["chrome"] });
+    expect(state).toEqual({ version: 2, payloadId: "1.2.0+abc1234", activeSlot: "a", extensionVersion: "0.3.0", placedAt: fixture.now.toISOString(), registeredTargets: ["chrome"] });
   });
 
   it("leaves no temp name behind", async () => {

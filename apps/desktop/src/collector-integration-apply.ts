@@ -34,20 +34,30 @@
  *    and `extension.prev`; anything else in the folder is the user's and must be left alone.
  *
  * Order of side effects for setup / repair / refresh (each step is verified before the next):
- *  1. preconditions (inspect; E2E isolation; policy; payload; state matrix; foreign confirmation)
+ *  1. preconditions (inspect; E2E isolation; policy; payload; state matrix; foreign confirmation).
+ *     The inspection also fixes the expected set E (design 3.1) and a per-target ownership snapshot;
+ *     every guard re-reads each target and stops on any difference (design 3.3, 5.6).
  *  2. program folder (protected DACL; parents checked; existing unsafe folder is never re-permissioned)
  *  3. integration folder (protected DACL) and stale contact temp files
  *  4. recover a pending extension swap; guard re-check
  *  5. write the INACTIVE Host slot (exclusive temp, hash of written bytes, rename, re-read hash)
  *  6. stage `extension.next`, verify manifest key -> ID and every file hash, swap folders
  *  7. guard re-check (point of no return), then write the manifest (temp + rename) for the new slot
- *  8. registry (setup/repair only), then read back: ownership `ours`
- *  9. `integration-state.json` (temp + rename)
+ *  8. registry, one target at a time (design 5.2): `absent` is registered, a confirmed `foreign` value
+ *     is replaced, each write is read back (`ours`). A refused or failed target is recorded and the
+ *     next target is still tried. A refresh only registers targets that were never registered before.
+ *  9. `integration-state.json` v2 with `registeredTargets` (temp + rename)
  * 10. Host self-check. The previous slot is NOT pruned: it stays complete until the next update
  *     writes it (design 6.3), so a Chrome that still runs the old Host keeps working.
  *
- * Remove: value-matched unregister first (a foreign value is left alone; this also runs when the
- * program folder is unsafe, in which case nothing on disk is touched and the outcome is `partial`),
+ * Registration-only refresh (design 5.4): state `outdated` for the single reason
+ * `registration-target-added` with the same payload: steps 2-7 and the extension swap are skipped,
+ * only steps 8-10 run, and the result reports `filesChanged: false`.
+ *
+ * Remove: every WRITABLE target (not only E), read fresh and value-matched, reverse registry order; a
+ * foreign value is left alone, an unreadable key refuses the run before anything changed, and a key that
+ * cannot be removed keeps all files (this also runs when the program folder is unsafe, in which case
+ * nothing on disk is touched and the outcome is `partial`),
  * then ONLY names we own: the manifest, the slots' fixed file names (and our private temp names), the
  * files the packaged descriptor lists in the extension folders, the state file, then a
  * non-recursive rmdir. Unknown entries (user files, files of an older extension version) stay and
@@ -85,6 +95,14 @@ import {
   type CollectorPayloadDescriptor,
 } from "./collector-payload.js";
 import {
+  COLLECTOR_BROWSERS,
+  COLLECTOR_REGISTRY_TARGETS,
+  COLLECTOR_REGISTRY_TARGET_IDS,
+  type CollectorBrowserId,
+  type CollectorBrowserSpec,
+  type CollectorRegistryTargetId,
+} from "./collector-browser-table.js";
+import {
   COLLECTOR_EXTENSION_FOLDER_NAME,
   COLLECTOR_HOST_SLOTS,
   COLLECTOR_STATE_FILE_NAME,
@@ -97,6 +115,7 @@ import {
   parseIntegrationStateFile,
   type CollectorHostSlot,
   type IntegrationPaths,
+  type IntegrationStateFile,
 } from "./collector-integration.js";
 import { inspectAndEvaluatePathSecurity } from "./collector-path-security.js";
 import {
@@ -110,6 +129,7 @@ import {
   type CollectorApplyReason,
   type CollectorApplyRequest,
   type CollectorApplyResult,
+  type CollectorApplyTargetResult,
   type CollectorApplyWarning,
   type CollectorApplyOutcome,
   type CollectorIntegrationApplyDependencies,
@@ -172,13 +192,19 @@ function manifestBytes(slot: CollectorHostSlot, programFolder: string): Uint8Arr
   return new TextEncoder().encode(`${JSON.stringify(buildCollectorHostManifest(slot, programFolder), null, 2)}\n`);
 }
 
-function stateBytes(descriptor: CollectorPayloadDescriptor, slot: CollectorHostSlot, now: Date): Uint8Array {
+/** State file v2 (design 4.3). Always written as v2; v1 is only ever read. */
+function stateBytes(
+  fields: { readonly payloadId: string; readonly extensionVersion: string; readonly placedAt: string },
+  slot: CollectorHostSlot,
+  registeredTargets: readonly CollectorRegistryTargetId[],
+): Uint8Array {
   return new TextEncoder().encode(`${JSON.stringify({
-    version: 1,
-    payloadId: descriptor.payloadId,
+    version: 2,
+    payloadId: fields.payloadId,
     activeSlot: slot,
-    extensionVersion: descriptor.extension.version,
-    placedAt: now.toISOString(),
+    extensionVersion: fields.extensionVersion,
+    placedAt: fields.placedAt,
+    registeredTargets,
   }, null, 2)}\n`);
 }
 
@@ -323,22 +349,75 @@ async function ensureIntegrationDirectory(context: Context): Promise<void> {
 
 // ----- Guard (re-evaluated before the first write and before the point of no return) --------
 
-async function guard(context: Context, expectedRegistration: HostRegistrationOwnership, options: { readonly folderExists: boolean }): Promise<void> {
+/**
+ * What the precondition inspection saw, per registry target (design 3.3, 5.6). The guard compares
+ * the live registry against exactly this: a target that changed since the user confirmed (for
+ * example a replacement confirmed for Edge while Chrome turned foreign meanwhile) is never touched.
+ */
+interface TargetPlan {
+  readonly table: readonly CollectorBrowserSpec[];
+  /** The expected set E (design 3.1), registry order. */
+  readonly expected: readonly CollectorRegistryTargetId[];
+  /** Ownership of every target the inspection could read (an `unknown` target is not compared). */
+  readonly snapshot: Readonly<Partial<Record<CollectorRegistryTargetId, HostRegistrationOwnership>>>;
+  /** `registeredTargets` of the state file the inspection read (empty when none). */
+  readonly registered: readonly CollectorRegistryTargetId[];
+  /** Verified browsers whose policy blocked per-user hosts at the precondition. */
+  readonly blockedBrowsers: readonly CollectorBrowserId[];
+}
+
+const WRITABLE_TARGET_IDS: readonly CollectorRegistryTargetId[] = COLLECTOR_REGISTRY_TARGET_IDS.filter((id) => COLLECTOR_REGISTRY_TARGETS.some((target) => target.id === id && target.writable));
+
+/** Verified rows that a policy blocks right now. A policy that cannot be read never blocks (design 8.4). */
+function readBlockedBrowsers(deps: CollectorIntegrationApplyDependencies, table: readonly CollectorBrowserSpec[]): { readonly blocked: readonly CollectorBrowserId[]; readonly verified: number } {
+  const blocked: CollectorBrowserId[] = [];
+  let verified = 0;
+  for (const row of table) {
+    if (row.verification !== "verified") continue;
+    verified += 1;
+    if (row.policyRoot === null) continue;
+    try {
+      if (evaluateChromePolicies(deps.registry.readBrowserPolicies(row.policyRoot)).blocked) blocked.push(row.id);
+    } catch {
+      // not blocked by itself
+    }
+  }
+  return { blocked, verified };
+}
+
+function buildTargetPlan(deps: CollectorIntegrationApplyDependencies, first: CollectorIntegrationInspection): TargetPlan {
+  const table = deps.browserTable ?? COLLECTOR_BROWSERS;
+  const snapshot: Partial<Record<CollectorRegistryTargetId, HostRegistrationOwnership>> = {};
+  for (const target of COLLECTOR_REGISTRY_TARGET_IDS) {
+    const ownership = first.registrations[target];
+    if (ownership !== "unknown") snapshot[target] = ownership;
+  }
+  return Object.freeze({
+    table,
+    expected: first.expectedTargets,
+    snapshot: Object.freeze(snapshot),
+    registered: first.registeredTargets ?? [],
+    blockedBrowsers: Object.freeze(first.browsers.entries.filter((entry) => entry.verification === "verified" && entry.policy.blocked).map((entry) => entry.id)),
+  });
+}
+
+async function guard(context: Context, plan: TargetPlan, options: { readonly folderExists: boolean }): Promise<void> {
   const { deps, paths } = context;
   if (deps.e2eIsolationActive) throw new Abort("e2e-isolation");
-  try {
-    if (evaluateChromePolicies(deps.registry.readBrowserPolicies("Google\\Chrome")).blocked) throw new Abort("policy-blocked");
-  } catch (error: unknown) {
-    if (error instanceof Abort) throw error;
-    // Unreadable policies never block by themselves (design 8.4: Chrome is the authority).
+  const { blocked, verified } = readBlockedBrowsers(deps, plan.table);
+  if (verified > 0 && blocked.length === verified) throw new Abort("policy-blocked");
+  // A browser became (un)blocked: E is no longer the set the user confirmed.
+  if (blocked.length !== plan.blockedBrowsers.length || blocked.some((id) => !plan.blockedBrowsers.includes(id))) throw new Abort("expected-targets-changed");
+  // Every target, read fresh: one that changed since the precondition stops the run (never overwritten).
+  for (const [target, expected] of Object.entries(plan.snapshot) as Array<[CollectorRegistryTargetId, HostRegistrationOwnership]>) {
+    let ownership: HostRegistrationOwnership;
+    try {
+      ownership = deps.registry.readCollectorHostRegistration(target);
+    } catch {
+      throw new Abort("inspection-incomplete");
+    }
+    if (ownership !== expected) throw new Abort("registration-changed");
   }
-  let registration: HostRegistrationOwnership;
-  try {
-    registration = deps.registry.readCollectorHostRegistration("chrome");
-  } catch {
-    throw new Abort("inspection-incomplete");
-  }
-  if (registration !== expectedRegistration) throw new Abort("registration-changed");
   if (options.folderExists) requireSafeDirectory(context, paths.programFolder);
 }
 
@@ -388,21 +467,26 @@ async function requireRecognizedExtensionContent(context: Context, directory: st
   }
 }
 
+/** The parsed `integration-state.json` when it is a readable, valid plain file; otherwise `undefined`. */
+async function readValidStateFile(context: Context): Promise<IntegrationStateFile | undefined> {
+  const { fileSystem } = context.deps;
+  try {
+    const entry = await fileSystem.stat(context.paths.statePath);
+    if (entry === null || entry.isReparsePoint || entry.kind !== "file") return undefined;
+    const read = await fileSystem.readSmallFile(context.paths.statePath, MAX_STATE_BYTES);
+    if (read.kind !== "ok") return undefined;
+    return parseIntegrationStateFile(new TextDecoder("utf-8", { fatal: true }).decode(read.bytes));
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Ownership evidence: a readable, valid `integration-state.json` (a plain file) in the program
  * folder. Callers have already verified that the folder is a safe, protected directory.
  */
 async function hasValidStateFile(context: Context): Promise<boolean> {
-  const { fileSystem } = context.deps;
-  try {
-    const entry = await fileSystem.stat(context.paths.statePath);
-    if (entry === null || entry.isReparsePoint || entry.kind !== "file") return false;
-    const read = await fileSystem.readSmallFile(context.paths.statePath, MAX_STATE_BYTES);
-    if (read.kind !== "ok") return false;
-    return parseIntegrationStateFile(new TextDecoder("utf-8", { fatal: true }).decode(read.bytes)) !== undefined;
-  } catch {
-    return false;
-  }
+  return (await readValidStateFile(context)) !== undefined;
 }
 
 /**
@@ -706,32 +790,96 @@ async function writeAtomically(context: Context, finalPath: string, bytes: Uint8
 
 // ----- Registry -----------------------------------------------------------------------------
 
-type RegistryStep = "ok" | "registry-write-denied" | "registry-write-failed";
-
-function writeRegistration(context: Context, initial: HostRegistrationOwnership): RegistryStep {
-  const { registry } = context.deps;
-  if (initial === "ours") return "ok";
-  let outcome;
-  try {
-    outcome = initial === "foreign" ? registry.replaceForeignCollectorHostRegistration("chrome") : registry.registerCollectorHost("chrome");
-  } catch {
-    return "registry-write-failed";
-  }
-  if (outcome === "ok") return "ok";
-  if (outcome === "foreign") throw new Abort("registration-changed");
-  return outcome === "access-denied" ? "registry-write-denied" : "registry-write-failed";
-}
-
-function readBackRegistration(context: Context): void {
+/** Read one target back and require `ours`. The native verdict is "default value equals <UserProgramFiles>\MAGINALIA Collector\<manifest>"; `resolveLayout` already required that this equals the folder verified above. */
+function readBackTarget(context: Context, target: CollectorRegistryTargetId): void {
   let verdict: HostRegistrationOwnership;
   try {
-    verdict = context.deps.registry.readCollectorHostRegistration("chrome");
+    verdict = context.deps.registry.readCollectorHostRegistration(target);
   } catch {
     throw new Abort("registry-readback-mismatch");
   }
-  // The native verdict is "default value equals <UserProgramFiles>\MAGINALIA Collector\<manifest>";
-  // `resolveLayout` already required that this equals the folder verified above.
   if (verdict !== "ours") throw new Abort("registry-readback-mismatch");
+}
+
+/**
+ * Registry step (design 5.2 step 8): every target of E, in registry order, each one independently.
+ * `ours` is left alone; `absent` is registered; a `foreign` value (the user confirmed replacing it;
+ * the guard proved it is still the same value) is replaced. A write that is refused or throws is
+ * recorded for that target and the next target is still tried: the keys are independent and one
+ * refusal is no reason to leave another browser unregistered. Nothing is rolled back (design 5.3):
+ * a target that was written points at a complete slot (invariant I'), so removing it again would only
+ * break a working browser. A target that comes back `foreign` from the addon (someone wrote it after
+ * the guard) aborts the run. Every target that is `ours` afterwards is read back.
+ *
+ * A refresh never writes a target that was registered before (that key was removed by someone: a
+ * repair decides) and never replaces anything.
+ */
+function registerExpectedTargets(
+  context: Context,
+  plan: TargetPlan,
+  action: "setup" | "repair" | "refresh",
+  targets: CollectorApplyTargetResult[],
+): "ok" | "registry-write-denied" | "registry-write-failed" {
+  const { registry } = context.deps;
+  let denied = false;
+  let failed = false;
+  for (const target of plan.expected) {
+    const initial = plan.snapshot[target] ?? "absent";
+    if (initial === "ours") {
+      readBackTarget(context, target);
+      targets.push({ target, result: "ours-already" });
+      continue;
+    }
+    if (action === "refresh" && initial === "foreign") throw new Abort("registration-changed"); // a refresh never replaces
+    if (action === "refresh" && plan.registered.includes(target)) {
+      targets.push({ target, result: "left-absent" });
+      continue;
+    }
+    let outcome;
+    try {
+      outcome = initial === "foreign" ? registry.replaceForeignCollectorHostRegistration(target) : registry.registerCollectorHost(target);
+    } catch {
+      failed = true;
+      targets.push({ target, result: "failed" });
+      continue;
+    }
+    if (outcome === "foreign") throw new Abort("registration-changed");
+    if (outcome !== "ok") {
+      if (outcome === "access-denied") denied = true;
+      else failed = true;
+      targets.push({ target, result: outcome === "access-denied" ? "denied" : "failed" });
+      continue;
+    }
+    readBackTarget(context, target);
+    targets.push({ target, result: initial === "foreign" ? "replaced" : "registered" });
+  }
+  return denied ? "registry-write-denied" : failed ? "registry-write-failed" : "ok";
+}
+
+/**
+ * Targets that did not take part in the registry step, for the result (design 5.2): a writable
+ * target whose browser is policy-blocked is `skipped-policy`, any other one that E does not contain
+ * is `not-expected`. Registry order.
+ */
+function completeTargetResults(plan: TargetPlan, done: readonly CollectorApplyTargetResult[]): readonly CollectorApplyTargetResult[] {
+  return Object.freeze(WRITABLE_TARGET_IDS.map((target) => {
+    const known = done.find((entry) => entry.target === target);
+    if (known !== undefined) return Object.freeze(known);
+    const blockedRow = plan.table.some((row) => row.verification === "verified" && plan.blockedBrowsers.includes(row.id) && row.nativeMessaging.ownTargets.includes(target));
+    return Object.freeze({ target, result: blockedRow ? ("skipped-policy" as const) : ("not-expected" as const) });
+  }));
+}
+
+/**
+ * `registeredTargets` for the state file (design 4.3, S4 decision a). It records every target this
+ * run was responsible for, `ours` or not: E (including a target whose write was refused) and what
+ * the previous state file already listed. A refused write therefore stays `registration-missing`
+ * (a repair notice) on the next inspection instead of turning into `outdated(registration-target-added)`,
+ * which would re-run an automatic refresh at every start without anyone being told. Registry order.
+ */
+function nextRegisteredTargets(plan: TargetPlan): readonly CollectorRegistryTargetId[] {
+  const wanted = new Set<CollectorRegistryTargetId>([...plan.registered, ...plan.expected]);
+  return Object.freeze(WRITABLE_TARGET_IDS.filter((target) => wanted.has(target)));
 }
 
 // ----- Self-check (design 3.5, 4.3) ---------------------------------------------------------
@@ -774,10 +922,21 @@ async function result(
   warnings: readonly CollectorApplyWarning[],
   selfCheck: "ok" | "failed" | "skipped",
   existing?: CollectorIntegrationInspection,
+  details: { readonly targets?: readonly CollectorApplyTargetResult[]; readonly filesChanged?: boolean } = {},
 ): Promise<CollectorApplyResult> {
   const inspection = existing ?? await inspectCollectorIntegration(deps);
   const state: CollectorIntegrationState = selfCheck === "failed" ? "damaged" : inspection.state;
-  return Object.freeze({ action, outcome, reason, warnings: Object.freeze([...warnings]), state, selfCheck, inspection });
+  return Object.freeze({
+    action,
+    outcome,
+    reason,
+    warnings: Object.freeze([...warnings]),
+    targets: Object.freeze([...(details.targets ?? [])]),
+    filesChanged: details.filesChanged === true,
+    state,
+    selfCheck,
+    inspection,
+  });
 }
 
 /** Reads the manifest on disk and returns the slot it points at, or `null` when absent/invalid/unrecognized. */
@@ -853,11 +1012,16 @@ async function converge(
   request: Exclude<CollectorApplyRequest, { action: "remove" }>,
   first: CollectorIntegrationInspection,
 ): Promise<CollectorApplyResult> {
+  // `applyExclusive` routes `remove` elsewhere; the union type cannot express that.
+  const action = request.action as "setup" | "repair" | "refresh";
   const paths = resolveLayout(deps);
   if (paths === undefined) return result(deps, request.action, "refused", "layout-unresolved", [], "skipped", first);
   const context: Context = { deps, paths, warnings: [] };
-  const initialRegistration: HostRegistrationOwnership = first.registration === "unknown" ? "absent" : first.registration;
   if (first.registration === "unknown") return result(deps, request.action, "refused", "inspection-incomplete", [], "skipped", first);
+  const plan = buildTargetPlan(deps, first);
+  // Nothing to register (no verified, unblocked browser needs a key): a setup would place files that
+  // no browser can ever start. Refused before anything is written.
+  if (plan.expected.length === 0) return result(deps, request.action, "refused", "wrong-state", [], "skipped", first);
 
   let descriptor: CollectorPayloadDescriptor;
   try {
@@ -869,41 +1033,65 @@ async function converge(
     return result(deps, request.action, "refused", "payload-unavailable", [], "skipped", first);
   }
 
+  // Registration-only refresh (design 5.4): the installation is current and healthy and only a
+  // registry target was added (a new version registers more browsers, or a `when-present` browser
+  // appeared). No slot, extension or manifest is written, so nothing the browsers run changes.
+  const registrationOnly = request.action === "refresh"
+    && first.reasons.length === 1
+    && first.reasons[0] === "registration-target-added"
+    && first.installed.payloadId === descriptor.payloadId;
+
   let reason: CollectorApplyReason | null = null;
   let wrote = false;
+  let placed = false;
   let selfCheck: "ok" | "failed" | "skipped" = "skipped";
+  const targets: CollectorApplyTargetResult[] = [];
+  const finish = (outcome: CollectorApplyOutcome, why: CollectorApplyReason | null): Promise<CollectorApplyResult> =>
+    result(deps, request.action, outcome, why, context.warnings, selfCheck, undefined, {
+      targets: targets.length > 0 ? completeTargetResults(plan, targets) : [],
+      filesChanged: placed,
+    });
   try {
-    await guard(context, initialRegistration, { folderExists: false });
-    await ensureProgramFolder(context);
-    await refuseLinkedNames(context);
-    await requireRecognizedContent(context, descriptor, await hasValidStateFile(context));
-    wrote = true;
-    await ensureIntegrationDirectory(context);
-    await guard(context, initialRegistration, { folderExists: true });
-    const slot = await chooseTargetSlot(context, first);
-
-    await writeSlot(context, slot, descriptor);
-    await swapExtension(context, descriptor);
-
-    // Last check before the manifest switch: the Host files are re-hashed (not trusted from
-    // `writeSlot`) and the guard is re-evaluated. After the manifest rename succeeds Chrome runs the
-    // new Host and nothing is rolled back: a later failure (registry, state file, self-check) is
-    // reported as `failed` with the files left in place, the previous slot stays complete as the
-    // fallback, and a repair converges. Until that rename the previous installation is untouched.
-    if (!(await slotHostFilesMatch(context, slot, descriptor))) throw new Abort("hash-mismatch");
-    await guard(context, initialRegistration, { folderExists: true });
-    await writeAtomically(context, paths.manifestPath, manifestBytes(slot, paths.programFolder));
-
-    let registryStep: RegistryStep = "ok";
-    if (request.action !== "refresh") {
-      registryStep = writeRegistration(context, initialRegistration);
-      if (registryStep === "ok") readBackRegistration(context);
+    let slot: CollectorHostSlot;
+    let stateFields: { readonly payloadId: string; readonly extensionVersion: string; readonly placedAt: string };
+    if (registrationOnly) {
+      await guard(context, plan, { folderExists: true });
+      const current = await readValidStateFile(context);
+      if (current === undefined) throw new Abort("program-folder-unrecognized-content");
+      wrote = true;
+      slot = current.activeSlot;
+      // Files are not placed: the state file keeps what it says about them.
+      stateFields = { payloadId: current.payloadId, extensionVersion: current.extensionVersion, placedAt: current.placedAt };
+      await guard(context, plan, { folderExists: true });
     } else {
-      readBackRegistration(context); // a refresh keeps the same value; it must still be ours
+      await guard(context, plan, { folderExists: false });
+      await ensureProgramFolder(context);
+      await refuseLinkedNames(context);
+      await requireRecognizedContent(context, descriptor, await hasValidStateFile(context));
+      wrote = true;
+      await ensureIntegrationDirectory(context);
+      await guard(context, plan, { folderExists: true });
+      slot = await chooseTargetSlot(context, first);
+
+      placed = true;
+      await writeSlot(context, slot, descriptor);
+      await swapExtension(context, descriptor);
+
+      // Last check before the manifest switch: the Host files are re-hashed (not trusted from
+      // `writeSlot`) and the guard is re-evaluated. After the manifest rename succeeds Chrome runs the
+      // new Host and nothing is rolled back: a later failure (registry, state file, self-check) is
+      // reported as `failed` with the files left in place, the previous slot stays complete as the
+      // fallback, and a repair converges. Until that rename the previous installation is untouched.
+      if (!(await slotHostFilesMatch(context, slot, descriptor))) throw new Abort("hash-mismatch");
+      await guard(context, plan, { folderExists: true });
+      await writeAtomically(context, paths.manifestPath, manifestBytes(slot, paths.programFolder));
+      stateFields = { payloadId: descriptor.payloadId, extensionVersion: descriptor.extension.version, placedAt: deps.now().toISOString() };
     }
-    // Files are complete and verified: record them even when the registry write was denied, so
-    // the state is the deterministic `registration-missing` (or still-foreign) with a repair.
-    await writeAtomically(context, join(paths.programFolder, COLLECTOR_STATE_FILE_NAME), stateBytes(descriptor, slot, deps.now()));
+
+    const registryStep = registerExpectedTargets(context, plan, action, targets);
+    // Files are complete and verified: record them even when a registry write was denied, so the
+    // state is the deterministic `registration-missing` (or still-foreign) with a repair.
+    await writeAtomically(context, join(paths.programFolder, COLLECTOR_STATE_FILE_NAME), stateBytes(stateFields, slot, nextRegisteredTargets(plan)));
     if (registryStep !== "ok") {
       reason = registryStep;
     } else {
@@ -914,13 +1102,13 @@ async function converge(
   } catch (error: unknown) {
     reason = reasonForError(error);
   }
-  if (reason === null) return result(deps, request.action, "applied", null, context.warnings, selfCheck);
+  if (reason === null) return finish("applied", null);
   // `refused` = a precondition failed before anything of the installation was changed. `wrote`
   // turns true once the program folder is verified and every content check passed; creating the
   // empty program folder itself does not count (a refusal may leave an empty protected folder).
   // Any failure after that point is `failed`, with the post-action inspection showing what is on disk.
-  const refusedBeforeWrite = !wrote && (reason === "e2e-isolation" || reason === "policy-blocked" || reason === "registration-changed" || reason === "program-folder-unsafe" || reason === "inspection-incomplete" || reason === "reparse-point-found" || reason === "program-folder-unrecognized-content");
-  return result(deps, request.action, refusedBeforeWrite ? "refused" : "failed", reason, context.warnings, selfCheck);
+  const refusedBeforeWrite = !wrote && (reason === "e2e-isolation" || reason === "policy-blocked" || reason === "registration-changed" || reason === "expected-targets-changed" || reason === "program-folder-unsafe" || reason === "inspection-incomplete" || reason === "reparse-point-found" || reason === "program-folder-unrecognized-content");
+  return finish(refusedBeforeWrite ? "refused" : "failed", reason);
 }
 
 // ----- Remove (design 3.5, 2.4, 8.5) --------------------------------------------------------
@@ -1047,6 +1235,14 @@ async function packagedDescriptorOrNull(deps: CollectorIntegrationApplyDependenc
   }
 }
 
+/** The targets a remove run reached, in registry order (a refusal before the unregister step lists none). */
+function completeRemoveResults(targets: readonly CollectorApplyTargetResult[]): readonly CollectorApplyTargetResult[] {
+  return Object.freeze(WRITABLE_TARGET_IDS.flatMap((target) => {
+    const known = targets.find((entry) => entry.target === target);
+    return known === undefined ? [] : [Object.freeze(known)];
+  }));
+}
+
 async function remove(
   deps: CollectorIntegrationApplyDependencies,
   first: CollectorIntegrationInspection,
@@ -1056,34 +1252,65 @@ async function remove(
   const context: Context = { deps, paths, warnings: [] };
   const { fileSystem } = deps;
   const tally = { locked: false, leftover: false };
+  const targets: CollectorApplyTargetResult[] = [];
+  const done = (outcome: CollectorApplyOutcome, reason: CollectorApplyReason | null, selfCheck: "skipped" = "skipped", existing?: CollectorIntegrationInspection): Promise<CollectorApplyResult> =>
+    result(deps, "remove", outcome, reason, context.warnings, selfCheck, existing, { targets: completeRemoveResults(targets) });
   let folderIsSafe = true;
   let unregistered = false;
   try {
     const folder = await fileSystem.stat(paths.programFolder);
-    let registration: HostRegistrationOwnership;
-    try {
-      registration = deps.registry.readCollectorHostRegistration("chrome");
-    } catch {
-      return result(deps, "remove", "refused", "inspection-incomplete", [], "skipped", first);
-    }
-    if (folder === null && registration !== "ours") return result(deps, "remove", "noop", null, [], "skipped", first);
-
-    // 1. Registry first, value-matched by the native layer; a foreign value is left untouched.
-    //    This runs even when the program folder is not safe to touch: removing our registration
-    //    stops Chrome from starting whatever is in that folder, and it deletes nothing on disk.
-    if (registration === "foreign") {
-      warn(context, "foreign-registration-left");
-    } else if (registration === "ours") {
-      let outcome;
+    // Every WRITABLE target, whatever the expected set E is now (a policy block or an unverified
+    // browser row must not leave our key behind), each one read fresh: nothing from the first
+    // inspection is trusted here. A key that cannot be read is never reported as removed: nothing has
+    // been changed yet, so the run is refused and can be repeated.
+    const ownerships = new Map<CollectorRegistryTargetId, HostRegistrationOwnership>();
+    for (const target of WRITABLE_TARGET_IDS) {
       try {
-        outcome = deps.registry.unregisterCollectorHost("chrome");
+        ownerships.set(target, deps.registry.readCollectorHostRegistration(target));
       } catch {
-        return result(deps, "remove", "failed", "unregister-failed", context.warnings, "skipped");
+        return done("refused", "inspection-incomplete", "skipped", first);
       }
-      if (outcome === "foreign") warn(context, "foreign-registration-left");
-      else if (outcome !== "ok" && outcome !== "not-registered") return result(deps, "remove", "failed", "unregister-failed", context.warnings, "skipped");
-      else if (outcome === "ok") unregistered = true;
     }
+    if (folder === null && ![...ownerships.values()].includes("ours")) return result(deps, "remove", "noop", null, [], "skipped", first);
+
+    // 1. Registry first, value-matched by the native layer; a foreign value is left untouched. Reverse
+    //    registry order, and every target is tried even after one failed (the keys are independent).
+    //    This runs even when the program folder is not safe to touch: removing our registration
+    //    stops the browser from starting whatever is in that folder, and it deletes nothing on disk.
+    let unregisterFailed = false;
+    for (const target of [...WRITABLE_TARGET_IDS].reverse()) {
+      const ownership = ownerships.get(target);
+      if (ownership === "foreign") {
+        warn(context, "foreign-registration-left");
+        targets.push({ target, result: "foreign-left" });
+      } else if (ownership === "absent") {
+        targets.push({ target, result: "not-registered" });
+      } else {
+        let outcome;
+        try {
+          outcome = deps.registry.unregisterCollectorHost(target);
+        } catch {
+          unregisterFailed = true;
+          targets.push({ target, result: "failed" });
+          continue;
+        }
+        if (outcome === "foreign") {
+          warn(context, "foreign-registration-left");
+          targets.push({ target, result: "foreign-left" });
+        } else if (outcome === "not-registered") {
+          targets.push({ target, result: "not-registered" });
+        } else if (outcome === "ok") {
+          unregistered = true;
+          targets.push({ target, result: "removed" });
+        } else {
+          unregisterFailed = true;
+          targets.push({ target, result: outcome === "access-denied" ? "denied" : "failed" });
+        }
+      }
+    }
+    // A key that is still ours keeps the files: the browser that uses it must find a complete Host
+    // (design 5.5). Whatever was removed stays removed; running remove again converges.
+    if (unregisterFailed) return done("failed", "unregister-failed");
 
     // 2. Only then decide whether the folder may be touched at all.
     if (folder !== null) {
@@ -1101,11 +1328,11 @@ async function remove(
     return result(deps, "remove", "failed", "write-failed", [], "skipped");
   }
   if (!folderIsSafe) {
-    // Nothing on disk was touched. If the registration was removed, that much was done: `partial`.
+    // Nothing on disk was touched. If a registration was removed, that much was done: `partial`.
     // If nothing at all changed (absent or foreign registration), this is a plain refusal.
-    if (!unregistered) return result(deps, "remove", "refused", "program-folder-unsafe", context.warnings, "skipped");
+    if (!unregistered) return done("refused", "program-folder-unsafe");
     warn(context, "leftovers-remain");
-    return result(deps, "remove", "partial", "program-folder-unsafe", context.warnings, "skipped");
+    return done("partial", "program-folder-unsafe");
   }
 
   // 3. Names we own, inside the program folder only. Nothing is deleted by listing a folder and
@@ -1142,7 +1369,7 @@ async function remove(
     tally.leftover = true;
   }
   if (tally.leftover) warn(context, "leftovers-remain");
-  return result(deps, "remove", tally.leftover ? "partial" : "applied", tally.locked ? "file-locked" : null, context.warnings, "skipped");
+  return done(tally.leftover ? "partial" : "applied", tally.locked ? "file-locked" : null);
 }
 
 // ----- Entry point --------------------------------------------------------------------------

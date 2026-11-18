@@ -40,7 +40,7 @@ function applyResult(outcome: CollectorApplyResult["outcome"], reason: Collector
   const post = inspection(outcome === "applied" ? "ready" : "outdated", {
     installed: { payloadId: "1.3.0+def5678", activeSlot: "b", hostVersion: "1.3.0", extensionVersion: "0.4.0" },
   });
-  return { action, outcome, reason, warnings: [], state: post.state, selfCheck: "skipped", inspection: post };
+  return { action, outcome, reason, warnings: [], targets: [], filesChanged: false, state: post.state, selfCheck: "skipped", inspection: post };
 }
 
 class MemoryStore implements CollectorNoticeStore {

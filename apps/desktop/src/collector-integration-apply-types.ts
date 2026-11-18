@@ -6,6 +6,7 @@
  * runner and the clock), so tests run against temp roots and fakes. Results carry opaque codes
  * only: no paths, no Shelf identifiers, no free text.
  */
+import type { CollectorRegistryTargetId } from "./collector-browser-table.js";
 import type { CollectorIntegrationFileSystem, CollectorIntegrationInspection, CollectorIntegrationState } from "./collector-integration-types.js";
 import type { CollectorIntegrationInspectDependencies } from "./collector-integration.js";
 
@@ -109,6 +110,8 @@ export type CollectorApplyReason =
   | "program-folder-unrecognized-content"
   | "payload-unavailable"
   | "registration-changed"
+  /** The set of browsers whose registration is expected changed between the precondition and a guard (a row became policy-blocked or unblocked). */
+  | "expected-targets-changed"
   | "layout-unresolved"
   | "busy"
   // failures
@@ -153,11 +156,53 @@ export type CollectorApplyWarning =
  */
 export type CollectorApplyOutcome = "applied" | "noop" | "refused" | "failed" | "partial";
 
+/**
+ * What this run did to one writable registry target (design 5.2, 5.5). Opaque codes only.
+ *
+ * setup / repair / refresh: `ours-already` (nothing written), `registered` (absent -> ours),
+ * `replaced` (a confirmed foreign value was replaced), `denied` / `failed` (the write was refused or
+ * threw; the key is unchanged), `left-absent` (a refresh does not re-register a target that was
+ * registered before; that is a repair), `skipped-policy` (its browser is policy-blocked: not expected),
+ * `not-expected` (no verified, unblocked browser row needs it).
+ *
+ * remove: `removed`, `not-registered`, `foreign-left` (a foreign value is never deleted),
+ * `denied` / `failed` (the key is still ours).
+ */
+export type CollectorApplyTargetOutcome =
+  | "ours-already"
+  | "registered"
+  | "replaced"
+  | "denied"
+  | "failed"
+  | "left-absent"
+  | "skipped-policy"
+  | "not-expected"
+  | "removed"
+  | "not-registered"
+  | "foreign-left";
+
+export interface CollectorApplyTargetResult {
+  readonly target: CollectorRegistryTargetId;
+  readonly result: CollectorApplyTargetOutcome;
+}
+
 export interface CollectorApplyResult {
   readonly action: CollectorApplyAction;
   readonly outcome: CollectorApplyOutcome;
   readonly reason: CollectorApplyReason | null;
   readonly warnings: readonly CollectorApplyWarning[];
+  /**
+   * One entry per WRITABLE registry target, in registry order, once the run reached the registry
+   * step (or, for remove, the unregister step); empty for a refusal before that. A partial failure
+   * is visible here: `outcome` is `failed` when any target was `denied` / `failed`.
+   */
+  readonly targets: readonly CollectorApplyTargetResult[];
+  /**
+   * `true` only when this run placed Host or extension files (a slot, the extension folder or the
+   * manifest was written). A registration-only refresh (design 5.4), a refusal and a remove leave it
+   * `false`: the "updated" notice (design 4.6, WP-5c) must key on this, never on `outcome === "applied"`.
+   */
+  readonly filesChanged: boolean;
   /**
    * The state the caller should act on: the post-action inspection state, except that a failed
    * self-check reports `damaged` (design 4.3). The override is not persisted.
