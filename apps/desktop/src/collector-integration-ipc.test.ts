@@ -5,6 +5,7 @@ import {
   buildUpdatedNotice,
   COLLECTOR_NOTICE_IDS,
 } from "./collector-integration-notices.js";
+import { COLLECTOR_BROWSER_IDS } from "./collector-browser-table.js";
 import {
   COLLECTOR_INTEGRATION_INTENTS,
   COLLECTOR_NOTICE_ID_VALUES,
@@ -16,17 +17,38 @@ import {
 describe("Collector integration IPC contract", () => {
   it("accepts every intent with no extra fields", () => {
     for (const intent of COLLECTOR_INTEGRATION_INTENTS) expect(isCollectorIntegrationRequest({ intent })).toBe(true);
-    expect(isCollectorIntegrationRequest({ intent: "setup", confirmReplaceForeign: true, proceedWithoutChrome: false })).toBe(true);
+    expect(isCollectorIntegrationRequest({ intent: "setup", confirmReplaceForeign: true, proceedWithoutSupportedBrowser: false })).toBe(true);
     expect(isCollectorIntegrationRequest({ intent: "repair", confirmReplaceForeign: true })).toBe(true);
+  });
+
+  it("accepts a browser row id on openBrowserExtensions only", () => {
+    for (const id of COLLECTOR_BROWSER_IDS) {
+      expect(isCollectorIntegrationRequest({ intent: "openBrowserExtensions", browser: id })).toBe(true);
+      for (const intent of COLLECTOR_INTEGRATION_INTENTS) {
+        if (intent !== "openBrowserExtensions") expect(isCollectorIntegrationRequest({ intent, browser: id })).toBe(false);
+      }
+    }
+  });
+
+  it("rejects a browser that is not a table row id, in any spelling, or that carries a path or URL", () => {
+    const bad: unknown[] = ["", "Chrome", "CHROME", "brave", "chromium", "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "chrome://extensions/", "https://example.test", "chrome ", null, 1, true, {}, ["chrome"]];
+    for (const browser of bad) expect(isCollectorIntegrationRequest({ intent: "openBrowserExtensions", browser })).toBe(false);
+    expect(isCollectorIntegrationRequest({ intent: "openBrowserExtensions", browser: undefined })).toBe(true);
+  });
+
+  it("no longer knows the Chrome-only intent or flag", () => {
+    expect(COLLECTOR_INTEGRATION_INTENTS as readonly string[]).not.toContain("openChromeExtensions");
+    expect(isCollectorIntegrationRequest({ intent: "openChromeExtensions" })).toBe(false);
+    expect(isCollectorIntegrationRequest({ intent: "setup", proceedWithoutChrome: true })).toBe(false);
   });
 
   it("rejects paths, commands, unknown intents and misplaced flags", () => {
     const bad: unknown[] = [
       undefined, null, 1, "setup", [], [{ intent: "setup" }], {}, { intent: "unknown" }, { intent: "SETUP" },
-      { intent: "setup", path: "C:\\Windows" }, { intent: "openChromeExtensions", url: "https://example.test" },
+      { intent: "setup", path: "C:\\Windows" }, { intent: "openBrowserExtensions", url: "https://example.test" },
       { intent: "copyExtensionPath", target: "x" }, { intent: "setup", confirmReplaceForeign: 1 },
-      { intent: "remove", proceedWithoutChrome: true }, { intent: "inspect", confirmReplaceForeign: false },
-      { intent: "repair", proceedWithoutChrome: false }, Object.create({ intent: "setup" }),
+      { intent: "remove", proceedWithoutSupportedBrowser: true }, { intent: "inspect", confirmReplaceForeign: false },
+      { intent: "repair", proceedWithoutSupportedBrowser: false }, Object.create({ intent: "setup" }),
     ];
     for (const value of bad) expect(isCollectorIntegrationRequest(value)).toBe(false);
   });

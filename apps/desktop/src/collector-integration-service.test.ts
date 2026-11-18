@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { CollectorApplyRequest, CollectorApplyResult } from "./collector-integration-apply-types.js";
 import { buildAlpha1MigrationNotice, COLLECTOR_NOTICE_IDS, type CollectorNotice } from "./collector-integration-notices.js";
-import type { ChromeLocation, CollectorIntegrationInspection, CollectorIntegrationState } from "./collector-integration-types.js";
+import type { CollectorBrowserId, CollectorRecommendationReason } from "./collector-browser-table.js";
+import type { BrowserLocation, CollectorBrowserStatus, CollectorBrowsersInspection, CollectorIntegrationInspection, CollectorIntegrationState } from "./collector-integration-types.js";
 import { createCollectorStartupRefresh, type CollectorStartupRefresh } from "./collector-startup-refresh.js";
 import { DEFAULT_COLLECTOR_NOTICE_STATE, type CollectorNoticeState } from "./collector-integration-notices.js";
 import {
@@ -13,6 +14,35 @@ import {
 
 const SECRET_EXTENSION_FOLDER = "C:\\Users\\someone\\AppData\\Local\\Programs\\MAGINALIA Collector\\extension";
 const SECRET_CHROME = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+
+const NO_POLICY = { userLevelHostsDisabled: false, hostBlocked: false, blocked: false, extensionLoadMayBeBlocked: false, status: "read" } as const;
+
+function browserStatus(id: CollectorBrowserId, overrides: Partial<CollectorBrowserStatus> = {}): CollectorBrowserStatus {
+  return {
+    id,
+    verification: id === "chrome" ? "verified" : "unverified",
+    installed: "not-found",
+    source: null,
+    effective: { target: null, ownership: "absent" },
+    policy: NO_POLICY,
+    ...overrides,
+  };
+}
+
+/** Chrome installed (the only verified row today); Edge and Vivaldi not installed. */
+function browsers(overrides: Partial<CollectorBrowsersInspection> = {}): CollectorBrowsersInspection {
+  return {
+    defaultBrowser: "chrome",
+    recommended: "chrome",
+    recommendationReason: "default-supported" as CollectorRecommendationReason,
+    entries: [
+      browserStatus("edge"),
+      browserStatus("chrome", { installed: "found", source: "app-paths-hkcu", effective: { target: "chrome", ownership: "ours" } }),
+      browserStatus("vivaldi"),
+    ],
+    ...overrides,
+  };
+}
 
 function inspection(state: CollectorIntegrationState = "ready", overrides: Partial<CollectorIntegrationInspection> = {}): CollectorIntegrationInspection {
   return {
@@ -26,7 +56,7 @@ function inspection(state: CollectorIntegrationState = "ready", overrides: Parti
     versions: { host: "equal", extension: "equal" },
     filesVerified: false,
     policy: { userLevelHostsDisabled: false, hostBlocked: false, blocked: false, extensionLoadMayBeBlocked: false, status: "read" },
-    chrome: { status: "found", source: "app-paths-hkcu", rejected: [], defaultBrowser: "chrome" },
+    browsers: browsers(),
     contact: { status: "absent" },
     extensionFolderDisplay: SECRET_EXTENSION_FOLDER,
     writesAllowed: true,
@@ -60,7 +90,9 @@ interface Rig {
   applyImpl: (request: CollectorApplyRequest) => Promise<CollectorApplyResult>;
   confirmation: { confirmed: boolean; clearSaveDestination: boolean };
   clearCalls: number;
-  chrome: ChromeLocation;
+  /** What the locator answers per row (missing row: not-found). */
+  locations: Partial<Record<CollectorBrowserId, BrowserLocation>>;
+  readonly located: CollectorBrowserId[];
   launchResult: boolean;
   startup: CollectorStartupRefresh;
 }
@@ -79,7 +111,8 @@ function rig(overrides: Partial<CollectorIntegrationServiceDependencies> = {}): 
     applyImpl: async (request) => applyResult(request.action),
     confirmation: { confirmed: true, clearSaveDestination: false },
     clearCalls: 0,
-    chrome: { status: "found", source: "app-paths-hkcu", executablePath: SECRET_CHROME, rejected: [] },
+    locations: { chrome: { status: "found", source: "app-paths-hkcu", executablePath: SECRET_CHROME, rejected: [] } },
+    located: [],
     launchResult: true,
     startup: undefined as unknown as CollectorStartupRefresh,
     get deps(): CollectorIntegrationServiceDependencies {
@@ -91,9 +124,9 @@ function rig(overrides: Partial<CollectorIntegrationServiceDependencies> = {}): 
           r.applies.push(request);
           return r.applyImpl(request);
         },
-        locateChrome: async () => r.chrome,
+        locateBrowser: async (id) => { r.located.push(id); return r.locations[id] ?? { status: "not-found", rejected: [] }; },
         gate: gate,
-        launchChrome: async (executable, args) => { r.launches.push({ executable, args }); return r.launchResult; },
+        launchBrowser: async (executable, args) => { r.launches.push({ executable, args }); return r.launchResult; },
         writeClipboardText: (text) => { r.clipboard.push(text); },
         openFolder: async (folder) => { r.opened.push(folder); return true; },
         confirmRemove: async () => r.confirmation,
@@ -214,8 +247,12 @@ describe("collector integration service", () => {
     const bad: unknown[] = [
       undefined, null, "setup", 5, [], {}, { intent: "format-disk" }, { intent: "setup", path: "C:\\x" },
       { intent: "setup", command: "calc.exe" }, { intent: "inspect", confirmReplaceForeign: true },
-      { intent: "repair", proceedWithoutChrome: true }, { intent: "setup", confirmReplaceForeign: "yes" },
-      { intent: "setup", proceedWithoutChrome: 1 }, { intent: 7 },
+      { intent: "repair", proceedWithoutSupportedBrowser: true }, { intent: "setup", confirmReplaceForeign: "yes" },
+      { intent: "setup", proceedWithoutSupportedBrowser: 1 }, { intent: 7 },
+      { intent: "openChromeExtensions" }, { intent: "setup", proceedWithoutChrome: true },
+      { intent: "openBrowserExtensions", url: "https://example.test" }, { intent: "openBrowserExtensions", path: "C:\\x\\chrome.exe" },
+      { intent: "openBrowserExtensions", browser: "brave" }, { intent: "openBrowserExtensions", browser: "C:\\x\\chrome.exe" },
+      { intent: "openBrowserExtensions", browser: 1 }, { intent: "setup", browser: "chrome" }, { intent: "inspect", browser: "edge" },
     ];
     for (const request of bad) expect(await service.handle(request)).toEqual({ kind: "invalid-request" });
     expect(r.applies).toHaveLength(0);
@@ -231,29 +268,103 @@ describe("collector integration service", () => {
       await service.handle({ intent: "setup" }),
       await service.handle({ intent: "repair", confirmReplaceForeign: true }),
       await service.handle({ intent: "remove" }),
-      await service.handle({ intent: "openChromeExtensions" }),
+      await service.handle({ intent: "openBrowserExtensions" }),
+      await service.handle({ intent: "openBrowserExtensions", browser: "chrome" }),
       await service.handle({ intent: "copyExtensionPath" }),
       await service.handle({ intent: "revealExtensionFolder" }),
       await service.handle({ intent: "checkConnection" }),
     ];
-    expect(responses.map((response) => response.kind)).toEqual(["status", "apply", "apply", "apply", "chrome-extensions", "extension-folder", "extension-folder", "connection"]);
+    expect(responses.map((response) => response.kind)).toEqual(["status", "apply", "apply", "apply", "browser-extensions", "browser-extensions", "extension-folder", "extension-folder", "connection"]);
     for (const response of responses) noAbsolutePath(response);
     // the path is used inside the main process only
     expect(r.clipboard).toEqual([SECRET_EXTENSION_FOLDER]);
     expect(r.opened).toEqual([SECRET_EXTENSION_FOLDER]);
-    expect(r.launches).toEqual([{ executable: SECRET_CHROME, args: ["chrome://extensions/"] }]);
+    expect(r.launches).toEqual([
+      { executable: SECRET_CHROME, args: ["chrome://extensions/"] },
+      { executable: SECRET_CHROME, args: ["chrome://extensions/"] },
+    ]);
   });
 
-  it("setup without Chrome is refused unless the user explicitly continued", async () => {
+  it("setup without a supported browser is refused unless the user explicitly continued", async () => {
     const r = rig();
-    r.current = inspection("not-set-up", { chrome: { status: "not-found", source: null, rejected: [], defaultBrowser: "edge" } });
+    r.current = inspection("not-set-up", {
+      browsers: browsers({
+        defaultBrowser: "edge",
+        recommended: null,
+        recommendationReason: "none-installed",
+        entries: [browserStatus("edge"), browserStatus("chrome"), browserStatus("vivaldi")],
+      }),
+    });
     const service = createCollectorIntegrationService(r.deps);
-    expect((await service.handle({ intent: "setup" })).kind).toBe("chrome-required");
+    expect((await service.handle({ intent: "setup" })).kind).toBe("browser-required");
     expect(r.applies).toHaveLength(0);
-    expect((await service.handle({ intent: "setup", proceedWithoutChrome: true })).kind).toBe("apply");
+    expect((await service.handle({ intent: "setup", proceedWithoutSupportedBrowser: true })).kind).toBe("apply");
     expect(r.applies).toEqual([{ action: "setup" }]);
-    r.current = inspection("not-set-up", { chrome: { status: "unknown", source: null, rejected: [], defaultBrowser: "unknown" } });
-    expect((await service.handle({ intent: "setup" })).kind).toBe("chrome-required");
+    r.current = inspection("not-set-up", {
+      browsers: browsers({
+        defaultBrowser: "unknown",
+        recommended: null,
+        recommendationReason: "detection-failed",
+        entries: [browserStatus("edge", { installed: "unknown" }), browserStatus("chrome", { installed: "unknown" }), browserStatus("vivaldi", { installed: "unknown" })],
+      }),
+    });
+    expect((await service.handle({ intent: "setup" })).kind).toBe("browser-required");
+  });
+
+  it("setup needs a verified, installed, non-blocked browser: an unverified or blocked one does not count", async () => {
+    const r = rig();
+    const service = createCollectorIntegrationService(r.deps);
+    const withEntries = (entries: readonly CollectorBrowserStatus[]) => inspection("not-set-up", { browsers: browsers({ entries }) });
+    // Edge is installed but unverified: not enough.
+    r.current = withEntries([browserStatus("edge", { installed: "found" }), browserStatus("chrome"), browserStatus("vivaldi")]);
+    expect((await service.handle({ intent: "setup" })).kind).toBe("browser-required");
+    // Chrome is installed but policy blocks it.
+    r.current = withEntries([browserStatus("edge"), browserStatus("chrome", { installed: "found", policy: { ...NO_POLICY, userLevelHostsDisabled: true, blocked: true } }), browserStatus("vivaldi")]);
+    expect((await service.handle({ intent: "setup" })).kind).toBe("browser-required");
+    expect(r.applies).toHaveLength(0);
+    // Chrome installed and allowed: proceeds.
+    r.current = withEntries([browserStatus("edge"), browserStatus("chrome", { installed: "found" }), browserStatus("vivaldi")]);
+    expect((await service.handle({ intent: "setup" })).kind).toBe("apply");
+  });
+
+  it("the status carries per-browser facts and never a path, an executable name or a ProgId", async () => {
+    const r = rig();
+    r.current = inspection("ready", {
+      browsers: browsers({
+        defaultBrowser: "other-chromium",
+        recommended: "chrome",
+        recommendationReason: "default-unverified",
+        entries: [
+          browserStatus("edge", { installed: "found", source: "known-program-files-x86", effective: { target: "chrome", ownership: "foreign" }, policy: { ...NO_POLICY, extensionLoadMayBeBlocked: true } }),
+          browserStatus("chrome", { installed: "found", source: "app-paths-hkcu", effective: { target: "chrome", ownership: "ours" } }),
+          browserStatus("vivaldi", { installed: "unknown" }),
+        ],
+      }),
+    });
+    const service = createCollectorIntegrationService(r.deps);
+    const response = await service.handle({ intent: "inspect" });
+    if (response.kind !== "status") throw new Error("expected a status response");
+    expect(response).toMatchObject({
+      kind: "status",
+      status: {
+        browsers: {
+          defaultBrowser: "other-chromium",
+          recommended: "chrome",
+          recommendationReason: "default-unverified",
+          entries: [
+            { id: "edge", verification: "unverified", installed: "found", registration: "foreign", registrationVia: "chrome", policyBlocked: false, extensionLoadMayBeBlocked: true },
+            { id: "chrome", verification: "verified", installed: "found", registration: "ours", registrationVia: "chrome", policyBlocked: false, extensionLoadMayBeBlocked: false },
+            { id: "vivaldi", verification: "unverified", installed: "unknown", registration: "absent", registrationVia: null, policyBlocked: false, extensionLoadMayBeBlocked: false },
+          ],
+        },
+      },
+    });
+    expect(Object.keys(response.status.browsers.entries[0]!).sort()).toEqual(
+      ["extensionLoadMayBeBlocked", "id", "installed", "policyBlocked", "registration", "registrationVia", "verification"],
+    );
+    noAbsolutePath(response);
+    expect(JSON.stringify(response)).not.toContain("source");
+    expect(response.status).not.toHaveProperty("chrome");
   });
 
   it("forwards confirmReplaceForeign only when the renderer set it", async () => {
@@ -316,11 +427,11 @@ describe("collector integration service", () => {
         mode,
         inspect: async () => { calls.push("inspect"); return r.current; },
         apply: async () => { calls.push("apply"); return applyResult("setup"); },
-        locateChrome: async () => { calls.push("chrome"); return r.chrome; },
-        launchChrome: async () => { calls.push("launch"); return true; },
+        locateBrowser: async () => { calls.push("locate"); return r.locations.chrome ?? { status: "unknown" }; },
+        launchBrowser: async () => { calls.push("launch"); return true; },
         writeClipboardText: () => { calls.push("clipboard"); },
       });
-      for (const intent of ["inspect", "setup", "repair", "remove", "openChromeExtensions", "copyExtensionPath", "revealExtensionFolder", "checkConnection"] as const) {
+      for (const intent of ["inspect", "setup", "repair", "remove", "openBrowserExtensions", "copyExtensionPath", "revealExtensionFolder", "checkConnection"] as const) {
         expect(await service.handle({ intent })).toEqual({ kind: "unavailable", reason });
       }
       service.startPeriodicReconcile(1);
@@ -356,15 +467,52 @@ describe("collector integration service", () => {
     expect(r.opened).toEqual([]);
   });
 
-  it("openChromeExtensions reports not-found / failed without spawning when Chrome is missing", async () => {
+  it("openBrowserExtensions reports not-found / failed without spawning when the browser is missing", async () => {
     const r = rig();
     const service = createCollectorIntegrationService(r.deps);
-    r.chrome = { status: "not-found", rejected: [] };
-    expect(await service.handle({ intent: "openChromeExtensions" })).toEqual({ kind: "chrome-extensions", result: "chrome-not-found" });
+    r.locations = { chrome: { status: "not-found", rejected: [] } };
+    expect(await service.handle({ intent: "openBrowserExtensions" })).toEqual({ kind: "browser-extensions", browser: "chrome", result: "browser-not-found" });
+    r.locations = { chrome: { status: "unknown" } };
+    expect(await service.handle({ intent: "openBrowserExtensions" })).toEqual({ kind: "browser-extensions", browser: "chrome", result: "browser-not-found" });
     expect(r.launches).toHaveLength(0);
-    r.chrome = { status: "found", source: "app-paths-hkcu", executablePath: SECRET_CHROME, rejected: [] };
+    r.locations = { chrome: { status: "found", source: "app-paths-hkcu", executablePath: SECRET_CHROME, rejected: [] } };
     r.launchResult = false;
-    expect(await service.handle({ intent: "openChromeExtensions" })).toEqual({ kind: "chrome-extensions", result: "failed" });
+    expect(await service.handle({ intent: "openBrowserExtensions" })).toEqual({ kind: "browser-extensions", browser: "chrome", result: "failed" });
+  });
+
+  it("openBrowserExtensions without a request.browser uses the recommended row and spawns its fixed arguments", async () => {
+    const r = rig();
+    const service = createCollectorIntegrationService(r.deps);
+    expect(await service.handle({ intent: "openBrowserExtensions" })).toEqual({ kind: "browser-extensions", browser: "chrome", result: "opened" });
+    expect(r.located).toEqual(["chrome"]);
+    expect(r.launches).toEqual([{ executable: SECRET_CHROME, args: ["chrome://extensions/"] }]);
+  });
+
+  it("openBrowserExtensions with nothing recommended reports not-found without locating or spawning", async () => {
+    const r = rig();
+    r.current = inspection("not-set-up", { browsers: browsers({ recommended: null, recommendationReason: "none-installed", entries: [browserStatus("edge"), browserStatus("chrome"), browserStatus("vivaldi")] }) });
+    const service = createCollectorIntegrationService(r.deps);
+    expect(await service.handle({ intent: "openBrowserExtensions" })).toEqual({ kind: "browser-extensions", browser: null, result: "browser-not-found" });
+    expect(r.located).toEqual([]);
+    expect(r.launches).toEqual([]);
+  });
+
+  it("openBrowserExtensions with request.browser opens that row from the locator with the row's own arguments, never anything from the request", async () => {
+    const r = rig();
+    const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+    r.locations = { ...r.locations, edge: { status: "found", source: "known-program-files-x86", executablePath: EDGE, rejected: [] } };
+    const service = createCollectorIntegrationService(r.deps);
+    const response = await service.handle({ intent: "openBrowserExtensions", browser: "edge" });
+    expect(response).toEqual({ kind: "browser-extensions", browser: "edge", result: "opened" });
+    expect(r.located).toEqual(["edge"]);
+    expect(r.launches).toEqual([{ executable: EDGE, args: ["edge://extensions/"] }]);
+    noAbsolutePath(response);
+    // an explicit row skips the inspection: the request alone selects the row
+    r.located.length = 0;
+    r.launches.length = 0;
+    expect(await service.handle({ intent: "openBrowserExtensions", browser: "vivaldi" })).toEqual({ kind: "browser-extensions", browser: "vivaldi", result: "browser-not-found" });
+    expect(r.located).toEqual(["vivaldi"]);
+    expect(r.launches).toEqual([]);
   });
 
   it("coalesces concurrent read-only inspections", async () => {
@@ -430,7 +578,7 @@ describe("collector integration service (review fixes)", () => {
     r.applyImpl = () => applying.promise;
     const service = createCollectorIntegrationService({ ...r.deps, inspect: () => calls[n++] ?? Promise.resolve(inspection("damaged")) });
     const early = service.handle({ intent: "inspect" }); // starts inspection #1 (slow)
-    const run = service.handle({ intent: "setup", proceedWithoutChrome: true }); // apply starts: new generation
+    const run = service.handle({ intent: "setup", proceedWithoutSupportedBrowser: true }); // apply starts: new generation
     await new Promise((resolve) => setTimeout(resolve, 0));
     const during = await service.handle({ intent: "inspect" });
     expect(n).toBe(2); // not the shared pre-apply inspection

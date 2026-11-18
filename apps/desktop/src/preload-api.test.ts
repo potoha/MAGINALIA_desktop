@@ -504,10 +504,12 @@ describe("Collector integration preload boundary", () => {
     const calls: Array<{ channel: string; args: unknown[] }> = [];
     const api = createMarkdownPreloadApi(async (channel, ...args) => { calls.push({ channel, args: [...args] }); return { kind: "busy" }; });
     await api.runCollectorIntegration({ intent: "setup", confirmReplaceForeign: true });
-    for (const bad of [null, "setup", { intent: "run", command: "calc" }, { intent: "inspect", path: "C:\\x" }, { intent: "setup", proceedWithoutChrome: "yes" }, { intent: "remove", confirmReplaceForeign: true }]) {
+    for (const bad of [null, "setup", { intent: "run", command: "calc" }, { intent: "inspect", path: "C:\\x" }, { intent: "setup", proceedWithoutSupportedBrowser: "yes" }, { intent: "remove", confirmReplaceForeign: true }, { intent: "openBrowserExtensions", browser: "C:\\x\\chrome.exe" }, { intent: "openBrowserExtensions", browser: "brave" }, { intent: "setup", browser: "chrome" }]) {
       expect(() => api.runCollectorIntegration(bad as never)).toThrow("request is invalid");
     }
     expect(calls).toEqual([{ channel: COLLECTOR_INTEGRATION_CHANNEL, args: [{ intent: "setup", confirmReplaceForeign: true }] }]);
+    await api.runCollectorIntegration({ intent: "openBrowserExtensions", browser: "edge" });
+    expect(calls[1]).toEqual({ channel: COLLECTOR_INTEGRATION_CHANNEL, args: [{ intent: "openBrowserExtensions", browser: "edge" }] });
   });
 
   it("validates notice ids going out and notice lists coming in", async () => {

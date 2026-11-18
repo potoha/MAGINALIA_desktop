@@ -12,7 +12,7 @@
  *    behind a user apply instead of failing, because it has no user to retry it.
  *  - Every apply result is handed to the orchestrator (`recordApplyResult`) and the resulting
  *    notice list is published.
- *  - `setup` refuses without Chrome unless the user explicitly continued (design 4.2). `remove`
+ *  - `setup` refuses without a supported browser unless the user explicitly continued (design 4.2). `remove`
  *    always asks for confirmation here, in the main process, so the renderer cannot remove the
  *    integration on its own.
  *  - Results are summaries (`collector-integration-ipc.ts`): no machine-local path is returned and
@@ -20,7 +20,8 @@
  */
 import type { CollectorNotice } from "./collector-integration-notices.js";
 import type { CollectorApplyRequest, CollectorApplyResult } from "./collector-integration-apply-types.js";
-import type { CollectorInspectOptions, CollectorIntegrationInspection, ChromeLocation } from "./collector-integration-types.js";
+import { COLLECTOR_BROWSERS, type CollectorBrowserId } from "./collector-browser-table.js";
+import type { BrowserLocation, CollectorInspectOptions, CollectorIntegrationInspection } from "./collector-integration-types.js";
 import type { CollectorStartupRefresh, CollectorStartupResult } from "./collector-startup-refresh.js";
 import type { CollectorIntegrationRuntimeMode } from "./collector-startup-refresh-composition.js";
 import {
@@ -85,11 +86,12 @@ export interface CollectorIntegrationServiceDependencies {
   readonly startupRefresh: CollectorStartupRefresh;
   readonly inspect: (options?: CollectorInspectOptions) => Promise<CollectorIntegrationInspection>;
   readonly apply: (request: CollectorApplyRequest) => Promise<CollectorApplyResult>;
-  readonly locateChrome: () => Promise<ChromeLocation>;
+  /** Main-process locator of one table row; the path it returns never leaves the main process. */
+  readonly locateBrowser: (id: CollectorBrowserId) => Promise<BrowserLocation>;
   /** The gate also handed to the composition's `wrapApply`, so the startup refresh shares it. */
   readonly gate: CollectorApplyGate;
-  /** Detached launch of the validated `chrome.exe` with fixed arguments. `false` on failure. */
-  readonly launchChrome: (executablePath: string, args: readonly string[]) => Promise<boolean>;
+  /** Detached launch of the validated browser executable with the row's fixed arguments. `false` on failure. */
+  readonly launchBrowser: (executablePath: string, args: readonly string[]) => Promise<boolean>;
   readonly writeClipboardText: (text: string) => void;
   /** Opens a folder in the shell. `false` when it could not be opened. */
   readonly openFolder: (folder: string) => Promise<boolean>;
@@ -105,7 +107,6 @@ export interface CollectorIntegrationServiceDependencies {
   readonly clearInterval?: (handle: unknown) => void;
 }
 
-export const COLLECTOR_CHROME_EXTENSIONS_ARGUMENTS: readonly string[] = Object.freeze(["chrome://extensions/"]);
 export const COLLECTOR_RECONCILE_INTERVAL_MS = 60_000;
 
 export interface CollectorIntegrationService {
@@ -137,7 +138,20 @@ export function summarizeInspection(inspection: CollectorIntegrationInspection, 
     reasons: Object.freeze([...inspection.reasons]),
     inspectionComplete: inspection.inspectionComplete,
     registration: inspection.registration,
-    chrome: Object.freeze({ status: inspection.chrome.status, defaultBrowser: inspection.chrome.defaultBrowser }),
+    browsers: Object.freeze({
+      defaultBrowser: inspection.browsers.defaultBrowser,
+      recommended: inspection.browsers.recommended,
+      recommendationReason: inspection.browsers.recommendationReason,
+      entries: Object.freeze(inspection.browsers.entries.map((entry) => Object.freeze({
+        id: entry.id,
+        verification: entry.verification,
+        installed: entry.installed,
+        registration: entry.effective.ownership,
+        registrationVia: entry.effective.target,
+        policyBlocked: entry.policy.blocked,
+        extensionLoadMayBeBlocked: entry.policy.extensionLoadMayBeBlocked,
+      }))),
+    }),
     policy: Object.freeze({
       blocked: inspection.policy.blocked,
       userLevelHostsDisabled: inspection.policy.userLevelHostsDisabled,
@@ -272,9 +286,11 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
         return { kind: "connection", state: inspection.state, applyInProgress: deps.gate.busy, connection: summarizeConnection(inspection) };
       }
       case "setup": {
-        if (request.proceedWithoutChrome !== true) {
+        if (request.proceedWithoutSupportedBrowser !== true) {
           const inspection = await inspectShared();
-          if (inspection.chrome.status !== "found") return { kind: "chrome-required", status: summarizeInspection(inspection, deps.gate.busy) };
+          // Design 7.2: a verified, installed browser that policy does not block must exist.
+          const usable = inspection.browsers.entries.some((entry) => entry.verification === "verified" && entry.installed === "found" && !entry.policy.blocked);
+          if (!usable) return { kind: "browser-required", status: summarizeInspection(inspection, deps.gate.busy) };
         }
         return runApply({ action: "setup", ...(request.confirmReplaceForeign === true ? { confirmReplaceForeign: true } : {}) });
       }
@@ -282,11 +298,16 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
         return runApply({ action: "repair", ...(request.confirmReplaceForeign === true ? { confirmReplaceForeign: true } : {}) });
       case "remove":
         return runApply({ action: "remove" });
-      case "openChromeExtensions": {
-        const location = await deps.locateChrome();
-        if (location.status !== "found") return { kind: "chrome-extensions", result: "chrome-not-found" };
-        const launched = await deps.launchChrome(location.executablePath, COLLECTOR_CHROME_EXTENSIONS_ARGUMENTS);
-        return { kind: "chrome-extensions", result: launched ? "opened" : "failed" };
+      case "openBrowserExtensions": {
+        // The renderer names at most a table row id. The executable comes from the main-process locator
+        // and the arguments from the row: nothing here is taken from the request.
+        const target: CollectorBrowserId | null = request.browser ?? (await inspectShared()).browsers.recommended;
+        const row = target === null ? undefined : COLLECTOR_BROWSERS.find((entry) => entry.id === target);
+        if (target === null || row === undefined) return { kind: "browser-extensions", browser: target, result: "browser-not-found" };
+        const location = await deps.locateBrowser(target);
+        if (location.status !== "found") return { kind: "browser-extensions", browser: target, result: "browser-not-found" };
+        const launched = await deps.launchBrowser(location.executablePath, row.extensionsPage.launchArguments);
+        return { kind: "browser-extensions", browser: target, result: launched ? "opened" : "failed" };
       }
       case "copyExtensionPath":
       case "revealExtensionFolder": {

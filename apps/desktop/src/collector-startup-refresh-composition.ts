@@ -28,14 +28,15 @@ import { applyCollectorIntegration } from "./collector-integration-apply.js";
 import type { CollectorIntegrationApplyDependencies } from "./collector-integration-apply-types.js";
 import {
   inspectCollectorIntegration,
+  locateBrowserExecutable,
   parseIntegrationStateFile,
   resolveIntegrationPaths,
 } from "./collector-integration.js";
+import type { CollectorBrowserId } from "./collector-browser-table.js";
 import type { CollectorRegistryAdapter } from "./collector-registry-adapter.js";
 import type { PathSecurityInspector } from "./collector-path-security.js";
 import { COLLECTOR_PAYLOAD_EMBEDDED, COMPILED_COLLECTOR_PAYLOAD } from "./collector-payload-compiled.js";
-import { locateChromeExecutable } from "./collector-integration.js";
-import type { ChromeLocation, CollectorInspectOptions, CollectorIntegrationInspection } from "./collector-integration-types.js";
+import type { BrowserLocation, CollectorInspectOptions, CollectorIntegrationInspection } from "./collector-integration-types.js";
 import type { CollectorApplyRequest, CollectorApplyResult } from "./collector-integration-apply-types.js";
 import { createFileCollectorNoticeStore, type CollectorNoticeStore } from "./collector-integration-notices.js";
 import {
@@ -85,8 +86,8 @@ export interface CollectorIntegrationRuntime {
   readonly inspect: (options?: CollectorInspectOptions) => Promise<CollectorIntegrationInspection>;
   /** Raw apply (not wrapped by `wrapApply`). Rejects in an inert runtime. */
   readonly apply: (request: CollectorApplyRequest) => Promise<CollectorApplyResult>;
-  /** Main-process only: the validated `chrome.exe` path must never reach the renderer or a log. Rejects in an inert runtime. */
-  readonly locateChrome: () => Promise<ChromeLocation>;
+  /** Main-process only: the validated executable path must never reach the renderer or a log. Rejects in an inert runtime. */
+  readonly locateBrowser: (id: CollectorBrowserId) => Promise<BrowserLocation>;
 }
 
 export class CollectorPayloadNotEmbeddedError extends Error {
@@ -109,7 +110,7 @@ const inertDependencies = (now: () => Date, noticeStore: CollectorNoticeStore, i
 const rejectInert = (): Promise<never> => Promise.reject(new Error("The Collector integration is inert in this process."));
 
 function inertRuntime(mode: "inert-e2e-isolation" | "inert-no-payload", startupRefresh: CollectorStartupRefresh): CollectorIntegrationRuntime {
-  return Object.freeze({ mode, startupRefresh, inspect: rejectInert, apply: rejectInert, locateChrome: rejectInert });
+  return Object.freeze({ mode, startupRefresh, inspect: rejectInert, apply: rejectInert, locateBrowser: rejectInert });
 }
 
 export function createCollectorIntegrationRuntimeFromParts(options: CollectorStartupCompositionOptions): CollectorIntegrationRuntime {
@@ -167,7 +168,7 @@ export function createCollectorIntegrationRuntimeFromParts(options: CollectorSta
     startupRefresh,
     inspect,
     apply,
-    locateChrome: () => locateChromeExecutable({ registry, fileSystem }),
+    locateBrowser: (id: CollectorBrowserId) => locateBrowserExecutable(id, { registry, fileSystem }),
   });
 }
 

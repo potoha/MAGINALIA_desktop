@@ -102,8 +102,6 @@ export interface CollectorIntegrationFileSystem {
 }
 
 export type BrowserExecutableSource = "app-paths-hkcu" | "app-paths-hklm-64" | "app-paths-hklm-32" | "known-local-app-data" | "known-program-files" | "known-program-files-x86";
-/** @deprecated Use `BrowserExecutableSource` (S7 removes the Chrome-only names). */
-export type ChromeSource = BrowserExecutableSource;
 
 export type ChromeCandidateRejection =
   | "not-absolute-local"
@@ -122,22 +120,10 @@ export type BrowserLocation =
   | { readonly status: "found"; readonly source: BrowserExecutableSource; readonly executablePath: string; readonly rejected: readonly BrowserRejectedCandidate[] }
   | { readonly status: "not-found"; readonly rejected: readonly BrowserRejectedCandidate[] }
   | { readonly status: "unknown" };
-/** @deprecated Use `BrowserLocation`. */
-export type ChromeLocation = BrowserLocation;
 
 export interface BrowserRejectedCandidate {
   readonly source: BrowserExecutableSource;
   readonly reason: ChromeCandidateRejection;
-}
-/** @deprecated Use `BrowserRejectedCandidate`. */
-export type ChromeRejectedCandidate = BrowserRejectedCandidate;
-
-/** The Chrome row of `browsers`, kept for the pre-multi-browser consumers (S7 removes it). */
-export interface ChromeDetection {
-  readonly status: "found" | "not-found" | "unknown";
-  readonly source: BrowserExecutableSource | null;
-  readonly rejected: readonly BrowserRejectedCandidate[];
-  readonly defaultBrowser: DefaultBrowserKind;
 }
 
 export interface ChromePolicyEvaluation {
@@ -244,8 +230,6 @@ export interface CollectorIntegrationInspection {
   /** Aggregate: `blocked` only when every verified browser is blocked (design 4.4-1). */
   readonly policy: ChromePolicyEvaluation & { readonly status: "read" | "unavailable" };
   readonly browsers: CollectorBrowsersInspection;
-  /** @deprecated The Chrome row of `browsers`; kept until S7 migrates the WP-7a service and IPC. */
-  readonly chrome: ChromeDetection;
   readonly contact: CollectorContactStatus;
   /** The only path allowed to leave (design 4.1): where the extension folder is or will be. */
   readonly extensionFolderDisplay: string | null;

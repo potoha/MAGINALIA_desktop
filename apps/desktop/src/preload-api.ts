@@ -553,11 +553,12 @@ export function createMarkdownPreloadApi(
     runCollectorIntegration: (request) => {
       if (!isCollectorIntegrationRequest(request)) throw new TypeError("The Collector integration request is invalid.");
       // Copy the validated fields only: nothing else the caller attached can reach the main process.
-      const { intent, confirmReplaceForeign, proceedWithoutChrome } = request;
+      const { intent, confirmReplaceForeign, proceedWithoutSupportedBrowser, browser } = request;
       return invoke(COLLECTOR_INTEGRATION_CHANNEL, {
         intent,
         ...(confirmReplaceForeign === undefined ? {} : { confirmReplaceForeign }),
-        ...(proceedWithoutChrome === undefined ? {} : { proceedWithoutChrome })
+        ...(proceedWithoutSupportedBrowser === undefined ? {} : { proceedWithoutSupportedBrowser }),
+        ...(browser === undefined ? {} : { browser })
       }) as Promise<CollectorIntegrationResponse>;
     },
     getCollectorNotices: async () => {

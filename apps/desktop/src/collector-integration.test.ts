@@ -10,7 +10,7 @@ import {
   expectedHostManifest,
   inspectCollectorIntegration,
   isLocalAbsoluteWindowsPath,
-  locateChromeExecutable,
+  locateBrowserExecutable,
   parseCollectorContactRecord,
   parseIntegrationStateFile,
 } from "./collector-integration";
@@ -469,14 +469,14 @@ describe("Chrome locator (design 4.2)", () => {
     fixture.fileSystem.addFile(hkcu, "x");
     fixture.fileSystem.addFile(CHROME, "x");
     fixture.registry.appPaths = [{ source: "hkcu", value: hkcu }, { source: "hklm-64", value: CHROME }];
-    const found = await locateChromeExecutable(fixture.dependencies);
+    const found = await locateBrowserExecutable("chrome", fixture.dependencies);
     expect(found).toMatchObject({ status: "found", source: "app-paths-hkcu", executablePath: hkcu });
   });
 
   it("falls back to the known folders when App Paths are absent", async () => {
     const fixture = setup();
     fixture.fileSystem.addFile(CHROME, "x");
-    const found = await locateChromeExecutable(fixture.dependencies);
+    const found = await locateBrowserExecutable("chrome", fixture.dependencies);
     expect(found).toMatchObject({ status: "found", source: "known-program-files", executablePath: CHROME });
   });
 
@@ -484,7 +484,7 @@ describe("Chrome locator (design 4.2)", () => {
     const fixture = setup();
     fixture.fileSystem.addFile(CHROME, "x");
     fixture.registry.appPaths = [{ source: "hklm-32", value: `"${CHROME}"` }];
-    expect(await locateChromeExecutable(fixture.dependencies)).toMatchObject({ status: "found", source: "app-paths-hklm-32" });
+    expect(await locateBrowserExecutable("chrome", fixture.dependencies)).toMatchObject({ status: "found", source: "app-paths-hklm-32" });
   });
 
   const rejects: ReadonlyArray<readonly [string, string, string, (f: IntegrationFixture) => void]> = [
@@ -509,7 +509,7 @@ describe("Chrome locator (design 4.2)", () => {
       const fixture = setup();
       arrange(fixture);
       fixture.registry.appPaths = [{ source: "hkcu", value }];
-      const result = await locateChromeExecutable(fixture.dependencies);
+      const result = await locateBrowserExecutable("chrome", fixture.dependencies);
       expect(result.status).toBe("not-found");
       if (result.status !== "not-found") return;
       expect(result.rejected[0]).toEqual({ source: "app-paths-hkcu", reason });
@@ -520,23 +520,23 @@ describe("Chrome locator (design 4.2)", () => {
     const fixture = setup();
     fixture.fileSystem.addFile(CHROME, "x");
     fixture.registry.appPaths = [{ source: "hkcu", value: "\\\\server\\x\\chrome.exe" }];
-    const result = await locateChromeExecutable(fixture.dependencies);
+    const result = await locateBrowserExecutable("chrome", fixture.dependencies);
     expect(result).toMatchObject({ status: "found", source: "known-program-files" });
     if (result.status === "found") expect(result.rejected).toContainEqual({ source: "app-paths-hkcu", reason: "not-absolute-local" });
   });
 
   it("is not-found when there is no candidate at all, and unknown when the registry read fails", async () => {
     const fixture = setup();
-    expect((await locateChromeExecutable(fixture.dependencies)).status).toBe("not-found");
+    expect((await locateBrowserExecutable("chrome", fixture.dependencies)).status).toBe("not-found");
     fixture.registry.failNext.readBrowserAppPaths = new Error("denied");
-    expect(await locateChromeExecutable(fixture.dependencies)).toEqual({ status: "unknown" });
+    expect(await locateBrowserExecutable("chrome", fixture.dependencies)).toEqual({ status: "unknown" });
   });
 
   it("a file-system failure rejects only that candidate", async () => {
     const fixture = setup();
     fixture.fileSystem.addFile(CHROME, "x");
     fixture.fileSystem.failing.add(securityKey("C:\\Program Files\\Google"));
-    const result = await locateChromeExecutable(fixture.dependencies);
+    const result = await locateBrowserExecutable("chrome", fixture.dependencies);
     expect(result.status).toBe("not-found");
     if (result.status === "not-found") expect(result.rejected.some((entry) => entry.reason === "read-failed")).toBe(true);
   });
@@ -545,14 +545,16 @@ describe("Chrome locator (design 4.2)", () => {
     const fixture = setup();
     fixture.fileSystem.addFile(CHROME, "x");
     const result = await inspect(fixture);
-    expect(result.chrome).toMatchObject({ status: "found", source: "known-program-files" });
-    expect(JSON.stringify(result.chrome)).not.toMatch(/Program Files|chrome\.exe/iu);
+    const chrome = result.browsers.entries.find((entry) => entry.id === "chrome");
+    expect(chrome).toMatchObject({ installed: "found", source: "known-program-files" });
+    expect(JSON.stringify(result.browsers)).not.toMatch(/Program Files|chrome\.exe/iu);
+    expect(result).not.toHaveProperty("chrome");
   });
 
   it("Chrome absence never changes the integration state", async () => {
     const fixture = createIntegrationFixture();
     const result = await inspect(fixture);
-    expect(result.chrome.status).toBe("not-found");
+    expect(result.browsers.entries.find((entry) => entry.id === "chrome")?.installed).toBe("not-found");
     expect(result.state).toBe("ready");
   });
 
@@ -570,9 +572,9 @@ describe("Chrome locator (design 4.2)", () => {
   it("default browser is reported and a failing read only yields unknown", async () => {
     const fixture = setup();
     fixture.registry.defaultBrowserProgId = "MSEdgeHTM";
-    expect((await inspect(fixture)).chrome.defaultBrowser).toBe("edge");
+    expect((await inspect(fixture)).browsers.defaultBrowser).toBe("edge");
     fixture.registry.failNext.readDefaultBrowserProgId = new Error("denied");
-    expect((await inspect(fixture)).chrome.defaultBrowser).toBe("unknown");
+    expect((await inspect(fixture)).browsers.defaultBrowser).toBe("unknown");
   });
 
   it("local absolute path rule", () => {

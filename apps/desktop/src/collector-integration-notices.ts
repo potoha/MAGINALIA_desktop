@@ -17,7 +17,7 @@ import { parseCollectorVersion } from "./collector-version.js";
 export const COLLECTOR_SETUP_COMMAND_ID = "maginalia.collector.setup";
 export const COLLECTOR_REPAIR_COMMAND_ID = "maginalia.collector.repair";
 /** New in WP-5c (not in design 5): the notice buttons of design 6.5 / 5. */
-export const COLLECTOR_OPEN_CHROME_EXTENSIONS_COMMAND_ID = "maginalia.collector.openChromeExtensions";
+export const COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND_ID = "maginalia.collector.openBrowserExtensions";
 export const COLLECTOR_DISMISS_NOTICE_COMMAND_ID = "maginalia.collector.dismissNotice";
 
 export const COLLECTOR_NOTICE_IDS = Object.freeze({
@@ -77,7 +77,7 @@ export function buildUpdatedNotice(extensionVersion: string, createdAt: string):
     createdAt,
     clearsWhen: "contact-reports-extension-version" as const,
     actions: Object.freeze([
-      { commandId: COLLECTOR_OPEN_CHROME_EXTENSIONS_COMMAND_ID, label: "Chrome で拡張機能の画面を開く" },
+      { commandId: COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND_ID, label: "Chrome で拡張機能の画面を開く" },
       { commandId: COLLECTOR_DISMISS_NOTICE_COMMAND_ID, label: "閉じる", argument: { noticeId: COLLECTOR_NOTICE_IDS.updated } },
     ]),
   });

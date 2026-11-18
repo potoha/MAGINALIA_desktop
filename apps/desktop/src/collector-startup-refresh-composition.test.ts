@@ -104,7 +104,7 @@ describe("integration runtime (WP-7 slice A)", () => {
     expect(runtime.mode).toBe("inert-e2e-isolation");
     await expect(runtime.inspect()).rejects.toThrow();
     await expect(runtime.apply({ action: "setup" })).rejects.toThrow();
-    await expect(runtime.locateChrome()).rejects.toThrow();
+    await expect(runtime.locateBrowser("chrome")).rejects.toThrow();
     expect(constructed).toBe(0);
     expect(await readdir(m.root)).toEqual(["Local", "Programs"]);
   });
@@ -128,7 +128,8 @@ describe("integration runtime (WP-7 slice A)", () => {
     expect(wrapped).toBe(1);
     const inspection = await runtime.inspect({ verifyFileHashes: false });
     expect(inspection.state).toBe("not-set-up");
-    expect((await runtime.locateChrome()).status).toBeDefined();
+    expect((await runtime.locateBrowser("chrome")).status).toBeDefined();
+    expect((await runtime.locateBrowser("edge")).status).toBeDefined();
     expect(await readdir(m.root)).toEqual(["Local", "Programs"]);
   });
 });

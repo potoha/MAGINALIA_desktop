@@ -10,6 +10,13 @@
  * from Electron and nothing with side effects.
  */
 import type { CollectorApplyAction, CollectorApplyOutcome, CollectorApplyReason, CollectorApplyWarning } from "./collector-integration-apply-types.js";
+import {
+  COLLECTOR_BROWSER_IDS,
+  type CollectorBrowserId,
+  type CollectorBrowserInstalled,
+  type CollectorRecommendationReason,
+  type CollectorRegistryTargetId,
+} from "./collector-browser-table.js";
 import type {
   CollectorIntegrationReason,
   CollectorIntegrationState,
@@ -32,7 +39,7 @@ export const COLLECTOR_INTEGRATION_INTENTS = [
   "setup",
   "repair",
   "remove",
-  "openChromeExtensions",
+  "openBrowserExtensions",
   "copyExtensionPath",
   "revealExtensionFolder",
   "checkConnection",
@@ -47,13 +54,20 @@ export interface CollectorIntegrationRequest {
    */
   readonly confirmReplaceForeign?: boolean;
   /**
-   * `setup` only. The user chose "Chrome は入っています（このまま続ける）" (design 4.2). Without it a
-   * setup is refused unless Chrome was found.
+   * `setup` only. The user chose to continue although no supported browser was found (design 4.2,
+   * multi-browser design 7.1). Without it a setup is refused unless a verified, installed browser
+   * that policy does not block was found.
    */
-  readonly proceedWithoutChrome?: boolean;
+  readonly proceedWithoutSupportedBrowser?: boolean;
+  /**
+   * `openBrowserExtensions` only. A table row id (an enumeration, never a path or URL). Omitted: the
+   * recommended browser of the current inspection. The main process still locates and validates the
+   * executable itself.
+   */
+  readonly browser?: CollectorBrowserId;
 }
 
-const REQUEST_KEYS = ["intent", "confirmReplaceForeign", "proceedWithoutChrome"] as const;
+const REQUEST_KEYS = ["intent", "confirmReplaceForeign", "proceedWithoutSupportedBrowser", "browser"] as const;
 
 export function isCollectorIntegrationRequest(value: unknown): value is CollectorIntegrationRequest {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
@@ -61,11 +75,15 @@ export function isCollectorIntegrationRequest(value: unknown): value is Collecto
   const keys = Object.keys(record);
   if (!keys.every((key) => (REQUEST_KEYS as readonly string[]).includes(key))) return false;
   if (!Object.hasOwn(record, "intent") || typeof record.intent !== "string" || !(COLLECTOR_INTEGRATION_INTENTS as readonly string[]).includes(record.intent)) return false;
-  for (const flag of ["confirmReplaceForeign", "proceedWithoutChrome"] as const) {
+  for (const flag of ["confirmReplaceForeign", "proceedWithoutSupportedBrowser"] as const) {
     if (record[flag] !== undefined && typeof record[flag] !== "boolean") return false;
   }
   if (record.confirmReplaceForeign !== undefined && record.intent !== "setup" && record.intent !== "repair") return false;
-  if (record.proceedWithoutChrome !== undefined && record.intent !== "setup") return false;
+  if (record.proceedWithoutSupportedBrowser !== undefined && record.intent !== "setup") return false;
+  if (record.browser !== undefined) {
+    if (typeof record.browser !== "string" || !(COLLECTOR_BROWSER_IDS as readonly string[]).includes(record.browser)) return false;
+    if (record.intent !== "openBrowserExtensions") return false;
+  }
   return true;
 }
 
@@ -85,6 +103,28 @@ export function isCollectorNoticeId(value: unknown): value is string {
 
 // ----- Results ------------------------------------------------------------------------------
 
+/** One browser row as the renderer may see it. Deliberately has no path, executable location or ProgId. */
+export interface CollectorBrowserSummary {
+  readonly id: CollectorBrowserId;
+  readonly verification: "verified" | "unverified";
+  readonly installed: CollectorBrowserInstalled;
+  /** Who owns the registration this browser will actually use (`effective` of the inspection). */
+  readonly registration: "ours" | "foreign" | "absent" | "unknown";
+  /** The registry target that registration lives in (Edge may use the Chromium or Chrome key), or `null`. */
+  readonly registrationVia: CollectorRegistryTargetId | null;
+  readonly policyBlocked: boolean;
+  readonly extensionLoadMayBeBlocked: boolean;
+}
+
+export interface CollectorBrowsersSummary {
+  /** A classification only (never the ProgId string). */
+  readonly defaultBrowser: DefaultBrowserKind;
+  readonly recommended: CollectorBrowserId | null;
+  readonly recommendationReason: CollectorRecommendationReason;
+  /** Table order. */
+  readonly entries: readonly CollectorBrowserSummary[];
+}
+
 /** Everything safe for the renderer. Deliberately has no path field. */
 export interface CollectorIntegrationStatus {
   /**
@@ -96,7 +136,7 @@ export interface CollectorIntegrationStatus {
   readonly reasons: readonly CollectorIntegrationReason[];
   readonly inspectionComplete: boolean;
   readonly registration: "absent" | "ours" | "foreign" | "unknown";
-  readonly chrome: { readonly status: "found" | "not-found" | "unknown"; readonly defaultBrowser: DefaultBrowserKind };
+  readonly browsers: CollectorBrowsersSummary;
   readonly policy: {
     readonly blocked: boolean;
     readonly userLevelHostsDisabled: boolean;
@@ -141,9 +181,13 @@ export type CollectorIntegrationResponse =
   }
   /** `remove`: the user declined the confirmation. Nothing changed. */
   | { readonly kind: "cancelled" }
-  /** `setup`: Chrome was not found (or could not be determined) and `proceedWithoutChrome` was not set. Nothing written. */
-  | { readonly kind: "chrome-required"; readonly status: CollectorIntegrationStatus }
-  | { readonly kind: "chrome-extensions"; readonly result: "opened" | "chrome-not-found" | "failed" }
+  /**
+   * `setup`: no verified, installed, policy-allowed browser was found (or detection failed) and
+   * `proceedWithoutSupportedBrowser` was not set. Nothing written.
+   */
+  | { readonly kind: "browser-required"; readonly status: CollectorIntegrationStatus }
+  /** `browser` is the row that was tried (`null`: there was none to try). */
+  | { readonly kind: "browser-extensions"; readonly browser: CollectorBrowserId | null; readonly result: "opened" | "browser-not-found" | "failed" }
   | { readonly kind: "extension-folder"; readonly intent: "copyExtensionPath" | "revealExtensionFolder"; readonly result: "done" | "unavailable" | "failed" }
   | { readonly kind: "connection"; readonly state: CollectorIntegrationState; readonly applyInProgress: boolean; readonly connection: CollectorConnectionSummary };
 

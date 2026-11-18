@@ -69,8 +69,6 @@ import type {
   BrowserLocation,
   BrowserRejectedCandidate,
   ChromeCandidateRejection,
-  ChromeDetection,
-  ChromeLocation,
   ChromePolicyEvaluation,
   CollectorBrowserStatus,
   CollectorContactInvalidReason,
@@ -331,18 +329,10 @@ export async function locateBrowserExecutable(
   return { status: "not-found", rejected: Object.freeze(rejected) };
 }
 
-/** Chrome-only entry point kept for the WP-7a service (S7 moves it to `locateBrowserExecutable`). */
-export async function locateChromeExecutable(
-  dependencies: Pick<CollectorIntegrationInspectDependencies, "registry" | "fileSystem">,
-): Promise<ChromeLocation> {
-  return locateBrowserExecutable("chrome", dependencies);
-}
-
 /** What the inspection learns about one table row (never contains a path). */
 interface DetectedBrowser {
   readonly installed: CollectorBrowserInstalled;
   readonly source: BrowserExecutableSource | null;
-  readonly rejected: readonly BrowserRejectedCandidate[];
   readonly policy: ChromePolicyEvaluation;
   readonly policyStatus: "read" | "unavailable" | "not-applicable";
 }
@@ -370,7 +360,6 @@ async function detectBrowsers(
     detected.set(row.id, Object.freeze({
       installed: location.status,
       source: location.status === "found" ? location.source : null,
-      rejected: location.status === "unknown" ? Object.freeze([]) : location.rejected,
       policy,
       policyStatus,
     }));
@@ -1033,15 +1022,6 @@ export async function inspectCollectorIntegration(
   }));
   const registrations = Object.freeze(Object.fromEntries(COLLECTOR_REGISTRY_TARGET_IDS.map((target) => [target, ownerships[target] ?? "unknown"]))) as Readonly<Record<CollectorRegistryTargetId, CollectorTargetOwnership>>;
 
-  // Compatibility view of the Chrome row for the pre-multi-browser consumers (WP-7a service, IPC).
-  const chromeFacts = detected.get("chrome");
-  const chrome: ChromeDetection = Object.freeze({
-    status: chromeFacts?.installed ?? "unknown",
-    source: chromeFacts?.source ?? null,
-    rejected: chromeFacts?.rejected ?? Object.freeze([]),
-    defaultBrowser,
-  });
-
   return Object.freeze({
     state,
     reasons: Object.freeze([...sink.reasons]),
@@ -1067,7 +1047,6 @@ export async function inspectCollectorIntegration(
       recommendationReason: recommendation.reason,
       entries,
     }),
-    chrome,
     contact,
     extensionFolderDisplay: paths?.extensionFolder ?? null,
     writesAllowed: !dependencies.e2eIsolationActive,

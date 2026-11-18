@@ -585,12 +585,14 @@ describe("browsers: default browser, detection and recommendation", () => {
     expect(result.state).toBe("ready");
   });
 
-  it("the deprecated chrome view equals the Chrome row", async () => {
+  it("the Chrome row and the default browser are read from the browsers view alone", async () => {
     const fixture = createIntegrationFixture();
     installChrome(fixture);
     fixture.registry.defaultBrowserProgId = "VivaldiHTM";
     const result = await inspectWith(fixture);
-    expect(result.chrome).toMatchObject({ status: "found", source: "known-program-files", defaultBrowser: "vivaldi" });
+    expect(result.browsers.entries.find((entry) => entry.id === "chrome")).toMatchObject({ installed: "found", source: "known-program-files" });
+    expect(result.browsers.defaultBrowser).toBe("vivaldi");
+    expect(result).not.toHaveProperty("chrome");
   });
 });
 

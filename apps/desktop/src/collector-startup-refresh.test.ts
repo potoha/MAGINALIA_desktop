@@ -4,7 +4,7 @@ import type { CollectorIntegrationInspection, CollectorIntegrationState } from "
 import {
   COLLECTOR_DISMISS_NOTICE_COMMAND_ID,
   COLLECTOR_NOTICE_IDS,
-  COLLECTOR_OPEN_CHROME_EXTENSIONS_COMMAND_ID,
+  COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND_ID,
   COLLECTOR_REPAIR_COMMAND_ID,
   COLLECTOR_SETUP_COMMAND_ID,
   DEFAULT_COLLECTOR_NOTICE_STATE,
@@ -28,7 +28,6 @@ function inspection(state: CollectorIntegrationState, overrides: Partial<Collect
     versions: { host: "older", extension: "older" },
     filesVerified: false,
     policy: { userLevelHostsDisabled: false, hostBlocked: false, blocked: false, extensionLoadMayBeBlocked: false, status: "read" },
-    chrome: { status: "found", source: "app-paths-hkcu", rejected: [], defaultBrowser: "chrome" },
     contact: { status: "absent" },
     extensionFolderDisplay: null,
     writesAllowed: true,
@@ -113,7 +112,7 @@ describe("automatic refresh (design 6.2)", () => {
     const updated = result.notices[0] as Extract<CollectorNotice, { kind: "updated" }>;
     expect(updated.extensionVersion).toBe("0.4.0");
     expect(updated.title).toBe("MAGINALIA Collector を新しい版（0.4.0）に更新しました。");
-    expect(updated.actions.map((action) => action.commandId)).toEqual([COLLECTOR_OPEN_CHROME_EXTENSIONS_COMMAND_ID, COLLECTOR_DISMISS_NOTICE_COMMAND_ID]);
+    expect(updated.actions.map((action) => action.commandId)).toEqual([COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND_ID, COLLECTOR_DISMISS_NOTICE_COMMAND_ID]);
     expect(r.store.state.updated).toEqual({ extensionVersion: "0.4.0", createdAt: T0 });
   });
 

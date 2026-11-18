@@ -1,3 +1,4 @@
+import { COLLECTOR_BROWSERS } from "../collector-browser-table";
 import type { CollectorIntegrationRequest, CollectorIntegrationResponse } from "../collector-integration-ipc";
 import type { CollectorNoticeAction } from "../collector-integration-notices";
 import type { CommandArgs, CommandRegistry } from "./command-registry";
@@ -14,7 +15,7 @@ import type { CommandArgs, CommandRegistry } from "./command-registry";
 export const COLLECTOR_SETUP_COMMAND = "maginalia.collector.setup";
 export const COLLECTOR_REPAIR_COMMAND = "maginalia.collector.repair";
 export const COLLECTOR_REMOVE_INTEGRATION_COMMAND = "maginalia.collector.removeIntegration";
-export const COLLECTOR_OPEN_CHROME_EXTENSIONS_COMMAND = "maginalia.collector.openChromeExtensions";
+export const COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND = "maginalia.collector.openBrowserExtensions";
 export const COLLECTOR_DISMISS_NOTICE_COMMAND = "maginalia.collector.dismissNotice";
 
 export interface CollectorIntegrationCommandDependencies {
@@ -22,6 +23,11 @@ export interface CollectorIntegrationCommandDependencies {
   readonly run: ((request: CollectorIntegrationRequest) => Promise<CollectorIntegrationResponse>) | null;
   /** `window.maginalia.dismissCollectorNotice`; `null` when this runtime has none. */
   readonly dismiss: ((noticeId: string) => Promise<unknown>) | null;
+}
+
+/** The names of the browsers a setup accepts today (verified rows of the table, in table order). */
+function supportedBrowserNames(): string {
+  return COLLECTOR_BROWSERS.filter((entry) => entry.verification === "verified").map((entry) => entry.displayName).join("、");
 }
 
 /**
@@ -37,10 +43,15 @@ export function collectorResponseProblem(response: CollectorIntegrationResponse)
       return "Collector 連携の操作を実行できませんでした。";
     case "busy":
       return "別の Collector 連携の操作を実行中です。終わってからもう一度お試しください。";
-    case "chrome-required":
-      return "Google Chrome が見つからないため、Collector 連携を設定していません。";
-    case "chrome-extensions":
-      return response.result === "opened" ? null : "Chrome の拡張機能の画面を開けませんでした。Chrome のアドレスバーに chrome://extensions と入力してください。";
+    case "browser-required":
+      return `対応しているブラウザー（${supportedBrowserNames()}）が見つからないため、Collector 連携を設定していません。`;
+    case "browser-extensions": {
+      if (response.result === "opened") return null;
+      const row = response.browser === null ? undefined : COLLECTOR_BROWSERS.find((entry) => entry.id === response.browser);
+      return row === undefined
+        ? "ブラウザーの拡張機能の画面を開けませんでした。対応しているブラウザーが見つかりません。"
+        : `${row.displayName} の拡張機能の画面を開けませんでした。${row.displayName} のアドレスバーに ${row.extensionsPage.displayUrl} と入力してください。`;
+    }
     case "apply":
       return response.outcome === "failed" || response.outcome === "refused" || response.outcome === "partial"
         ? "Collector 連携の操作を完了できませんでした。「Collector 連携を確認・修復…」で状態を確認してください。"
@@ -60,9 +71,9 @@ export function registerCollectorIntegrationCommands(registry: CommandRegistry, 
   registry.register({
     id: COLLECTOR_SETUP_COMMAND,
     title: "Collector 連携を設定",
-    description: "Set up the MAGINALIA Collector integration for Google Chrome.",
+    description: "Set up the MAGINALIA Collector integration for a supported browser.",
     category: "Collector",
-    keywords: ["collector", "chrome", "extension", "setup", "連携", "設定"]
+    keywords: ["collector", "chrome", "browser", "extension", "setup", "ブラウザー", "連携", "設定"]
   }, () => run({ intent: "setup" }));
 
   registry.register({
@@ -82,12 +93,12 @@ export function registerCollectorIntegrationCommands(registry: CommandRegistry, 
   }, () => run({ intent: "remove" }));
 
   registry.register({
-    id: COLLECTOR_OPEN_CHROME_EXTENSIONS_COMMAND,
-    title: "Chrome で拡張機能の画面を開く",
-    description: "Open Chrome's extensions page so the MAGINALIA Collector can be loaded or updated.",
+    id: COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND,
+    title: "ブラウザーで拡張機能の画面を開く",
+    description: "Open the browser's extensions page so the MAGINALIA Collector can be loaded or updated.",
     category: "Collector",
-    keywords: ["collector", "chrome", "extensions", "拡張機能"]
-  }, () => run({ intent: "openChromeExtensions" }));
+    keywords: ["collector", "chrome", "browser", "extensions", "ブラウザー", "拡張機能"]
+  }, () => run({ intent: "openBrowserExtensions" }));
 
   registry.register({
     id: COLLECTOR_DISMISS_NOTICE_COMMAND,
