@@ -8,8 +8,11 @@
 # Rules (all enforced by src/collector-uninstall.test.ts):
 #  - Runs only from `customUnInstall`, only when NOT ${isUpdated} (an update keeps the integration)
 #    and only for a per-user install ($installMode == "CurrentUser"; see the macro at the end).
-#  - The HKCU Native Messaging Host key is removed only when its default value equals OUR manifest
-#    path. A foreign value is left alone and the folder cleanup still runs.
+#  - Every writable HKCU Native Messaging Host key (Chrome, Edge) is checked on its own and removed
+#    only when its default value equals OUR manifest path. A foreign value is left alone and the
+#    other keys and the folder cleanup still run. The parent NativeMessagingHosts keys, the
+#    read-only Chromium key and any other host are never touched. This does not depend on the state
+#    file: the registry decision is the value match alone.
 #  - Files are deleted only inside the fixed program folder, only by fixed name (or our private
 #    `<name>.<16 lowercase hex>.tmp` temp names), and only when the program folder holds a VALID
 #    integration-state.json (the ownership evidence). No state file, or an invalid one: nothing on
@@ -19,7 +22,7 @@
 #  - A link / junction / reparse point (folder or file) is never followed and never deleted.
 #  - Unknown files stay; the folder then stays (the safe failure). Nothing outside the program
 #    folder is touched: not %LOCALAPPDATA%\MAGINALIA (binding, journal), Shelf, Workdesk, Projects,
-#    Chrome profile data or the Chrome-side extension registration.
+#    browser profile data or the browser-side extension registration.
 #
 # Register use (uninstaller functions): leaf functions $0-$5, layer 2 $R0-$R4, layer 3 $R5-$R7,
 # slot / extension cleanup $R8-$R9, folder cleanup and state check $6-$9. Result goes in $0. The
@@ -27,7 +30,13 @@
 
 !include "LogicLib.nsh"
 
-!define MAGINALIA_COLLECTOR_HOST_KEY "Software\Google\Chrome\NativeMessagingHosts\org.maginalia.collector"
+# One define per WRITABLE registry target of the addon table (apps/desktop/native/windows-integration,
+# kTargets) and of COLLECTOR_REGISTRY_TARGETS: chrome, edge. A define is named after the target id.
+# The read-only targets (chromium, and the unverified vivaldi) are never written or deleted by
+# MAGINALIA, so they have no define here. Add a define (and one insertmacro below) for a new
+# writable target; src/collector-uninstall.test.ts checks the three tables agree.
+!define MAGINALIA_COLLECTOR_HOST_KEY_CHROME "Software\Google\Chrome\NativeMessagingHosts\org.maginalia.collector"
+!define MAGINALIA_COLLECTOR_HOST_KEY_EDGE "Software\Microsoft\Edge\NativeMessagingHosts\org.maginalia.collector"
 !define MAGINALIA_COLLECTOR_PROGRAM_SUBPATH "Programs\MAGINALIA Collector"
 !define MAGINALIA_COLLECTOR_MANIFEST_NAME "org.maginalia.collector.json"
 !define MAGINALIA_COLLECTOR_STATE_NAME "integration-state.json"
@@ -230,8 +239,11 @@ Function un.MAGINALIA_CleanExtension
 FunctionEnd
 
 # Pop program folder; $0 = "1" only when it is a plain directory holding a valid integration-state.json
-# (mirrors parseIntegrationStateFile: exactly the five fields, version 1, payloadId, activeSlot a|b,
-# extensionVersion, placedAt). Any doubt, including a PowerShell failure, is "0". Clobbers $0-$9, $R0-$R7.
+# (mirrors parseIntegrationStateFile, multi-browser design 4.3 / 6.1: version 1 has exactly the five
+# fields version, payloadId, activeSlot a|b, extensionVersion, placedAt; version 2 has exactly those
+# five plus registeredTargets, an array without duplicates whose entries are the writable target ids
+# "chrome" / "edge" in any order, possibly empty). Any doubt, including a PowerShell failure, is "0".
+# Clobbers $0-$9, $R0-$R7.
 Function un.MAGINALIA_HasValidState
   Pop $6
   Push $6
@@ -264,14 +276,27 @@ Function un.MAGINALIA_HasValidState
   FileWrite $9 `  $$t = (New-Object System.Text.UTF8Encoding($$false, $$true)).GetString([byte[]]$$b)$\r$\n`
   FileWrite $9 `  Add-Type -AssemblyName System.Web.Extensions$\r$\n`
   FileWrite $9 `  $$o = (New-Object System.Web.Script.Serialization.JavaScriptSerializer).DeserializeObject($$t)$\r$\n`
-  FileWrite $9 `  if ($$o -isnot [System.Collections.IDictionary] -or $$o.Count -ne 5) { exit 3 }$\r$\n`
-  FileWrite $9 `  foreach ($$k in 'version','payloadId','activeSlot','extensionVersion','placedAt') { if (-not $$o.ContainsKey($$k)) { exit 3 } }$\r$\n`
-  FileWrite $9 `  if ($$o['version'] -isnot [int] -or $$o['version'] -ne 1) { exit 3 }$\r$\n`
+  FileWrite $9 `  if ($$o -isnot [System.Collections.IDictionary] -or -not $$o.ContainsKey('version')) { exit 3 }$\r$\n`
+  FileWrite $9 `  $$v = $$o['version']$\r$\n`
+  FileWrite $9 `  if ($$v -isnot [int] -or ($$v -ne 1 -and $$v -ne 2)) { exit 3 }$\r$\n`
+  FileWrite $9 `  $$f = 'version','payloadId','activeSlot','extensionVersion','placedAt'$\r$\n`
+  FileWrite $9 `  if ($$v -eq 2) { $$f += 'registeredTargets' }$\r$\n`
+  FileWrite $9 `  if ($$o.Count -ne $$f.Count) { exit 3 }$\r$\n`
+  FileWrite $9 `  foreach ($$k in $$f) { if (-not $$o.ContainsKey($$k)) { exit 3 } }$\r$\n`
   FileWrite $9 `  if ($$o['payloadId'] -isnot [string] -or $$o['payloadId'] -cnotmatch '^[0-9A-Za-z][0-9A-Za-z.-]{0,63}\+[0-9A-Za-z]{1,40}\z') { exit 3 }$\r$\n`
   FileWrite $9 `  if ($$o['activeSlot'] -isnot [string] -or ($$o['activeSlot'] -cne 'a' -and $$o['activeSlot'] -cne 'b')) { exit 3 }$\r$\n`
   FileWrite $9 `  if ($$o['extensionVersion'] -isnot [string] -or $$o['extensionVersion'] -cnotmatch '^[0-9]{1,9}(\.[0-9]{1,9}){0,3}(-(?<pre>[0-9A-Za-z][0-9A-Za-z.-]{0,31}))?(\+[0-9A-Za-z][0-9A-Za-z.-]{0,63})?\z') { exit 3 }$\r$\n`
   FileWrite $9 `  if ($$Matches['pre'] -and @($$Matches['pre'].Split('.') | Where-Object { $$_.Length -eq 0 }).Count -gt 0) { exit 3 }$\r$\n`
   FileWrite $9 `  if ($$o['placedAt'] -isnot [string] -or $$o['placedAt'] -cnotmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,3})?Z\z') { exit 3 }$\r$\n`
+  FileWrite $9 `  if ($$v -eq 2) {$\r$\n`
+  FileWrite $9 `    $$r = $$o['registeredTargets']$\r$\n`
+  FileWrite $9 `    if ($$r -isnot [object[]]) { exit 3 }$\r$\n`
+  FileWrite $9 `    $$seen = @{}$\r$\n`
+  FileWrite $9 `    foreach ($$e in $$r) {$\r$\n`
+  FileWrite $9 `      if ($$e -isnot [string] -or ($$e -cne 'chrome' -and $$e -cne 'edge') -or $$seen.ContainsKey($$e)) { exit 3 }$\r$\n`
+  FileWrite $9 `      $$seen[$$e] = $$true$\r$\n`
+  FileWrite $9 `    }$\r$\n`
+  FileWrite $9 `  }$\r$\n`
   FileWrite $9 `  exit 0$\r$\n`
   FileWrite $9 `} catch { exit 3 }$\r$\n`
   FileClose $9
@@ -343,8 +368,21 @@ FunctionEnd
 
 !endif
 
-# Registration + folder cleanup. `${MAGINALIA_COLLECTOR_HOST_KEY}` is unregistered only when its
-# default value is exactly our manifest path (case-insensitive compare, as Windows paths are).
+# One writable target: the HKCU host key `hostKey` is unregistered only when its default value is
+# exactly our manifest path (case-insensitive compare, as Windows paths are). Then the key itself
+# goes only when it is empty (a foreign extra value keeps it). The parent keys stay. Uses $R0 only;
+# an error here (missing key, no access) just skips this target and never stops the next one.
+!macro MAGINALIA_UnregisterHostKey hostKey
+  ClearErrors
+  ReadRegStr $R0 HKCU "${hostKey}" ""
+  ${IfNot} ${Errors}
+  ${AndIf} $R0 == "$LOCALAPPDATA\${MAGINALIA_COLLECTOR_PROGRAM_SUBPATH}\${MAGINALIA_COLLECTOR_MANIFEST_NAME}"
+    DeleteRegValue HKCU "${hostKey}" ""
+    DeleteRegKey /ifempty HKCU "${hostKey}"
+  ${EndIf}
+!macroend
+
+# Registration (every writable target) + folder cleanup.
 !macro MAGINALIA_CollectorCleanup
   Push $0
   Push $1
@@ -367,13 +405,8 @@ FunctionEnd
   Push $R8
   Push $R9
 
-  ClearErrors
-  ReadRegStr $R0 HKCU "${MAGINALIA_COLLECTOR_HOST_KEY}" ""
-  ${IfNot} ${Errors}
-  ${AndIf} $R0 == "$LOCALAPPDATA\${MAGINALIA_COLLECTOR_PROGRAM_SUBPATH}\${MAGINALIA_COLLECTOR_MANIFEST_NAME}"
-    DeleteRegValue HKCU "${MAGINALIA_COLLECTOR_HOST_KEY}" ""
-    DeleteRegKey /ifempty HKCU "${MAGINALIA_COLLECTOR_HOST_KEY}"
-  ${EndIf}
+  !insertmacro MAGINALIA_UnregisterHostKey "${MAGINALIA_COLLECTOR_HOST_KEY_CHROME}"
+  !insertmacro MAGINALIA_UnregisterHostKey "${MAGINALIA_COLLECTOR_HOST_KEY_EDGE}"
 
   Push "$LOCALAPPDATA\${MAGINALIA_COLLECTOR_PROGRAM_SUBPATH}"
   Call un.MAGINALIA_HasValidState

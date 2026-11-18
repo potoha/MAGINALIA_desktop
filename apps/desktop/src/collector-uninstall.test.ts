@@ -1,7 +1,9 @@
 /**
- * Static checks of the Collector uninstall cleanup (WP-8, design 2.4 / 8.5): the NSIS script is
- * read as text, never executed. The real uninstall is an owner E2E (WP-9). The compile test runs
- * only where electron-builder's NSIS (makensis) is already cached.
+ * Static checks of the Collector uninstall cleanup (WP-8, design 2.4 / 8.5; multi-browser S5, design
+ * 4.3 / 6): the NSIS script is read as text, never executed. The state-check PowerShell is the one
+ * piece that is executed (Windows PowerShell 5.1), against parseIntegrationStateFile for state v1
+ * and v2. The real uninstall is an owner E2E (WP-9). The compile test runs only where
+ * electron-builder's NSIS (makensis) is already cached.
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
@@ -10,6 +12,7 @@ import os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { COLLECTOR_EXTENSION_PREVIOUS_NAME, COLLECTOR_EXTENSION_STAGING_NAME, COLLECTOR_HOST_LICENSE_FILES } from "./collector-integration-apply.js";
+import { COLLECTOR_REGISTRY_TARGETS } from "./collector-browser-table.js";
 import { COLLECTOR_EXTENSION_FOLDER_NAME, COLLECTOR_HOST_SLOTS, COLLECTOR_STATE_FILE_NAME, parseIntegrationStateFile } from "./collector-integration.js";
 import { COLLECTOR_HOST_ADDON_NAME, COLLECTOR_HOST_EXECUTABLE_NAME } from "./collector-payload.js";
 import { COLLECTOR_HOST_REGISTRY_SUBKEY, COLLECTOR_MANIFEST_FILE_NAME, COLLECTOR_PROGRAM_FOLDER_NAME } from "./windows-integration.js";
@@ -87,24 +90,72 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
   it("unregisters only when the registry value equals our own manifest path", async () => {
     const source = await readScript();
     const lines = codeLines(source);
-    const hostKey = `!define MAGINALIA_COLLECTOR_HOST_KEY "${COLLECTOR_HOST_REGISTRY_SUBKEY}"`;
-    expect(lines).toContain(hostKey);
+    expect(lines).toContain(`!define MAGINALIA_COLLECTOR_HOST_KEY_CHROME "${COLLECTOR_HOST_REGISTRY_SUBKEY}"`);
     expect(lines).toContain(`!define MAGINALIA_COLLECTOR_MANIFEST_NAME "${COLLECTOR_MANIFEST_FILE_NAME}"`);
     expect(lines).toContain(`!define MAGINALIA_COLLECTOR_PROGRAM_SUBPATH "Programs\\${COLLECTOR_PROGRAM_FOLDER_NAME}"`);
 
-    const read = lines.findIndex((line) => line.startsWith('ReadRegStr $R0 HKCU "${MAGINALIA_COLLECTOR_HOST_KEY}" ""'));
-    const compare = lines.findIndex((line) => line === '${AndIf} $R0 == "$LOCALAPPDATA\\${MAGINALIA_COLLECTOR_PROGRAM_SUBPATH}\\${MAGINALIA_COLLECTOR_MANIFEST_NAME}"');
-    const deleteValue = lines.findIndex((line) => line.startsWith("DeleteRegValue HKCU"));
+    // The per-key block lives in ONE macro, so every target gets the identical read -> value match
+    // -> delete value -> delete key-if-empty sequence.
+    const macro = /^!macro MAGINALIA_UnregisterHostKey hostKey\n([\s\S]*?)^!macroend$/mu.exec(source);
+    expect(macro).not.toBeNull();
+    const macroLines = codeLines((macro as RegExpExecArray)[1] as string);
+    const read = macroLines.findIndex((line) => line === 'ReadRegStr $R0 HKCU "${hostKey}" ""');
+    const compare = macroLines.findIndex((line) => line === '${AndIf} $R0 == "$LOCALAPPDATA\\${MAGINALIA_COLLECTOR_PROGRAM_SUBPATH}\\${MAGINALIA_COLLECTOR_MANIFEST_NAME}"');
+    const deleteValue = macroLines.findIndex((line) => line === 'DeleteRegValue HKCU "${hostKey}" ""');
+    const deleteKey = macroLines.findIndex((line) => line === 'DeleteRegKey /ifempty HKCU "${hostKey}"');
     expect(read).toBeGreaterThanOrEqual(0);
     expect(compare).toBeGreaterThan(read);
     expect(deleteValue).toBeGreaterThan(compare);
-    // The key is removed only when empty after our value is gone; never unconditionally and never under HKLM.
-    const deletes = lines.filter((line) => /^DeleteReg(Key|Value)\b/u.test(line));
-    expect(deletes).toEqual([
-      'DeleteRegValue HKCU "${MAGINALIA_COLLECTOR_HOST_KEY}" ""',
-      'DeleteRegKey /ifempty HKCU "${MAGINALIA_COLLECTOR_HOST_KEY}"',
+    expect(deleteKey).toBeGreaterThan(deleteValue);
+    // Both deletes sit INSIDE the "no read error AND value equals our path" block.
+    const body = (macro as RegExpExecArray)[1] as string;
+    const guard = ["${IfNot} ${Errors} ${AndIf} $R0 == \"$LOCALAPPDATA\\${MAGINALIA_COLLECTOR_PROGRAM_SUBPATH}\\${MAGINALIA_COLLECTOR_MANIFEST_NAME}\""];
+    expect(enclosingConditions(body, "DeleteRegValue HKCU")).toEqual(guard);
+    expect(enclosingConditions(body, "DeleteRegKey /ifempty HKCU")).toEqual(guard);
+    // The macro is the ONLY place that touches the registry: exactly these three registry statements,
+    // all on the macro parameter; the key is removed only when empty, never under HKLM.
+    expect(lines.filter((line) => /^(ReadRegStr|ReadRegDWORD|WriteReg\w+|DeleteReg(Key|Value)|EnumReg\w+)\b/u.test(line))).toEqual([
+      'ReadRegStr $R0 HKCU "${hostKey}" ""',
+      'DeleteRegValue HKCU "${hostKey}" ""',
+      'DeleteRegKey /ifempty HKCU "${hostKey}"',
     ]);
     expect(source).not.toMatch(/\bHKLM\b|HKEY_LOCAL_MACHINE|SHCTX|SHELL_CONTEXT/u);
+  });
+
+  it("unregisters EVERY writable target (Chrome and Edge) and nothing else, matching the TS and addon tables", async () => {
+    const source = await readScript();
+    const lines = codeLines(source);
+
+    // The writable subkeys of the three tables: TS (collector-browser-table), addon (windows_integration.cc), NSIS.
+    const tsWritable = COLLECTOR_REGISTRY_TARGETS.filter((target) => target.writable).map((target) => [target.id, target.subkey] as const);
+    const addon = await readFile(path.join(desktopRoot, "native/windows-integration/src/windows_integration.cc"), "utf8");
+    const addonWritable = [...addon.matchAll(/^\s*\{"([a-z]+)", L"([^"]+)", (true|false)\},?$/gmu)]
+      .filter((match) => match[3] === "true")
+      .map((match) => [match[1] as string, (match[2] as string).replaceAll("\\\\", "\\")] as const);
+    const nshDefines = lines
+      .map((line) => /^!define MAGINALIA_COLLECTOR_HOST_KEY_([A-Z]+) "([^"]+)"$/u.exec(line))
+      .filter((match): match is RegExpExecArray => match !== null)
+      .map((match) => [(match[1] as string).toLowerCase(), match[2] as string] as const);
+    expect(tsWritable.map(([id]) => id)).toEqual(["chrome", "edge"]);
+    expect(addonWritable).toEqual(tsWritable);
+    expect(nshDefines).toEqual(tsWritable);
+    // The exact Edge key, spelled out: only the leaf key under the Edge host root.
+    expect(lines).toContain('!define MAGINALIA_COLLECTOR_HOST_KEY_EDGE "Software\\Microsoft\\Edge\\NativeMessagingHosts\\org.maginalia.collector"');
+    for (const [, subkey] of nshDefines) expect(subkey).toMatch(/^Software\\[A-Za-z]+(\\[A-Za-z]+)?\\NativeMessagingHosts\\org\.maginalia\.collector$/u);
+
+    // One macro insertion per writable target, in table order, and no other insertion. The read-only
+    // targets (Chromium, Vivaldi) and any parent key never appear as a registry path in the script.
+    const inserted = lines.filter((line) => line.startsWith("!insertmacro MAGINALIA_UnregisterHostKey"));
+    expect(inserted).toEqual(tsWritable.map(([id]) => `!insertmacro MAGINALIA_UnregisterHostKey "\${MAGINALIA_COLLECTOR_HOST_KEY_${id.toUpperCase()}}"`));
+    for (const target of COLLECTOR_REGISTRY_TARGETS.filter((spec) => !spec.writable)) expect(source, `read-only ${target.id}`).not.toContain(target.subkey);
+    expect(source).not.toMatch(/Software\\Chromium|Software\\Vivaldi/u);
+    // The insertions run from the cleanup macro, before the (state-gated) folder cleanup, so the
+    // registration is removed whatever the state file says.
+    const cleanup = /!macro MAGINALIA_CollectorCleanup\n([\s\S]*?)!macroend/u.exec(source);
+    const cleanupBody = (cleanup as RegExpExecArray)[1] as string;
+    expect(cleanupBody.indexOf("MAGINALIA_UnregisterHostKey")).toBeGreaterThan(-1);
+    expect(cleanupBody.lastIndexOf("MAGINALIA_UnregisterHostKey")).toBeLessThan(cleanupBody.indexOf("Call un.MAGINALIA_HasValidState"));
+    expect(enclosingConditions(cleanupBody, "!insertmacro MAGINALIA_UnregisterHostKey")).toEqual([]);
   });
 
   it("never recursively deletes and never deletes through a wildcard", async () => {
@@ -167,8 +218,16 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
     expect(validity).toContain("${MAGINALIA_COLLECTOR_STATE_NAME}");
     expect(source).toContain(`!define MAGINALIA_COLLECTOR_STATE_NAME "${COLLECTOR_STATE_FILE_NAME}"`);
     // Equivalent strictness to parseIntegrationStateFile (proven by the execution test below); any failure means "not ours".
-    for (const field of ["version", "payloadId", "activeSlot", "extensionVersion", "placedAt"]) expect(validity).toContain(`'${field}'`);
-    expect(validity).toContain("$$o.Count -ne 5");
+    for (const field of ["version", "payloadId", "activeSlot", "extensionVersion", "placedAt", "registeredTargets"]) expect(validity).toContain(`'${field}'`);
+    // v1: exactly the five fields; v2 adds registeredTargets (6 fields). Version 2 appends the sixth name.
+    expect(validity).toContain("$$f = 'version','payloadId','activeSlot','extensionVersion','placedAt'");
+    expect(validity).toContain("if ($$v -eq 2) { $$f += 'registeredTargets' }");
+    expect(validity).toContain("$$o.Count -ne $$f.Count");
+    // registeredTargets: an array of writable target ids only (the table's writable ids), no duplicates.
+    expect(validity).toContain("$$r -isnot [object[]]");
+    expect(validity).toContain("$$seen.ContainsKey($$e)");
+    const idChecks = [...validity.matchAll(/\$\$e -cne '([^']+)'/gu)].map((match) => match[1]);
+    expect(idChecks).toEqual(COLLECTOR_REGISTRY_TARGETS.filter((target) => target.writable).map((target) => target.id));
     expect(validity).toContain("catch { exit 3 }");
     expect(validity).not.toMatch(/\bInvoke-Expression\b|\biex\b/u);
 
@@ -257,6 +316,8 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
       for (const key of drop) delete value[key];
       return JSON.stringify(value);
     };
+    const validV2 = { ...valid, version: 2, registeredTargets: ["chrome", "edge"] };
+    const textV2 = (override: Record<string, unknown> = {}, drop: string[] = []): string => text({ version: 2, registeredTargets: ["chrome", "edge"], ...override }, drop);
     const utf8 = (value: string): Buffer => Buffer.from(value, "utf8");
     const cases: Array<[string, Buffer]> = [
       ["valid", utf8(text())],
@@ -273,7 +334,7 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
       ["missing placedAt", utf8(text({}, ["placedAt"]))],
       ["only one field", utf8('{"version":1}')],
       ["extra key", utf8(text({ extra: 1 }))],
-      ["version 2", utf8(text({ version: 2 }))],
+      ["version 2 without registeredTargets", utf8(text({ version: 2 }))],
       ["version as string", utf8(text({ version: "1" }))],
       ["bad slot", utf8(text({ activeSlot: "c" }))],
       ["slot uppercase", utf8(text({ activeSlot: "A" }))],
@@ -292,6 +353,41 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
       ["UTF-16LE with BOM", Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text(), "utf16le")])],
       ["UTF-16BE with BOM", Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(text(), "utf16le").swap16()])],
       ["invalid UTF-8", Buffer.concat([utf8('{"version":1,"payloadId":"'), Buffer.from([0xff, 0xfe]), utf8('"}')])],
+      // State v2 (S4 writes it; design 4.3): the same five fields plus `registeredTargets`.
+      ["v2 valid, chrome + edge", utf8(textV2())],
+      ["v2 valid, chrome only", utf8(textV2({ registeredTargets: ["chrome"] }))],
+      ["v2 valid, edge only", utf8(textV2({ registeredTargets: ["edge"] }))],
+      ["v2 valid, empty registeredTargets", utf8(textV2({ registeredTargets: [] }))],
+      ["v2 valid, reversed order", utf8(textV2({ registeredTargets: ["edge", "chrome"] }))],
+      ["v2 valid, CRLF pretty", utf8(JSON.stringify(validV2, null, 2).replaceAll("\n", "\r\n"))],
+      ["v2 valid, UTF-8 BOM, slot b", Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), utf8(textV2({ activeSlot: "b" }))])],
+      ["v2 missing registeredTargets (five fields)", utf8(textV2({}, ["registeredTargets"]))],
+      ["v2 extra key (seven fields)", utf8(textV2({ extra: 1 }))],
+      ["v2 duplicate target", utf8(textV2({ registeredTargets: ["chrome", "chrome"] }))],
+      ["v2 duplicate target, three entries", utf8(textV2({ registeredTargets: ["chrome", "edge", "chrome"] }))],
+      ["v2 unknown target", utf8(textV2({ registeredTargets: ["firefox"] }))],
+      ["v2 known + unknown target", utf8(textV2({ registeredTargets: ["chrome", "firefox"] }))],
+      ["v2 read-only target chromium", utf8(textV2({ registeredTargets: ["chromium"] }))],
+      ["v2 unverified target vivaldi", utf8(textV2({ registeredTargets: ["vivaldi"] }))],
+      ["v2 target uppercase", utf8(textV2({ registeredTargets: ["Chrome"] }))],
+      ["v2 target with trailing space", utf8(textV2({ registeredTargets: ["chrome "] }))],
+      ["v2 target empty string", utf8(textV2({ registeredTargets: [""] }))],
+      ["v2 target null element", utf8(textV2({ registeredTargets: [null] }))],
+      ["v2 target number element", utf8(textV2({ registeredTargets: [1] }))],
+      ["v2 target nested array", utf8(textV2({ registeredTargets: [["chrome"]] }))],
+      ["v2 target object element", utf8(textV2({ registeredTargets: [{ id: "chrome" }] }))],
+      ["v2 registeredTargets string", utf8(textV2({ registeredTargets: "chrome" }))],
+      ["v2 registeredTargets null", utf8(textV2({ registeredTargets: null }))],
+      ["v2 registeredTargets object", utf8(textV2({ registeredTargets: { chrome: true } }))],
+      ["v2 registeredTargets number", utf8(textV2({ registeredTargets: 1 }))],
+      ["v2 bad payloadId", utf8(textV2({ payloadId: "0.2.0" }))],
+      ["v2 bad activeSlot", utf8(textV2({ activeSlot: "c" }))],
+      ["v2 bad extensionVersion", utf8(textV2({ extensionVersion: "latest" }))],
+      ["v2 bad placedAt", utf8(textV2({ placedAt: "2026-11-16T01:02:03" }))],
+      ["v2 version as string", utf8(textV2({ version: "2" }))],
+      ["v1 with registeredTargets (six fields)", utf8(text({ registeredTargets: ["chrome"] }))],
+      ["version 3", utf8(textV2({ version: 3 }))],
+      ["version 0", utf8(textV2({ version: 0 }))],
     ];
     const oversize = utf8(`${text()}${" ".repeat(5000)}`);
     const directory = await mkdtemp(path.join(os.tmpdir(), "maginalia-state-"));
@@ -326,6 +422,8 @@ describe("Collector uninstall cleanup script (WP-8)", () => {
             expected = false;
           }
         }
+        // Guard against a vacuous pass: every case labelled valid really is accepted by the parser.
+        if (label.startsWith("valid") || label.startsWith("v2 valid")) expect(expected, `${label}: parseIntegrationStateFile`).toBe(true);
         expect(results.get(index) === 0, `${label} (script exit ${String(results.get(index))})`).toBe(expected);
       }
     } finally {
