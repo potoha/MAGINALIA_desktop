@@ -233,6 +233,8 @@ interface Context {
   readonly deps: CollectorIntegrationApplyDependencies;
   readonly paths: IntegrationPaths;
   readonly warnings: CollectorApplyWarning[];
+  /** Set by `writeSlot` once the first Host file of the new slot is on disk (it feeds `filesChanged`). */
+  placed: boolean;
 }
 
 function warn(context: Context, warning: CollectorApplyWarning): void {
@@ -638,6 +640,7 @@ async function writeSlot(context: Context, slot: CollectorHostSlot, descriptor: 
       await removeIfPresent(context, temporary);
       throw error;
     }
+    context.placed = true; // a Host file of the new slot now exists (`filesChanged`)
     // Re-open the final file: regular, not a link, and the bytes on disk are the verified bytes.
     const entry = await fileSystem.stat(final);
     if (entry === null || entry.isReparsePoint || entry.kind !== "file") throw new Abort("hash-mismatch");
@@ -835,6 +838,17 @@ function registerExpectedTargets(
       targets.push({ target, result: "left-absent" });
       continue;
     }
+    // Re-read right before the write (the last guard ran before the manifest write): a target that is
+    // no longer what the user confirmed / the inspection saw is never written. For `foreign` this proves
+    // only that it is still foreign, not that it is the same foreign value; the addon cannot tell
+    // either, which is why the confirmation dialog names the browsers (design 3.3).
+    let live: HostRegistrationOwnership;
+    try {
+      live = registry.readCollectorHostRegistration(target);
+    } catch {
+      throw new Abort("inspection-incomplete");
+    }
+    if (live !== initial) throw new Abort("registration-changed");
     let outcome;
     try {
       outcome = initial === "foreign" ? registry.replaceForeignCollectorHostRegistration(target) : registry.registerCollectorHost(target);
@@ -1016,7 +1030,7 @@ async function converge(
   const action = request.action as "setup" | "repair" | "refresh";
   const paths = resolveLayout(deps);
   if (paths === undefined) return result(deps, request.action, "refused", "layout-unresolved", [], "skipped", first);
-  const context: Context = { deps, paths, warnings: [] };
+  const context: Context = { deps, paths, warnings: [], placed: false };
   if (first.registration === "unknown") return result(deps, request.action, "refused", "inspection-incomplete", [], "skipped", first);
   const plan = buildTargetPlan(deps, first);
   // Nothing to register (no verified, unblocked browser needs a key): a setup would place files that
@@ -1043,13 +1057,15 @@ async function converge(
 
   let reason: CollectorApplyReason | null = null;
   let wrote = false;
-  let placed = false;
   let selfCheck: "ok" | "failed" | "skipped" = "skipped";
   const targets: CollectorApplyTargetResult[] = [];
   const finish = (outcome: CollectorApplyOutcome, why: CollectorApplyReason | null): Promise<CollectorApplyResult> =>
     result(deps, request.action, outcome, why, context.warnings, selfCheck, undefined, {
       targets: targets.length > 0 ? completeTargetResults(plan, targets) : [],
-      filesChanged: placed,
+      // `filesChanged`: a Host file was written. A refresh that placed files and then met a denied
+      // registry key is `failed` with `filesChanged: true`; one that failed before its first slot
+      // write is `failed` (or `refused`) with `false`.
+      filesChanged: context.placed,
     });
   try {
     let slot: CollectorHostSlot;
@@ -1058,22 +1074,23 @@ async function converge(
       await guard(context, plan, { folderExists: true });
       const current = await readValidStateFile(context);
       if (current === undefined) throw new Abort("program-folder-unrecognized-content");
-      wrote = true;
       slot = current.activeSlot;
       // Files are not placed: the state file keeps what it says about them.
       stateFields = { payloadId: current.payloadId, extensionVersion: current.extensionVersion, placedAt: current.placedAt };
       await guard(context, plan, { folderExists: true });
+      wrote = true; // only now: a guard abort above changed nothing and is reported as refused
     } else {
       await guard(context, plan, { folderExists: false });
       await ensureProgramFolder(context);
       await refuseLinkedNames(context);
       await requireRecognizedContent(context, descriptor, await hasValidStateFile(context));
-      wrote = true;
       await ensureIntegrationDirectory(context);
       await guard(context, plan, { folderExists: true });
+      // Only now: the second guard is the last check before the first slot write. (Creating the empty
+      // program folder and the integration folders is not a change of the installation.)
+      wrote = true;
       slot = await chooseTargetSlot(context, first);
 
-      placed = true;
       await writeSlot(context, slot, descriptor);
       await swapExtension(context, descriptor);
 
@@ -1104,8 +1121,9 @@ async function converge(
   }
   if (reason === null) return finish("applied", null);
   // `refused` = a precondition failed before anything of the installation was changed. `wrote`
-  // turns true once the program folder is verified and every content check passed; creating the
-  // empty program folder itself does not count (a refusal may leave an empty protected folder).
+  // turns true once the program folder is verified, every content check passed and the second guard
+  // held; creating the empty program folder itself does not count (a refusal may leave an empty
+  // protected folder).
   // Any failure after that point is `failed`, with the post-action inspection showing what is on disk.
   const refusedBeforeWrite = !wrote && (reason === "e2e-isolation" || reason === "policy-blocked" || reason === "registration-changed" || reason === "expected-targets-changed" || reason === "program-folder-unsafe" || reason === "inspection-incomplete" || reason === "reparse-point-found" || reason === "program-folder-unrecognized-content");
   return finish(refusedBeforeWrite ? "refused" : "failed", reason);
@@ -1249,7 +1267,7 @@ async function remove(
 ): Promise<CollectorApplyResult> {
   const paths = resolveLayout(deps);
   if (paths === undefined) return result(deps, "remove", "refused", "layout-unresolved", [], "skipped", first);
-  const context: Context = { deps, paths, warnings: [] };
+  const context: Context = { deps, paths, warnings: [], placed: false };
   const { fileSystem } = deps;
   const tally = { locked: false, leftover: false };
   const targets: CollectorApplyTargetResult[] = [];

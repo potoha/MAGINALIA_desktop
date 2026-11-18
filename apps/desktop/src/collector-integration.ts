@@ -479,7 +479,7 @@ function aggregatePolicy(
  * Would registering `target` make some verified row stop using a FOREIGN registration it uses today?
  * (Edge looks up its own key first, then the Chromium key, then the Chrome key; a foreign Chromium
  * key is what Edge uses while its own key is absent.) Only the first present key after `target` in
- * a row's lookup order counts, exactly as the browser reads it. Setup/repair accept this shadowing
+ * a row's lookup order counts, exactly as the browser reads it; an unreadable one counts as foreign. Setup/repair accept this shadowing
  * after the user confirmed (design 11.1); an automatic refresh must not do it silently.
  */
 export function registrationWouldShadowForeign(
@@ -493,7 +493,11 @@ export function registrationWouldShadowForeign(
     for (const next of order.slice(order.indexOf(target) + 1)) {
       const ownership = ownerships[next] ?? "unknown";
       if (ownership === "absent") continue;
-      if (ownership === "foreign") return true;
+      // Fail closed: a fallback key that cannot be read might be foreign, so it counts as shadowing.
+      // The inspection then reports `foreign-registration` (the user confirms; the repair still
+      // registers Edge) rather than `damaged` (which a repair refuses while a read keeps failing),
+      // because this key is a lookup target, not part of E, whose unreadability design 4.4-2 makes incomplete.
+      if (ownership === "foreign" || ownership === "unknown") return true;
       break;
     }
   }
