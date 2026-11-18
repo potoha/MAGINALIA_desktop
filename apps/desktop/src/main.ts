@@ -444,7 +444,7 @@ async function confirmCollectorRemoval(): Promise<{ readonly confirmed: boolean;
     type: "question",
     title: "Collector 連携",
     message: "Collector 連携を解除しますか？",
-    detail: "この MAGINALIA の連携プログラムの登録と、拡張機能のフォルダーを削除します。本棚・引用データ・Workdesk・書き込み記録は削除されません。Chrome に保留中の引用がある場合は、先に Collector で内容を確認してください。Chrome の拡張機能一覧に残る MAGINALIA Collector は、Chrome の画面から削除できます（削除すると保留中の引用も消えます）。",
+    detail: "この MAGINALIA の連携プログラムの登録と、拡張機能のフォルダーを削除します。本棚・引用データ・Workdesk・書き込み記録は削除されません。ブラウザーに保留中の引用がある場合は、先に Collector で内容を確認してください。ブラウザーの拡張機能一覧に残る MAGINALIA Collector は、そのブラウザーの画面から削除できます（削除すると保留中の引用も消えます）。",
     buttons: ["解除する", "キャンセル"],
     defaultId: 1,
     cancelId: 1,
