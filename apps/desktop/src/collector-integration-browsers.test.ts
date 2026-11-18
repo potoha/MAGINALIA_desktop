@@ -242,6 +242,36 @@ describe("inspection with Chrome and Edge verified (design 4.4)", () => {
   });
 });
 
+describe("policy-blocked scope (E_all) and an empty E", () => {
+  it("policy-blocked with our Chrome key: registration is ours, state policy-blocked, expectedTargets stays empty", async () => {
+    const fixture = readyBoth(["chrome"]);
+    fixture.registry.policies = policies({ nativeMessagingUserLevelHosts: 0 });
+    const result = await inspectWith(fixture);
+    expect(result).toMatchObject({ state: "policy-blocked", registration: "ours", inspectionComplete: true, expectedTargets: [] });
+  });
+
+  it("policy-blocked with an unreadable Chrome key: inspection is incomplete (registry-read-failed) and registration unknown", async () => {
+    const fixture = readyBoth(["chrome"]);
+    fixture.registry.policies = policies({ nativeMessagingUserLevelHosts: 0 });
+    const original = fixture.registry.readCollectorHostRegistration.bind(fixture.registry);
+    fixture.registry.readCollectorHostRegistration = (target) => {
+      if (target === "chrome") throw new Error("denied");
+      return original(target);
+    };
+    const result = await inspectWith(fixture);
+    expect(result).toMatchObject({ state: "policy-blocked", inspectionComplete: false, registration: "unknown" });
+    expect(result.reasons).toContain("registry-read-failed");
+  });
+
+  it("an empty E with an otherwise healthy installation is never ready", async () => {
+    const fixture = readyBoth(["chrome"]);
+    fixture.registry.registrations.chrome = "absent";
+    const result = await inspectWith(fixture, COLLECTOR_BROWSERS.map((row) => ({ ...row, verification: "unverified" }) as CollectorBrowserSpec));
+    expect(result.expectedTargets).toEqual([]);
+    expect(result.state).not.toBe("ready");
+  });
+});
+
 // ----- the product table: only Chrome counts today -------------------------------------------
 
 describe("inspection with the product table (Chrome verified, Edge unverified)", () => {

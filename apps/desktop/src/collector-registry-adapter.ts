@@ -193,7 +193,12 @@ function readHttpsProgId(integration: WindowsIntegration): DefaultBrowserProgIdF
     { source: "user-choice", subkey: USER_CHOICE_SUBKEY },
   ];
   for (const probe of probes) {
-    const value = integration.readRegistryValue("HKCU", probe.subkey, "ProgId", "default");
+    let value: ReturnType<WindowsIntegration["readRegistryValue"]>;
+    try {
+      value = integration.readRegistryValue("HKCU", probe.subkey, "ProgId", "default");
+    } catch {
+      continue; // an unreadable probe falls through to the next one
+    }
     if (value !== null && value.type === "sz" && value.value.length > 0) return Object.freeze({ progId: value.value, source: probe.source });
   }
   return null;

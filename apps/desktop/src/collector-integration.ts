@@ -427,6 +427,24 @@ export function computeExpectedTargets(
   return Object.freeze(COLLECTOR_REGISTRY_TARGET_IDS.filter((target) => expected.has(target)));
 }
 
+/**
+ * The registration scope: every target of every verified row, ignoring policy and detection (E_all).
+ * Used for the unreadable check and for the `registration` aggregate while policy blocks every browser
+ * (E is empty then, but our keys may still exist). Registry order, no duplicates.
+ */
+export function computeScopeTargets(
+  table: readonly CollectorBrowserSpec[],
+  registeredTargets: readonly CollectorRegistryTargetId[] | null,
+): readonly CollectorRegistryTargetId[] {
+  const scope = new Set<CollectorRegistryTargetId>();
+  for (const row of table) {
+    if (row.verification !== "verified") continue;
+    for (const target of row.nativeMessaging.ownTargets) scope.add(target);
+  }
+  for (const target of registeredTargets ?? []) scope.add(target);
+  return Object.freeze(COLLECTOR_REGISTRY_TARGET_IDS.filter((target) => scope.has(target)));
+}
+
 /** Aggregate over `E` (design 4.2): any unknown, else any foreign, else any ours, else absent. */
 function aggregateRegistration(expected: readonly CollectorRegistryTargetId[], ownerships: TargetOwnerships): HostRegistrationOwnership | "unknown" {
   const values = expected.map((target) => ownerships[target] ?? "unknown");
@@ -805,8 +823,10 @@ export async function inspectCollectorIntegration(
   const noteUnreadable = (targets: readonly CollectorRegistryTargetId[]): void => {
     if (targets.some((target) => (ownerships[target] ?? "unknown") === "unknown")) incomplete("registry-read-failed");
   };
-  noteUnreadable(expected);
-  let registration = aggregateRegistration(expected, ownerships);
+  let scope = computeScopeTargets(table, null);
+  noteUnreadable(scope);
+  // While policy blocks every browser E is empty; the aggregate then runs over the whole scope.
+  let registration = aggregateRegistration(policy.blocked ? scope : expected, ownerships);
 
   let payloadStatus: "valid" | "invalid" | "unavailable" = "unavailable";
   let payload: CollectorPayloadDescriptor | null = null;
@@ -881,8 +901,9 @@ export async function inspectCollectorIntegration(
             const refined = computeExpectedTargets(table, detected, installedState.registeredTargets);
             if (!sameTargets(refined, expected)) {
               expected = refined;
-              noteUnreadable(expected);
-              registration = aggregateRegistration(expected, ownerships);
+              scope = computeScopeTargets(table, installedState.registeredTargets);
+              noteUnreadable(scope);
+              registration = aggregateRegistration(policy.blocked ? scope : expected, ownerships);
             }
           }
           const registered = installedState?.registeredTargets ?? [];
@@ -935,6 +956,10 @@ export async function inspectCollectorIntegration(
                 }
                 // A new version registers more targets, or a `when-present` browser appeared (design 4.4-5).
                 if (addedTargets.length > 0) sink.add("registration-target-added");
+              } else if (expected.length === 0) {
+                // Nothing is expected to be registered: a healthy-looking installation is not "ready".
+                state = "damaged";
+                sink.add("registration-absent");
               } else {
                 state = "ready";
                 filesVerified = hashes;

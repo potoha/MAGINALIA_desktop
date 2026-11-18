@@ -576,6 +576,18 @@ describe("product adapter over a fake native module", () => {
     expect(calls).toEqual([]);
   });
 
+  it("a throwing UserChoiceLatest probe still falls back to UserChoice", () => {
+    const base = "Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\";
+    const { native } = fakeNative({ values: { [`HKCU|default|${base}UserChoice|ProgId`]: { type: "sz", value: "ChromeHTML" } } });
+    const original = native.readRegistryValue.bind(native) as (...args: unknown[]) => unknown;
+    native.readRegistryValue = (...args: unknown[]) => {
+      if (String(args[1]).includes("UserChoiceLatest")) throw new Error("access denied");
+      return original(...args);
+    };
+    const adapter = createCollectorRegistryAdapterOver(createWindowsIntegration(native));
+    expect(adapter.readDefaultBrowserProgId()).toEqual({ progId: "ChromeHTML", source: "user-choice" });
+  });
+
   it("reads App Paths for any bare .exe name (HKCU, HKLM 64, HKLM 32) and rejects names with separators", () => {
     const name = "vivaldi.exe";
     const adapter = adapterFor({
