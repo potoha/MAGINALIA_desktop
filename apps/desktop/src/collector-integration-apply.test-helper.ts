@@ -19,6 +19,7 @@ import {
   type HostSelfCheckRequest,
   type HostSelfCheckResult,
 } from "./collector-integration-apply-types.js";
+import { COLLECTOR_BROWSERS, type CollectorBrowserSpec } from "./collector-browser-table.js";
 import { FakeCollectorRegistryAdapter } from "./collector-registry-adapter.test-helper.js";
 import { FakeCollectorFileSystem, FIXTURE_NOW, fakeKey, sha256 } from "./collector-integration.test-helper.js";
 import { safeFacts } from "./collector-host-fixture.test-helper.js";
@@ -27,13 +28,15 @@ import type { PathSecurityFacts } from "./collector-path-security.js";
 /** The real Collector 0.3.0 public key: its derived extension ID is the compiled constant. */
 export const COLLECTOR_TEST_KEY = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyp0ZIrFbABW+I8H80k14vICG1gWIgUUlVxxfQ7trxjGvg728zPYQ7o1ZE01uwGzaKGRn3J5cyNwlcjrYJHENHRdDwD7H3opT4rUMXdUJVSsQB4FSjsq0KBNyxv4QuTjeEY7tuEmUKfAdcKD7H8poGmcTdpPcZR+ycmcAHnThsj3EcLKxreKeYXRPI3Is1TeJhsU5aFH8SElFO8bt/+ggPEDvk5SDpPUJa+3tW2Jz0MZyoBph5jf4G8EXQ/ZHD2hcrxqjhVQ2pLqovBRsC9b2vhuS42cxTCspSDdFvwwN+wnEyfUlHXXCwRUCsQR+JpIiT7X6LvgAku/iN2Lo7fkqbQIDAQAB";
 
-export type FakeMutation = "mkdir" | "mkdir-private" | "write" | "copy" | "rename-file" | "rename-dir" | "remove-file" | "remove-dir";
+export type FakeMutation = "mkdir" | "mkdir-private" | "write" | "copy" | "rename-file" | "rename-dir" | "remove-file" | "remove-dir" | "registry";
 
 const parentKey = (target: string): string => fakeKey(path.win32.dirname(target));
 
 export class FakeApplyFileSystem extends FakeCollectorFileSystem implements CollectorApplyFileSystem {
   /** Every mutation, in order: `<op> <lower-case path>`. */
   public readonly mutations: string[] = [];
+  /** Registry writes (`register edge`, `unregister chrome`, ...) in order; they count as mutations for `crashAfter` / `failAt`. */
+  public readonly registryLog: string[] = [];
   /** The Nth mutation (1-based) throws before running; one shot. */
   public failAt: number | null = null;
   /** After the Nth mutation ran, every later mutation throws (the process "died"). */
@@ -78,6 +81,16 @@ export class FakeApplyFileSystem extends FakeCollectorFileSystem implements Coll
       }
     }
     this.mutations.push(`${op} ${targets.map(fakeKey).join(" -> ")}`);
+  }
+
+  /**
+   * A registry write counted like a file mutation (S4): `crashAfter` / `failAt` apply to it, and it is
+   * logged in `registryLog` as `<op> <target>` (not in the file-only `mutations`). The fake registry calls this through `mutationGate`.
+   */
+  public registryMutation(label: string): void {
+    this.begin("registry", [label], []);
+    this.mutations.pop(); // `mutations` stays a file-only log; registry writes are in `registryLog`
+    this.registryLog.push(label);
   }
 
   public lock(target: string): void {
@@ -290,6 +303,8 @@ export interface ApplyFixture {
   payload: unknown;
   now: Date;
   isolated: boolean;
+  /** Browser table the inspection and apply use; `undefined` = the product table (only Chrome verified). */
+  browserTable: readonly CollectorBrowserSpec[] | undefined;
   selfCheckResult: HostSelfCheckResult | "throw";
   suffixCounter: number;
   deps: CollectorIntegrationApplyDependencies;
@@ -299,7 +314,7 @@ export interface ApplyFixture {
  * A machine where the program folder does not exist yet, the packaged payload sits in
  * `C:\res`, and the user directories (`LocalAppData`, `Programs`) exist with safe ACLs.
  */
-export function createApplyFixture(options: { readonly programsExists?: boolean } = {}): ApplyFixture {
+export function createApplyFixture(options: { readonly programsExists?: boolean; readonly browserTable?: readonly CollectorBrowserSpec[] } = {}): ApplyFixture {
   const registry = new FakeCollectorRegistryAdapter();
   const fileSystem = new FakeApplyFileSystem();
   const userProgramFiles = registry.knownFolders.UserProgramFiles;
@@ -309,6 +324,7 @@ export function createApplyFixture(options: { readonly programsExists?: boolean 
   const securityFacts = new Map<string, PathSecurityFacts | "throw">();
   const securityCalls: string[] = [];
   const selfChecks: HostSelfCheckRequest[] = [];
+  registry.mutationGate = (label) => fileSystem.registryMutation(label);
   fileSystem.addDirectory(registry.knownFolders.LocalAppData);
   if (options.programsExists !== false) fileSystem.addDirectory(userProgramFiles);
   for (const [name, content] of Object.entries(HOST_SOURCE_FILES)) fileSystem.addFile(path.win32.join(SOURCE_HOST_FOLDER, name), content);
@@ -326,6 +342,7 @@ export function createApplyFixture(options: { readonly programsExists?: boolean 
     payload: applyDescriptor(),
     now: FIXTURE_NOW,
     isolated: false,
+    browserTable: options.browserTable,
     selfCheckResult: { status: "ok", protocol: COLLECTOR_PROTOCOL },
     suffixCounter: 0,
     get deps(): CollectorIntegrationApplyDependencies {
@@ -342,6 +359,7 @@ export function createApplyFixture(options: { readonly programsExists?: boolean 
         readPayloadDescriptor: async () => fixture.payload,
         now: () => fixture.now,
         e2eIsolationActive: fixture.isolated,
+        ...(fixture.browserTable === undefined ? {} : { browserTable: fixture.browserTable }),
         payloadSource: { hostFolder: SOURCE_HOST_FOLDER, extensionFolder: SOURCE_EXTENSION_FOLDER },
         runHostSelfCheck: async (request) => {
           selfChecks.push(request);
@@ -356,4 +374,21 @@ export function createApplyFixture(options: { readonly programsExists?: boolean 
     },
   };
   return fixture;
+}
+
+/**
+ * The product table with the named rows switched to `verified` (the real change is the same one
+ * field). `tableWithVerified("chrome", "edge")` is the Chrome + Edge world of design 3.1.
+ */
+export function tableWithVerified(...ids: readonly string[]): readonly CollectorBrowserSpec[] {
+  return COLLECTOR_BROWSERS.map((row) =>
+    ids.includes(row.id)
+      ? ({ ...row, verification: "verified", evidence: { ...row.evidence, progIdPattern: "measured", lookupOrder: "vendor-doc", ownTargets: "vendor-doc", registration: "vendor-doc", policyRoot: "vendor-doc" } } as CollectorBrowserSpec)
+      : row);
+}
+
+/** The Chrome + Edge table with the Edge row switched to `when-present` (design 3.1, scenario 8). */
+export function tableWithWhenPresentEdge(): readonly CollectorBrowserSpec[] {
+  return tableWithVerified("chrome", "edge").map((row) =>
+    row.id === "edge" ? ({ ...row, nativeMessaging: { ...row.nativeMessaging, registration: "when-present" } } as CollectorBrowserSpec) : row);
 }

@@ -113,6 +113,19 @@ export class FakeCollectorRegistryAdapter implements CollectorRegistryAdapter {
   /** When set, the next write returns this outcome without changing state (then clears). */
   public nextRegisterOutcome: RegisterOutcome | undefined;
   public nextUnregisterOutcome: UnregisterOutcome | undefined;
+  /**
+   * S4: called at the start of every `register` / `replace` / `unregister` (after the target check, before
+   * the key changes) with a label such as `register edge`. The apply fixture wires it to the file-system
+   * mutation counter so a crash or a single failure can hit a registry write exactly like a file write.
+   * A throw from here makes the registry call throw.
+   */
+  public mutationGate: ((label: string) => void) | undefined;
+  /** Persistent per-target forced result of `register` / `replace` (the key stays unchanged). */
+  public registerOutcomes: Partial<Record<CollectorRegistryTargetId, RegisterOutcome>> = {};
+  /** Persistent per-target forced result of `unregister` (the key stays unchanged). */
+  public unregisterOutcomes: Partial<Record<CollectorRegistryTargetId, UnregisterOutcome>> = {};
+  /** Targets whose ownership read throws (an unreadable key). */
+  public readonly unreadableTargets = new Set<CollectorRegistryTargetId>();
   public readonly calls: FakeAdapterCall[] = [];
   /** Every registry call that takes a target, in order (for S3/S4 tests). */
   public readonly targetCalls: Array<{ readonly call: FakeAdapterCall; readonly target: CollectorRegistryTargetId }> = [];
@@ -145,15 +158,19 @@ export class FakeCollectorRegistryAdapter implements CollectorRegistryAdapter {
   public readCollectorHostRegistration(target: CollectorRegistryTargetId = "chrome"): CollectorHostRegistration {
     this.enter("readCollectorHostRegistration");
     this.checkTarget("readCollectorHostRegistration", target, this.inspectableTargets);
+    if (this.unreadableTargets.has(target)) throw new Error("injected unreadable registry key");
     return this.registrations[target];
   }
 
   private write(target: CollectorRegistryTargetId, replaceForeign: boolean): RegisterOutcome {
+    this.mutationGate?.(`${replaceForeign ? "replace" : "register"} ${target}`);
     const forced = this.nextRegisterOutcome;
     if (forced !== undefined) {
       this.nextRegisterOutcome = undefined;
       return forced;
     }
+    const forcedForTarget = this.registerOutcomes[target];
+    if (forcedForTarget !== undefined) return forcedForTarget;
     if (this.registrations[target] === "foreign" && !replaceForeign) return "foreign";
     this.registrations[target] = "ours";
     return "ok";
@@ -174,11 +191,14 @@ export class FakeCollectorRegistryAdapter implements CollectorRegistryAdapter {
   public unregisterCollectorHost(target: CollectorRegistryTargetId = "chrome"): UnregisterOutcome {
     this.enter("unregisterCollectorHost");
     this.checkTarget("unregisterCollectorHost", target, FAKE_WRITABLE_TARGETS);
+    this.mutationGate?.(`unregister ${target}`);
     const forced = this.nextUnregisterOutcome;
     if (forced !== undefined) {
       this.nextUnregisterOutcome = undefined;
       return forced;
     }
+    const forcedForTarget = this.unregisterOutcomes[target];
+    if (forcedForTarget !== undefined) return forcedForTarget;
     const current = this.registrations[target];
     if (current === "absent") return "not-registered";
     if (current === "foreign") return "foreign";
