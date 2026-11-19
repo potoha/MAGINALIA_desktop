@@ -812,6 +812,9 @@ export interface CollectorIntegrationRequest {
   （現行の原則を維持）。
 - `openBrowserDownloadPage` は `downloadUrl !== null` の行だけ受け付ける。
 
+> 実装状況（S7、§9 参照）: `openBrowserDownloadPage` と、`browser` を `setup` / `openBrowserDownloadPage`
+> で受けることは未実装（現状 `browser` は `openBrowserExtensions` のみ）。
+
 ### 7.2 サービスの振る舞い
 
 - `setup`: `proceedWithoutSupportedBrowser !== true` なら、`verified` かつ `found` かつ非ブロックの
@@ -826,7 +829,13 @@ export interface CollectorIntegrationRequest {
   （既定ブラウザーで開いてよい）。
 - 依存の改名: `locateChrome` → `locateBrowser(id)`、`launchChrome` → `launchBrowser`。
 
+> 実装状況（S7）: `openBrowserExtensions` の対象は現状 `request.browser` ?? `recommended`
+> （保存済み選択の段は §7.4 と一体で未実装）。`setup` の選択の保存も未実装。
+
 ### 7.3 応答
+
+> 実装状況（S7）: `browser-required`、`browser-extensions` と `status.browsers`
+> （`preferred` を除く）は実装済み。`browser-download` と `preferred` は未実装。
 
 ```ts
 | { readonly kind: "browser-required"; readonly status: CollectorIntegrationStatus }        // was chrome-required
@@ -941,6 +950,38 @@ readonly browsers: {
   通知状態 v2 `browser` と v1→v2 読み込み、Q9 の `removeRequested` 先行記録）は S7 と連動する後続。
 - Edge 行は `unverified` のまま（スパイク待ち）。Vivaldi の結論もスパイク待ち。
 - 既知の未解決: §5.5（read-only target の ours は消さず警告も無い）、§5.6（検出由来の `E` 変化の再確認なし）。
+
+**S7 の実装状況（write-back。`codex/mb-s7-service` e3a5115、S6 df3c66a の上。単体テストのみで、
+実ブラウザー・Electron での確認は NOT VERIFIED）:**
+
+- 削除した旧 API と移行先（別名・互換 shim は残していない。コマンド改名は Q3 のとおり alias なし）:
+
+  | 旧 | 新 |
+  | --- | --- |
+  | `inspection.chrome`（`ChromeDetection`）と `ChromeSource`/`ChromeLocation`/`ChromeRejectedCandidate` の deprecated 別名 | `inspection.browsers`、`BrowserExecutableSource`/`BrowserLocation`/`BrowserRejectedCandidate` |
+  | `locateChromeExecutable` / runtime `locateChrome` / service 依存 `locateChrome` | `locateBrowserExecutable(id, …)` / `locateBrowser(id)` |
+  | service 依存 `launchChrome`、定数 `COLLECTOR_CHROME_EXTENSIONS_ARGUMENTS` | `launchBrowser`、表の行の `extensionsPage.launchArguments` |
+  | intent `openChromeExtensions`、コマンド `maginalia.collector.openChromeExtensions` | `openBrowserExtensions`、`maginalia.collector.openBrowserExtensions` |
+  | request `proceedWithoutChrome` | `proceedWithoutSupportedBrowser` |
+  | 応答 `chrome-required` | `browser-required` |
+  | 応答 `chrome-extensions`（`chrome-not-found`） | `browser-extensions`（`browser: id \| null`、結果 `browser-not-found`） |
+  | `status.chrome` | `status.browsers { defaultBrowser, recommended, recommendationReason, entries[] }`（パス・source・ProgId なし。entry は §7.3 から `preferred` を除いた形） |
+
+- request の `browser` は `openBrowserExtensions` のときだけ受け付ける（enum 検証）。preload は
+  検証済みフィールドだけをコピーして渡す。
+- `setup` の `browser-required` 判定は §7.2 どおり（`verified` かつ `found` かつ非ブロックの行が
+  無いとき）。renderer 文言の一覧は verified 行を表順に並べる（現状は Chrome のみ）。
+- remove 確認ダイアログ（main.ts）と `maginalia.collector.openBrowserExtensions` のタイトル・説明・
+  keywords、`maginalia.collector.setup` の keywords（`browser`、`ブラウザー` を追加）は §7.5 に更新済み。
+- `openBrowserExtensions` の対象決定は現状 `request.browser` → `recommended` の 2 段。**§7.2 の
+  「保存済み選択」の段は未実装**（最後に選んだブラウザーの保存・通知状態 v2 `browser`・成功時の保存・
+  `status.browsers.preferred` と一体で、S6 の未実装分と同じ後続）。`setup` の `browser` 受理と選択の保存も同様に後続。
+- **未実装**: intent `openBrowserDownloadPage` と応答 `browser-download`（§7.1/7.3。S8 と一緒）。
+  updated 通知の文言（「Chrome で拡張機能の画面を開く」固定。§7.5）。`maginalia.collector.setup` の
+  description は Edge が `unverified` の間「for a supported browser.」で、Edge が `verified` に
+  なったら §7.5 の「(Edge, Chrome)」へ追従する。
+- Edge を `verified` にするときは、`browser-required` の一覧文言（`supportedBrowserNames`）の
+  テストを更新する必要がある。
 
 順序の提案: **S0 と S1 を並行** → S2 → S3 → S4 → S5 と S6（並行可）→ S7 → S8・S9（並行）→
 S10 → S11 → S12。Chrome+Edge は Edge が文書で裏付けられているので S0 を待たずに S2〜S7 を
