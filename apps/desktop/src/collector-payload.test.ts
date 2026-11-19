@@ -57,6 +57,10 @@ describe("payload descriptor schema", () => {
   it("file-name rule", () => {
     for (const ok of ["manifest.json", "icons/16.png", "a/b/c.js"]) expect(isSafeRelativeFileName(ok)).toBe(true);
     for (const bad of ["", "/a", "a/", "a//b", "./a", "a/../b", "a\\b", "a:b", "a\u0000b", "a/b.", "a /b", "x".repeat(201), 3]) expect(isSafeRelativeFileName(bad)).toBe(false);
+    for (const reserved of ["CON", "con", "PRN", "AUX", "NUL", "COM1", "com9", "LPT1", "lpt9", "NUL.txt", "con.json", "CONIN$", "conout$", "CONOUT$.txt", "a/CONIN$", "a/AUX", "a/com3.js/b", "icons/Nul.png"]) {
+      expect(isSafeRelativeFileName(reserved), reserved).toBe(false);
+    }
+    for (const fine of ["console.js", "com10.js", "lpt.js", "a/nulled", "COMX", "auxiliary/a.js"]) expect(isSafeRelativeFileName(fine), fine).toBe(true);
   });
 });
 

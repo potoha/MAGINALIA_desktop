@@ -21,7 +21,10 @@
     { "from": "packaging/manual", "to": "manual", "filter": ["マニュアル.pdf"] },
     { "from": "packaging/runtime/THIRD-PARTY-NOTICES", "to": "THIRD-PARTY-NOTICES" },
     { "from": "packaging/runtime/shelf-mutex", "to": "shelf-mutex", "filter": ["shelf_mutex.node", "PROVENANCE.json"] },
-    { "from": "packaging/runtime/windows-integration", "to": "windows-integration", "filter": ["windows_integration.node", "PROVENANCE.json"] }
+    { "from": "packaging/runtime/windows-integration", "to": "windows-integration", "filter": ["windows_integration.node", "PROVENANCE.json"] },
+    { "from": "packaging/runtime/collector-host", "to": "collector-host", "filter": ["MAGINALIA-Collector-Host.exe", "shelf_mutex.node", "LICENSE.txt", "NOTICE.txt", "NODE-LICENSE.txt", "PROVENANCE.txt"] },
+    { "from": "packaging/runtime/collector-extension", "to": "collector-extension" },
+    { "from": "packaging/runtime/collector-payload.json", "to": "collector-payload.json" }
   ],
   "win": {
     "target": [{ "target": "nsis", "arch": ["x64"] }],

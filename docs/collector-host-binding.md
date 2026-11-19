@@ -171,32 +171,41 @@ idempotent replay) and real child processes:
   `already-committed`, answers `shelf_write_busy` while another process holds the
   mutex, and fails closed for an Everyone-writable binding and a mismatched marker.
 
-NOT VERIFIED: a real Chrome caller, the installed standalone executable, and the
+NOT VERIFIED: a real Chrome caller, the packaged Host executable, and the
 Desktop Reviewer writing concurrently with the Host on a real Shelf.
 
-## 7. Standalone Windows distributable (PR A3)
+## 7. Collector Host payload (PR A3, reduced by WP-4)
 
-`npm run dist:collector-host` (apps/desktop, Windows x64) produces
-`release/collector-host/`:
+The Host is no longer distributed as a standalone installer. The Desktop installer
+carries the Host as a read-only payload and the Desktop app places and registers it
+at runtime (design: `collector-wizard-integration-design.md` section 2). The former
+per-user NSIS installer and its `dist:collector-host` output were removed.
+
+`npm run package:windows:collector-host` (apps/desktop, Windows x64, after
+`npm run build:native`) produces `release/collector-host/payload/`:
 
 | File | Content |
 | --- | --- |
-| `payload/MAGINALIA-Collector-Host.exe` | Node SEA: `node --experimental-sea-config` blob of a Vite/Rolldown CJS bundle of `collector-native-host-product-entry.ts`, injected with `postject` (new direct devDependency, already in the lockfile transitively) |
-| `payload/shelf_mutex.node` | the N-API 8 addon, static CRT (`/MT`); the build fails if it imports a VC++ runtime DLL |
-| `payload/org.maginalia.collector.json` | host manifest: `name`, `type: stdio`, `path`, exactly one `allowed_origins` entry |
-| `payload/PROVENANCE.txt` | commit SHA, Node/N-API/V8, postject, Vite, node-gyp, NSIS versions, SHA-256 of every shipped file |
-| `payload/LICENSE.txt`, `payload/NOTICE.txt` | repository license and notice |
-| `MAGINALIA-Collector-Host-Setup-<version>.exe` | per-user NSIS installer |
-| `SHA256SUMS` | payload files and installer |
+| `MAGINALIA-Collector-Host.exe` | Node SEA: `node --experimental-sea-config` blob of a Vite/Rolldown CJS bundle of `collector-native-host-product-entry.ts`, injected with `postject` |
+| `shelf_mutex.node` | the N-API 8 addon from `npm run build:native`, static CRT (`/MT`); the build fails if it imports a VC++ runtime DLL |
+| `PROVENANCE.txt` | commit SHA, payload version, Node/N-API/V8, postject, Vite, node-gyp versions, SHA-256 of every shipped file |
+| `LICENSE.txt`, `NOTICE.txt`, `NODE-LICENSE.txt` | repository license, notice with bundled npm package licenses, and the Node.js LICENSE from next to the building `node.exe` |
+
+`SHA256SUMS` next to `payload/` lists the payload files. There is no host manifest
+file in the payload: the Desktop app generates it at runtime.
 
 Build details:
 
+- The build requires Node.js >= 24 and takes the Node LICENSE from the building
+  runtime's directory; there is no fallback or download. The payload version
+  (`PAYLOAD_VERSION` in `scripts/collector-payload.mjs`) must equal
+  `apps/desktop/package.json` `version` (0.2.0 for alpha 2) or the build stops.
 - `@maginalia/format` reads its schemas from disk at import time. The bundler
   inlines the package's copied schema files, and the build fails if any non-builtin
   `require` remains in the bundle.
-- SEA config sets `execArgv: []` and `execArgvExtension: "none"`. Verified on
-  Node 24.14.0: `NODE_OPTIONS=--require …` and CLI runtime flags are ignored; without
-  this setting the SEA honored `NODE_OPTIONS`.
+- SEA config sets `execArgv: []` and `execArgvExtension: "none"`. After building,
+  the build runs the executable with `NODE_OPTIONS=--require ...` and with a CLI
+  `--require` flag and fails if the preload ran.
 - The addon is loaded only from `dirname(process.execPath)\shelf_mutex.node`
   (`useProductNativeAddonLocation("sea")`), selected by `node:sea`'s `isSea()`.
   In the SEA, `argv[1]` repeats the executable, so Chrome's origin stays at
@@ -205,34 +214,19 @@ Build details:
   the same configuration and runs it against a disposable profile (binding, private
   directories, real ACL check, commit, idempotent resend, schema validation). The
   shipped executable cannot be redirected to a disposable profile by design.
-- NSIS comes from electron-builder's checksum-pinned toolset
-  (`app-builder-lib` `getMakeNsisPath`, NSIS 3.04, the same one the Desktop
-  installer uses).
-
-Installer (`packaging/collector-host/installer.nsi`):
-
-- `RequestExecutionLevel user`, no UAC, fixed directory
-  `%LOCALAPPDATA%\Programs\MAGINALIA Collector Host`, Japanese UI.
-- Writes `HKCU\Software\Google\Chrome\NativeMessagingHosts\org.maginalia.collector`
-  (default value = manifest path) and an Apps-list entry under `HKCU\…\Uninstall\MAGINALIACollectorHost`.
-- The manifest `path` is the executable name, relative to the manifest folder (Chrome on
-  Windows resolves it there). The manifest is then static ASCII, safe for non-ASCII
-  user profile paths, and needs no install-time JSON escaping.
-- Install over the top is the update.
-- Uninstall deletes only the files it installed, the program folder when empty, the
-  host key and the Apps entry. It never touches `%LOCALAPPDATA%\MAGINALIA`, a Shelf,
-  or Chrome data.
 
 `npm run smoke:collector-host` runs the built executable directly. It does not
-install or register anything. It checks that, without a binding, `health` reports
-`writesEnabled: false` and `configured_shelf`/`save_web_quote` return
+install or register anything. WARNING: it sends `save_web_quote`; when the current
+Windows user already has a Desktop-written Shelf binding it runs against the real
+`%LOCALAPPDATA%\MAGINALIA` and can create a request record there. Run it only as a
+disposable Windows user, or with no binding. Without a binding it checks that `health`
+reports `writesEnabled: false` and `configured_shelf`/`save_web_quote` return
 `shelf_unconfigured`. It also checks: wrong or missing origin, frame errors, a copy
-without the addon failing closed with `configuration_unavailable`, env and
-`NODE_OPTIONS` injection ignored, and the real `%LOCALAPPDATA%\MAGINALIA` unchanged.
+without the addon failing closed with `configuration_unavailable`, and env and
+`NODE_OPTIONS` injection ignored.
 
 Known limitations / NOT VERIFIED:
 - Binaries are unsigned (SmartScreen).
 - The build is not byte-reproducible (linker timestamps).
-- Node.js's own license text is not yet shipped beside the embedded runtime.
-- Installer run, registry entries, Chrome discovery, Apps-list uninstall and
-  update-over-top are deferred to the joint test with the owner.
+- Placement, registry registration, Chrome discovery and uninstall of the Host are
+  Desktop runtime work (WP-5b, WP-8) and are verified in the joint test with the owner.

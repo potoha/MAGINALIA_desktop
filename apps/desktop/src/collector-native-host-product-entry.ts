@@ -3,7 +3,7 @@
  *
  * - Node: `node dist/main/collector-native-host-product-entry.js <origin>`
  * - Standalone executable: the Node SEA is a bundle of this file
- *   (`npm run dist:collector-host`).
+ *   (`npm run package:windows:collector-host`).
  *
  * Both forms put Chrome's first argument (the caller origin) at `argv[2]`; in the SEA
  * `argv[1]` repeats the executable path. The addon location is a code location: next

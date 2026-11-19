@@ -39,6 +39,14 @@ describe("Collector ownership / ACL policy (fakes)", () => {
     expect(evaluatePathSecurity({ ...dir, ownerSid: WINDOWS_ADMINISTRATORS_SID }, "directory"))
       .toEqual({ ok: false, violation: "owner-not-current-user" });
     expect(evaluatePathSecurity({ ...dir, ownerSid: "" }, "directory")).toEqual({ ok: false, violation: "owner-not-current-user" });
+    // SYSTEM / Administrators as owner is accepted only when the caller opts in (parent folders)
+    expect(evaluatePathSecurity({ ...dir, ownerSid: WINDOWS_ADMINISTRATORS_SID }, "directory", { allowSystemOrAdministratorOwner: true })).toEqual({ ok: true });
+    expect(evaluatePathSecurity({ ...dir, ownerSid: "S-1-5-18" }, "directory", { allowSystemOrAdministratorOwner: true })).toEqual({ ok: true });
+    expect(evaluatePathSecurity({ ...dir, ownerSid: "S-1-5-21-9-9-9-9" }, "directory", { allowSystemOrAdministratorOwner: true })).toEqual({ ok: false, violation: "owner-not-current-user" });
+    expect(evaluatePathSecurity({ ...dir, ownerSid: "" }, "directory", { allowSystemOrAdministratorOwner: true })).toEqual({ ok: false, violation: "owner-not-current-user" });
+    // ... and the write-access rule still applies to such a folder
+    expect(evaluatePathSecurity({ ...dir, ownerSid: "S-1-5-18", aces: [{ type: "allow", sid: "S-1-1-0", mask: 0x2, inheritOnly: false }] }, "directory", { allowSystemOrAdministratorOwner: true }))
+      .toEqual({ ok: false, violation: "foreign-writer" });
     expect(evaluatePathSecurity({ ...dir, daclPresent: false, aces: [] }, "directory")).toEqual({ ok: false, violation: "null-dacl" });
     // Everyone with FILE_WRITE_DATA, Authenticated Users with DELETE, an AppContainer
     // capability with full control, another local user with GENERIC_WRITE.

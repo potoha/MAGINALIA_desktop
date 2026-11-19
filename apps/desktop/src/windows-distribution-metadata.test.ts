@@ -21,7 +21,7 @@ describe("Windows distribution metadata", () => {
     };
     const stageScript = await readFile(path.join(repositoryRoot, "apps/desktop/scripts/stage-windows-app.mjs"), "utf8");
 
-    expect(app).toMatchObject({ name: "@maginalia/desktop", version: "0.1.0" });
+    expect(app).toMatchObject({ name: "@maginalia/desktop", version: "0.2.0" });
     expect(lock.packages["apps/desktop"]).toMatchObject({ name: app.name, version: app.version });
     expect(installer).toMatchObject({
       appId: "org.maginalia.desktop.alpha1",

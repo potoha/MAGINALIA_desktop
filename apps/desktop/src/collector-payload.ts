@@ -66,13 +66,16 @@ function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): b
   return Object.keys(value).every((key) => keys.includes(key)) && keys.every((key) => Object.hasOwn(value, key));
 }
 
-/** A bare relative POSIX-style file name: segments of safe characters, no traversal. */
+/** Windows reserved device names (with or without an extension): `CON`, `NUL.txt`, `COM1`, ... */
+const RESERVED_DEVICE_NAME = /^(?:conin\$|conout\$|con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(?:\..*)?$/iu;
+
+/** A bare relative POSIX-style file name: segments of safe characters, no traversal, no reserved device names. */
 export function isSafeRelativeFileName(name: unknown): name is string {
   if (typeof name !== "string" || name.length === 0 || name.length > MAX_FILE_NAME_LENGTH) return false;
   if (/[\\:*?"<>|]/u.test(name) || name.startsWith("/") || name.endsWith("/")) return false;
   // Control characters (including NUL) have no place in a packaged file name.
   if (/[\u0000-\u001f]/u.test(name)) return false;
-  return name.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== ".." && !/[. ]$/u.test(segment));
+  return name.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== ".." && !/[. ]$/u.test(segment) && !RESERVED_DEVICE_NAME.test(segment));
 }
 
 export function parseCollectorPayloadDescriptor(value: unknown): CollectorPayloadDescriptorResult {
