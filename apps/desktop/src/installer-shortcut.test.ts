@@ -41,4 +41,16 @@ describe("optional Desktop shortcut installer policy", () => {
     expect(source).not.toContain('Delete "$DESKTOP\\${MAGINALIA_PRERELEASE_NAME}.lnk"');
     expect(source).toContain('${OrIf} $MAGINALIA_PRERELEASE_LINK_REMOVED == "1"');
   });
+
+  it("calls Windows PowerShell by its real path and carries no stray control characters", async () => {
+    const source = await readFile(installerScriptPath, "utf8");
+
+    // A lost backslash in "\v1.0" once became a vertical tab (U+000B) and silently broke the call.
+    expect(source).not.toMatch(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u);
+    const calls = source.match(/\$SYSDIR\\WindowsPowerShell[^\r\n"]*powershell\.exe/gu) ?? [];
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    for (const call of calls) {
+      expect(call).toBe(String.raw`$SYSDIR\WindowsPowerShell\v1.0\powershell.exe`);
+    }
+  });
 });
