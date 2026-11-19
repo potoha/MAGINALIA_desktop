@@ -363,7 +363,7 @@ It proves the registry → manifest → exe → addon chain and reports
   secondary section above 「MAGINALIAを開く」. The Collector step is **not** a
   `FirstRunJournal` stage; first-run is complete without it and 「あとで設定」
   writes nothing.
-- IPC carries intents only (`inspect`, `setup`, `openChromeExtensions`,
+- IPC carries intents only (`inspect`, `setup`, `openBrowserExtensions`,
   `copyExtensionPath`, `revealExtensionFolder`, `configureSaveDestination`,
   `startConnectionCheck`, `remove`). The renderer never sends a path. The only
   path that reaches the renderer is the extension folder string, for display and
