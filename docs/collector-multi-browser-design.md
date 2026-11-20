@@ -854,6 +854,12 @@ export interface CollectorIntegrationRequest {
 
 > 実装状況（S7、§9 参照）: `openBrowserDownloadPage` と、`browser` を `setup` / `openBrowserDownloadPage`
 > で受けることは未実装（現状 `browser` は `openBrowserExtensions` のみ）。
+>
+> 実装状況（S8 B1、`codex/mb-s8-b1-main-gaps`）: **実装済み。** `browser` は `setup` /
+> `openBrowserExtensions` / `openBrowserDownloadPage` の 3 intent だけで受け付け、他の intent では拒否する。
+> `openBrowserDownloadPage` は、`browser` が無い・表に無い・`downloadUrl` が `null`（Vivaldi）・https でない
+> ときは何も開かず `browser-download` の `not-offered` を返す（上の「`downloadUrl !== null` の行だけ」を
+> 拒否ではなく `not-offered` で表した）。
 
 ### 7.2 サービスの振る舞い
 
@@ -883,11 +889,36 @@ export interface CollectorIntegrationRequest {
 
 > 実装状況（S7）: `openBrowserExtensions` の対象は現状 `request.browser` ?? `recommended`
 > （保存済み選択の段は §7.4 と一体で未実装）。`setup` の選択の保存も未実装。
+>
+> 実装状況（S8 B1）: **実装済み。** 対象 = `request.browser` ?? 保存済み ?? `recommended`。保存の条件:
+> - `openBrowserExtensions`: `request.browser` が指定され、かつ起動に成功したときだけ保存する。おすすめを
+>   黙って保存しない（利用者が選んでいないため）。
+> - `setup`: apply が `applied` または `noop` で終わり、かつ選ばれた行が `verified`・`found`・非ブロック
+>   のときだけ保存する。`refused` / `failed` / `partial`、未検証・未検出・ブロック中の行は保存しない
+>   （使えないブラウザーを保存すると、引数なしの起動が `browser-not-found` を返し続けるため）。
+> - 保存済みのブラウザーが無くなったときは、`recommended` へ落とさず `browser-not-found` を返す
+>   （`status.browsers.preferred` は保持）。
+> - 保存先は通知状態ファイル（userData）の v2 `browser`。v1 は読める（`browser` は null）。壊れた値・
+>   未知の id・パス・URL は null として無視し、他の項目は保つ。旧版の Desktop は v2 を壊れた状態として
+>   読むので、ダウングレードでは alpha1 通知が再表示され `removeRequested` も失われる（互換性の注意）。
+> - `remove`: 利用者の確認後・apply の前に `removeRequested` を記録する（Q9）。`refused` で終わったときは
+>   元の値に戻す。repair 通知は remove の開始時には消さず、apply が `refused` 以外で終わったときだけ
+>   消える（拒否された remove で通知が消える退行を防ぐ）。
+> - 既知の先送り: remove の apply が例外を投げると `removeRequested` が true のまま残る（Q9 の意図には
+>   沿うが、状態が outdated のままだと自動 refresh が止まり得る）。起動時の「ready なら `removeRequested`
+>   を解除」が、開始直後の remove と競合し得る（確率は低い）。
 
 ### 7.3 応答
 
 > 実装状況（S7）: `browser-required`、`browser-extensions` と `status.browsers`
 > （`preferred` を除く）は実装済み。`browser-download` と `preferred` は未実装。
+>
+> 実装状況（S8 B1）: `browser-download`（`opened` / `failed` / `not-offered`）と `status.browsers.preferred`
+> は**実装済み**。`status.browsers.entries[]` に `extensionsAddress`（ブラウザー表の `extensionsPage.displayUrl`、
+> 例 `chrome://extensions`。絶対パスではない固定文字列）を追加した。wizard の「アドレスをコピー」と
+> 手入力の案内に使う（§7.2 の spike 結果）。`entries[]` に「ダウンロード URL の有無」の印は無い
+> （Vivaldi は `not-offered` になる。wizard は「対応ブラウザーが 1 つも無いとき」だけダウンロードを
+> 勧めるので、Vivaldi の行には出さない）。
 
 ```ts
 | { readonly kind: "browser-required"; readonly status: CollectorIntegrationStatus }        // was chrome-required
@@ -1025,11 +1056,13 @@ readonly browsers: {
   無いとき）。renderer 文言の一覧は verified 行を表順に並べる（現状は Chrome のみ）。
 - remove 確認ダイアログ（main.ts）と `maginalia.collector.openBrowserExtensions` のタイトル・説明・
   keywords、`maginalia.collector.setup` の keywords（`browser`、`ブラウザー` を追加）は §7.5 に更新済み。
-- `openBrowserExtensions` の対象決定は現状 `request.browser` → `recommended` の 2 段。**§7.2 の
-  「保存済み選択」の段は未実装**（最後に選んだブラウザーの保存・通知状態 v2 `browser`・成功時の保存・
-  `status.browsers.preferred` と一体で、S6 の未実装分と同じ後続）。`setup` の `browser` 受理と選択の保存も同様に後続。
-- **未実装**: intent `openBrowserDownloadPage` と応答 `browser-download`（§7.1/7.3。S8 と一緒）。
-  updated 通知の文言（「Chrome で拡張機能の画面を開く」固定。§7.5）。`maginalia.collector.setup` の
+- `openBrowserExtensions` の対象決定は、S7 時点では `request.browser` → `recommended` の 2 段だった。
+  S8 B1 で「保存済み選択」の段（`request.browser` → 保存済み → `recommended`）、通知状態 v2 `browser`、
+  `status.browsers.preferred`、`setup` の `browser` 受理と保存が入った（§7.2 の S8 B1 注記）。
+- **S8 B1 で実装済み**: intent `openBrowserDownloadPage` と応答 `browser-download`、保存済み選択の段
+  （通知状態 v2 `browser`、`status.browsers.preferred`）、`setup` の `browser` 受理と保存、`removeRequested` の
+  先行記録（§7.1〜§7.3 の S8 B1 注記）。renderer 側（パネル・メニュー・コマンド）は B2 以降。
+- **未実装**: updated 通知の文言（「Chrome で拡張機能の画面を開く」固定。§7.5）。`maginalia.collector.setup` の
   description は Edge が `unverified` の間「for a supported browser.」で、Edge が `verified` に
   なったら §7.5 の「(Edge, Chrome)」へ追従する。
 - Edge を `verified` にするときは、`browser-required` の一覧文言（`supportedBrowserNames`）の
