@@ -366,7 +366,8 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
           removeBeganFrom = state.removeRequested;
           return state.removeRequested ? undefined : { ...state, removeRequested: true };
         });
-        active.delete(COLLECTOR_NOTICE_IDS.repair);
+        // The repair notice is deliberately left alone here: a refused remove changed nothing, and a remove that
+        // ran clears it in `recordApplyResult`.
       } catch {
         // best effort
       }

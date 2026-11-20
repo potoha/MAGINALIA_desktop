@@ -487,13 +487,27 @@ describe("remove requested before the apply (Q9)", () => {
     expect(r.applies).toEqual([]);
   });
 
-  it("drops a repair notice that is showing", async () => {
+  it("keeps a showing repair notice while the remove runs and when it is refused", async () => {
     const r = rig("damaged");
     const startup = createCollectorStartupRefresh(r.deps);
     await startup.runStartup();
     expect(kinds(startup.currentNotices())).toEqual(["repair"]);
     await startup.beginRemove();
-    expect(startup.currentNotices()).toEqual([]);
+    expect(kinds(startup.currentNotices())).toEqual(["repair"]);
+    await startup.recordApplyResult(removeResult("refused", "wrong-state"));
+    expect(kinds(startup.currentNotices())).toEqual(["repair"]);
+    expect(r.store.state.removeRequested).toBe(false);
+  });
+
+  it("a remove that ran clears the repair notice", async () => {
+    for (const outcome of ["applied", "partial"] as const) {
+      const r = rig("damaged");
+      const startup = createCollectorStartupRefresh(r.deps);
+      await startup.runStartup();
+      await startup.beginRemove();
+      await startup.recordApplyResult(removeResult(outcome));
+      expect(startup.currentNotices()).toEqual([]);
+    }
   });
 
   it("puts the previous value back when the remove was refused (nothing changed)", async () => {
