@@ -1,16 +1,24 @@
 import { COLLECTOR_BROWSERS } from "../collector-browser-table";
 import type { CollectorIntegrationRequest, CollectorIntegrationResponse } from "../collector-integration-ipc";
 import type { CollectorNoticeAction } from "../collector-integration-notices";
+import type { CollectorSaveDestinationIpcResult } from "../collector-save-destination-ipc";
 import type { CommandArgs, CommandRegistry } from "./command-registry";
+import { openCollectorWizard, type CollectorWizardDeps } from "./collector-wizard-controller";
 
 /**
  * Collector integration commands (design 5, WP-7 slice A).
  *
  * Every handler only forwards an enumerated intent to the main-process Collector integration
- * service (preload `runCollectorIntegration`). Menus, the Palette, notice buttons and the future
- * wizard panel (slice B) all dispatch these same command IDs; none of them carries a second
- * implementation. Slice B replaces the `setup` / `repair` handlers with "open the panel", and the
- * panel itself calls `runCollectorIntegration` with the same intents.
+ * service (preload `runCollectorIntegration`). Menus, the Palette and notice buttons all dispatch
+ * these same command IDs; none of them carries a second implementation.
+ *
+ * Slice B4: `setup` and `repair` OPEN THE WIZARD PANEL (the wizard inspects the installation and
+ * itself runs `setup` or `repair`), so both IDs share one handler. `removeIntegration` still sends the
+ * `remove` intent directly: the wizard model has no remove path, and the main process owns the single
+ * native confirmation. `openBrowserExtensions` stays a command for the notice button; the wizard's own
+ * "open the browser page" / "open the download page" buttons are wizard-internal (they send the
+ * `openBrowserExtensions` / `openBrowserDownloadPage` intents through the controller's
+ * `runCollectorIntegration` dependency), so `openBrowserDownloadPage` has no command ID of its own.
  */
 export const COLLECTOR_SETUP_COMMAND = "maginalia.collector.setup";
 export const COLLECTOR_REPAIR_COMMAND = "maginalia.collector.repair";
@@ -23,6 +31,35 @@ export interface CollectorIntegrationCommandDependencies {
   readonly run: ((request: CollectorIntegrationRequest) => Promise<CollectorIntegrationResponse>) | null;
   /** `window.maginalia.dismissCollectorNotice`; `null` when this runtime has none. */
   readonly dismiss: ((noticeId: string) => Promise<unknown>) | null;
+  /**
+   * Opens the wizard panel; `null` when this runtime lacks `runCollectorIntegration` or
+   * `configureCollectorSaveDestination` (both are optional in the preload API).
+   */
+  readonly openWizard: (() => void) | null;
+}
+
+const UNAVAILABLE_MESSAGE = "Collector 連携はこの環境では使えません。";
+
+/**
+ * The wizard opener for the preload API of this runtime, or `null` when the wizard cannot work
+ * (it needs both calls). `open` is injectable for tests.
+ */
+export function createCollectorWizardOpener(
+  api: {
+    readonly runCollectorIntegration?: CollectorWizardDeps["runCollectorIntegration"];
+    readonly configureCollectorSaveDestination?: () => Promise<CollectorSaveDestinationIpcResult>;
+  },
+  open: (deps: CollectorWizardDeps) => unknown = openCollectorWizard,
+): (() => void) | null {
+  const run = api.runCollectorIntegration;
+  const configure = api.configureCollectorSaveDestination;
+  if (typeof run !== "function" || typeof configure !== "function") return null;
+  return () => {
+    open({
+      runCollectorIntegration: (request) => run.call(api, request),
+      configureCollectorSaveDestination: () => configure.call(api),
+    });
+  };
 }
 
 /** The names of the browsers a setup accepts today (verified rows of the table, in table order). */
@@ -63,26 +100,31 @@ export function collectorResponseProblem(response: CollectorIntegrationResponse)
 
 export function registerCollectorIntegrationCommands(registry: CommandRegistry, dependencies: CollectorIntegrationCommandDependencies): void {
   const run = async (request: CollectorIntegrationRequest): Promise<void> => {
-    if (dependencies.run === null) throw new Error("Collector 連携はこの環境では使えません。");
+    if (dependencies.run === null) throw new Error(UNAVAILABLE_MESSAGE);
     const problem = collectorResponseProblem(await dependencies.run(request));
     if (problem !== null) throw new Error(problem);
+  };
+
+  const openWizard = (): void => {
+    if (dependencies.openWizard === null) throw new Error(UNAVAILABLE_MESSAGE);
+    dependencies.openWizard();
   };
 
   registry.register({
     id: COLLECTOR_SETUP_COMMAND,
     title: "Collector 連携を設定",
-    description: "Set up the MAGINALIA Collector integration for a supported browser.",
+    description: "Open the wizard that sets up the MAGINALIA Collector integration for a supported browser.",
     category: "Collector",
     keywords: ["collector", "chrome", "browser", "extension", "setup", "ブラウザー", "連携", "設定"]
-  }, () => run({ intent: "setup" }));
+  }, openWizard);
 
   registry.register({
     id: COLLECTOR_REPAIR_COMMAND,
     title: "Collector 連携を確認・修復",
-    description: "Check the MAGINALIA Collector integration and repair what is missing.",
+    description: "Open the wizard that checks the MAGINALIA Collector integration and repairs what is missing.",
     category: "Collector",
     keywords: ["collector", "chrome", "extension", "repair", "check", "確認", "修復"]
-  }, () => run({ intent: "repair" }));
+  }, openWizard);
 
   registry.register({
     id: COLLECTOR_REMOVE_INTEGRATION_COMMAND,

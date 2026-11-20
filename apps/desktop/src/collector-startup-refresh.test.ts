@@ -435,7 +435,8 @@ describe("remove requested", () => {
       r.current = inspection(state);
       const result = await createCollectorStartupRefresh(r.deps).runStartup();
       expect(result.outcome).toBe("remove-requested");
-      expect(result.notices).toEqual([]);
+      // Only an outdated installation (whose refresh is paused) says so; the other states stay quiet (Q9).
+      expect(kinds(result.notices)).toEqual(state === "outdated" ? ["remove-failed"] : []);
     }
     expect(r.applies).toEqual([]);
   });
@@ -465,6 +466,77 @@ describe("remove requested", () => {
     const r = rig("ready");
     r.store.state = { ...DEFAULT_COLLECTOR_NOTICE_STATE, removeRequested: true };
     await createCollectorStartupRefresh(r.deps).runStartup();
+    expect(r.store.state.removeRequested).toBe(false);
+  });
+});
+
+describe("remove apply threw (decision 4)", () => {
+  it("keeps removeRequested set, raises the failure notice and says the automatic update is paused", async () => {
+    const r = rig("outdated");
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.beginRemove();
+    await startup.recordRemoveFailure(); // the apply threw: no recordApplyResult
+    expect(r.store.state.removeRequested).toBe(true);
+    const notices = startup.currentNotices();
+    expect(kinds(notices)).toEqual(["remove-failed"]);
+    expect(notices[0]?.title).toBe("Collector 連携の解除に失敗しました");
+    expect(notices[0]?.detail).toContain("自動更新は止まっています");
+    expect(notices[0]?.actions.map((action) => action.commandId)).toEqual([
+      "maginalia.collector.removeIntegration",
+      "maginalia.collector.repair",
+      "maginalia.collector.dismissNotice",
+    ]);
+  });
+
+  it("re-asserts removeRequested when beginRemove could not persist it", async () => {
+    const r = rig("outdated");
+    await createCollectorStartupRefresh(r.deps).recordRemoveFailure();
+    expect(r.store.state.removeRequested).toBe(true);
+  });
+
+  it("at startup an outdated installation with removeRequested pauses the refresh AND shows the notice; other states stay quiet", async () => {
+    const r = rig("outdated");
+    r.store.state = { ...DEFAULT_COLLECTOR_NOTICE_STATE, removeRequested: true };
+    const result = await createCollectorStartupRefresh(r.deps).runStartup();
+    expect(result.outcome).toBe("remove-requested");
+    expect(r.applies).toEqual([]);
+    expect(kinds(result.notices)).toEqual(["remove-failed"]);
+    for (const state of ["damaged", "registration-missing"] as const) {
+      r.current = inspection(state);
+      expect((await createCollectorStartupRefresh(r.deps).runStartup()).notices).toEqual([]);
+    }
+  });
+
+  it("is dismissed for the session, and cleared by a later remove result, setup or repair", async () => {
+    const r = rig("outdated");
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.recordRemoveFailure();
+    expect(kinds(await startup.dismiss("collector.notice.remove-failed"))).toEqual([]);
+    await startup.recordRemoveFailure();
+    expect(kinds(startup.currentNotices())).toEqual(["remove-failed"]);
+    await startup.recordApplyResult(applyResult("applied", null, "remove"));
+    expect(startup.currentNotices()).toEqual([]);
+    await startup.recordRemoveFailure();
+    await startup.recordApplyResult(applyResult("applied", null, "repair"));
+    expect(startup.currentNotices()).toEqual([]);
+    expect(r.store.state.removeRequested).toBe(false);
+  });
+
+  it("a refused retry keeps the notice and removeRequested", async () => {
+    const r = rig("outdated");
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.recordRemoveFailure();
+    await startup.recordApplyResult(applyResult("refused", "busy", "remove"));
+    expect(kinds(startup.currentNotices())).toEqual(["remove-failed"]);
+    expect(r.store.state.removeRequested).toBe(true);
+  });
+
+  it("does nothing under E2E isolation", async () => {
+    const r = rig("outdated");
+    r.isolated = true;
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.recordRemoveFailure();
+    expect(startup.currentNotices()).toEqual([]);
     expect(r.store.state.removeRequested).toBe(false);
   });
 });

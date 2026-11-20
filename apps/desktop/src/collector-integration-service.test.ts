@@ -159,6 +159,7 @@ function rig(overrides: Partial<CollectorIntegrationServiceDependencies> = {}): 
     markNoticeSurfaceReady: async () => r.notices,
     recordApplyResult: async (result) => { r.events.push(`record:${result.action}:${result.outcome}`); r.recorded.push(result); },
     beginRemove: async () => { r.events.push("beginRemove"); },
+    recordRemoveFailure: async () => { r.events.push("recordRemoveFailure"); },
     preferredBrowser: async () => r.preferred,
     setPreferredBrowser: async (browser) => { r.rememberCalls.push(browser); r.preferred = browser; },
     currentNotices: () => r.notices,
@@ -691,6 +692,26 @@ describe("collector integration service", () => {
     expect((await service.handle({ intent: "remove" })).kind).toBe("apply");
     expect(r.applies).toEqual([{ action: "remove" }]);
     expect(r.logs).toEqual(["MAGINALIA_COLLECTOR_BEGIN_REMOVE_FAILED"]);
+  });
+
+  it("a remove whose apply throws records the failure (decision 4), publishes, and answers an error with a code-only log", async () => {
+    const r = rig();
+    r.applyImpl = async () => { throw new Error("D:\secret"); };
+    const service = createCollectorIntegrationService(r.deps);
+    expect(await service.handle({ intent: "remove" })).toEqual({ kind: "error" });
+    // beginRemove ran first (removeRequested set), the throw skipped recordApplyResult, then the failure was recorded
+    expect(r.events).toEqual(["beginRemove", "apply:remove", "recordRemoveFailure"]);
+    expect(r.logs).toEqual(["MAGINALIA_COLLECTOR_REMOVE_APPLY_FAILED", "MAGINALIA_COLLECTOR_INTEGRATION_REQUEST_FAILED"]);
+    expect(r.recorded).toEqual([]);
+    expect(r.clearCalls).toBe(0);
+  });
+
+  it("a failing recordRemoveFailure does not hide the original remove error", async () => {
+    const r = rig();
+    r.applyImpl = async () => { throw new Error("x"); };
+    const service = createCollectorIntegrationService({ ...r.deps, startupRefresh: { ...r.startup, recordRemoveFailure: async () => { throw new Error("D:\y"); } } });
+    expect(await service.handle({ intent: "remove" })).toEqual({ kind: "error" });
+    expect(r.logs).toContain("MAGINALIA_COLLECTOR_RECORD_REMOVE_FAILURE_FAILED");
   });
 
   it("openBrowserDownloadPage opens only the row's constant https URL, with the main-process opener", async () => {

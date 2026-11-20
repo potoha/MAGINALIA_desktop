@@ -21,6 +21,8 @@
  *    which would be a false alarm.
  *  - After the user asked for `remove` (`removeRequested`, persisted) no refresh and no repair
  *    notice happen until a setup or repair is applied (`recordApplyResult`).
+ *  - Decision 4: while `removeRequested` is set and the state is `outdated`, the refresh is paused (see `execute`),
+ *    so the "remove failed" notice is raised at startup too (not persisted: derived from the two facts).
  *  - Notice state is read and written through one serialized chain; an apply never runs inside it.
  *  - The alpha1 notice is held back (not even persisted as `shown`) until the renderer asked for notices
  *    (`markNoticeSurfaceReady`); refresh and repair notices do not wait for that.
@@ -35,6 +37,7 @@ import type { CollectorApplyRequest, CollectorApplyResult } from "./collector-in
 import type { CollectorInspectOptions, CollectorIntegrationInspection } from "./collector-integration-types.js";
 import {
   buildAlpha1MigrationNotice,
+  buildRemoveFailedNotice,
   buildRepairNotice,
   buildUpdatedNotice,
   COLLECTOR_NOTICE_IDS,
@@ -96,6 +99,11 @@ export interface CollectorStartupRefresh {
    * (nothing changed), `recordApplyResult` puts the previous value back. Never throws.
    */
   beginRemove(): Promise<void>;
+  /**
+   * The confirmed remove's apply THREW (decision 4). `removeRequested` stays set (it is re-asserted here in case
+   * `beginRemove` could not persist it) and the "remove failed" notice is raised. Never throws.
+   */
+  recordRemoveFailure(): Promise<void>;
   /** The browser the user last chose (multi-browser design 7.4), or `null`. Never throws. */
   preferredBrowser(): Promise<CollectorBrowserId | null>;
   /** Remembers the user's browser choice (same serialized state chain as every other write). Never throws. */
@@ -219,6 +227,10 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
         state = (await mutate((current) => ({ ...current, removeRequested: false }))).state;
       } else {
         await mutate((current) => current.updated !== null ? { ...current, updated: null } : undefined);
+        // The refresh below is skipped for an outdated installation: say so (decision 4). Other states stay quiet (Q9).
+        if (inspection.state === "outdated" && !dismissedForSession.has(COLLECTOR_NOTICE_IDS.removeFailed)) {
+          active.set(COLLECTOR_NOTICE_IDS.removeFailed, buildRemoveFailedNotice());
+        }
         return finish("remove-requested");
       }
     }
@@ -316,7 +328,7 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
         } else if (noticeId === COLLECTOR_NOTICE_IDS.alpha1Migration) {
           active.delete(noticeId);
           await mutate((state) => state.alpha1 !== "dismissed" ? { ...state, alpha1: "dismissed" as const } : undefined);
-        } else if (noticeId === COLLECTOR_NOTICE_IDS.repair) {
+        } else if (noticeId === COLLECTOR_NOTICE_IDS.repair || noticeId === COLLECTOR_NOTICE_IDS.removeFailed) {
           active.delete(noticeId);
           dismissedForSession.add(noticeId);
         }
@@ -340,12 +352,16 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
         }
         if (result.action === "remove") removeBeganFrom = undefined;
         if (result.action === "remove") {
+          // A removal that ran to a result (even a partial one) supersedes an earlier failure notice.
+          dismissedForSession.delete(COLLECTOR_NOTICE_IDS.removeFailed);
+          active.delete(COLLECTOR_NOTICE_IDS.removeFailed);
           // Whatever else happened, the user asked for it: stay quiet (a `partial` removal still looks damaged).
           active.delete(COLLECTOR_NOTICE_IDS.repair);
           active.delete(COLLECTOR_NOTICE_IDS.updated);
           await mutate((state) => !state.removeRequested || state.updated !== null ? { ...state, removeRequested: true, updated: null } : undefined);
         } else if ((result.action === "setup" || result.action === "repair") && (result.outcome === "applied" || result.outcome === "noop")) {
           active.delete(COLLECTOR_NOTICE_IDS.repair);
+          active.delete(COLLECTOR_NOTICE_IDS.removeFailed);
           active.delete(COLLECTOR_NOTICE_IDS.alpha1Migration);
           alpha1Pending = false;
           await mutate((state) => {
@@ -368,6 +384,20 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
         });
         // The repair notice is deliberately left alone here: a refused remove changed nothing, and a remove that
         // ran clears it in `recordApplyResult`.
+      } catch {
+        // best effort
+      }
+    },
+
+    async recordRemoveFailure(): Promise<void> {
+      try {
+        if (deps.e2eIsolationActive) return;
+        removeBeganFrom = undefined; // a later `refused` must not restore a value from before this failed remove
+        dismissedForSession.delete(COLLECTOR_NOTICE_IDS.removeFailed);
+        active.delete(COLLECTOR_NOTICE_IDS.repair);
+        active.delete(COLLECTOR_NOTICE_IDS.updated);
+        active.set(COLLECTOR_NOTICE_IDS.removeFailed, buildRemoveFailedNotice());
+        await mutate((state) => !state.removeRequested ? { ...state, removeRequested: true } : undefined);
       } catch {
         // best effort
       }

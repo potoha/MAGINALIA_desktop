@@ -276,7 +276,20 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
         } catch (error: unknown) {
           deps.logError("MAGINALIA_COLLECTOR_BEGIN_REMOVE_FAILED", error);
         }
-        const result = await deps.apply(request);
+        let result: CollectorApplyResult;
+        try {
+          result = await deps.apply(request);
+        } catch (error: unknown) {
+          // Decision 4: `removeRequested` (set by `beginRemove`) stays set; tell the user the removal did not finish.
+          deps.logError("MAGINALIA_COLLECTOR_REMOVE_APPLY_FAILED", error);
+          try {
+            await deps.startupRefresh.recordRemoveFailure();
+          } catch (recordError: unknown) {
+            deps.logError("MAGINALIA_COLLECTOR_RECORD_REMOVE_FAILURE_FAILED", recordError);
+          }
+          publish(deps.startupRefresh.currentNotices());
+          throw error;
+        }
         await recordSafely(result);
         // A refused removal changed nothing: the save destination setting stays too.
         if (confirmation.clearSaveDestination && result.outcome !== "refused") {

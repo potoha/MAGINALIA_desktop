@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildAlpha1MigrationNotice,
+  buildRemoveFailedNotice,
   buildRepairNotice,
   buildUpdatedNotice,
   COLLECTOR_NOTICE_IDS,
@@ -69,6 +70,7 @@ describe("Collector integration IPC contract", () => {
   it("accepts the real notices and rejects malformed lists", () => {
     const notices = [buildUpdatedNotice("0.4.0", "2026-11-16T09:00:00.000Z"), buildRepairNotice("damaged"), buildAlpha1MigrationNotice()];
     expect(isCollectorNoticeList(notices)).toBe(true);
+    expect(isCollectorNoticeList([buildRemoveFailedNotice()])).toBe(true);
     expect(isCollectorNoticeList([])).toBe(true);
     expect(isCollectorNoticeList("x")).toBe(false);
     expect(isCollectorNoticeList([null])).toBe(false);

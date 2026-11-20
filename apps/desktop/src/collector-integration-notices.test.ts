@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildAlpha1MigrationNotice,
+  buildRemoveFailedNotice,
   buildRepairNotice,
   buildUpdatedNotice,
   createFileCollectorNoticeStore,
@@ -97,5 +98,18 @@ describe("notice data", () => {
     expect(buildAlpha1MigrationNotice().title).toBe("Chrome で読んでいる Web ページの引用を、本棚に保存できるようになりました（MAGINALIA Collector）。");
     expect(buildAlpha1MigrationNotice().actions.map((action) => action.label)).toEqual(["設定する", "今はしない"]);
     expect(buildRepairNotice("damaged").actions[0]?.commandId).toBe("maginalia.collector.repair");
+  });
+
+  it("the remove-failed notice (decision 4) has the fixed title, says the automatic update is paused, and retries through the remove command", () => {
+    const notice = buildRemoveFailedNotice();
+    expect(notice.title).toBe("Collector 連携の解除に失敗しました");
+    expect(notice.detail).toContain("Collector の自動更新は止まっています");
+    expect(notice.actions.map((action) => [action.commandId, action.label])).toEqual([
+      ["maginalia.collector.removeIntegration", "解除をやり直す…"],
+      ["maginalia.collector.repair", "確認・修復…"],
+      ["maginalia.collector.dismissNotice", "閉じる"],
+    ]);
+    // nothing about it is persisted: the state schema is unchanged (still version 2, same four-plus-one fields)
+    expect(Object.keys(DEFAULT_COLLECTOR_NOTICE_STATE)).toEqual(["version", "removeRequested", "alpha1", "updated", "browser"]);
   });
 });

@@ -30,7 +30,20 @@ describe("native application menu contract", () => {
     expect(APPLICATION_MENU_COMMAND_IDS).toContain("maginalia.editor.replaceInDocument");
     expect(APPLICATION_MENU_COMMAND_IDS).toContain("maginalia.document.closeView");
     expect(APPLICATION_MENU_COMMAND_IDS).toContain("maginalia.collector.configureSaveDestination");
+    expect(APPLICATION_MENU_COMMAND_IDS).toContain("maginalia.collector.setup");
+    expect(APPLICATION_MENU_COMMAND_IDS).toContain("maginalia.collector.repair");
+    expect(APPLICATION_MENU_COMMAND_IDS).toContain("maginalia.collector.removeIntegration");
     expect(APPLICATION_MENU_COMMAND_IDS).toContain("maginalia.collector.clearSaveDestination");
+  });
+
+  it("lists the three Collector integration items with the exact Japanese labels, in the File menu", () => {
+    const file = APPLICATION_MENU_MANIFEST.find(({ label }) => label === "ファイル");
+    const collector = (file?.items ?? []).filter((item) => item.kind === "command" && item.id.startsWith("maginalia.collector."));
+    expect(collector.map((item) => item.kind === "command" ? [item.id, item.label] : null).slice(0, 3)).toEqual([
+      ["maginalia.collector.setup", "Collector 連携を設定…"],
+      ["maginalia.collector.repair", "Collector 連携の確認・修復…"],
+      ["maginalia.collector.removeIntegration", "Collector 連携を解除…"],
+    ]);
   });
 
   it("bounds renderer state to unique allowlisted commands and safe accelerators", () => {

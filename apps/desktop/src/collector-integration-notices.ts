@@ -20,14 +20,17 @@ export const COLLECTOR_REPAIR_COMMAND_ID = "maginalia.collector.repair";
 /** New in WP-5c (not in design 5): the notice buttons of design 6.5 / 5. */
 export const COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND_ID = "maginalia.collector.openBrowserExtensions";
 export const COLLECTOR_DISMISS_NOTICE_COMMAND_ID = "maginalia.collector.dismissNotice";
+/** The remove command (design 5). The remove-failed notice's retry button dispatches it. */
+export const COLLECTOR_REMOVE_COMMAND_ID = "maginalia.collector.removeIntegration";
 
 export const COLLECTOR_NOTICE_IDS = Object.freeze({
   updated: "collector.notice.updated",
   repair: "collector.notice.repair",
   alpha1Migration: "collector.notice.alpha1-migration",
+  removeFailed: "collector.notice.remove-failed",
 } as const);
 
-export type CollectorNoticeKind = "updated" | "repair" | "alpha1-migration";
+export type CollectorNoticeKind = "updated" | "repair" | "alpha1-migration" | "remove-failed";
 export type CollectorRepairNoticeState = "foreign-registration" | "registration-missing" | "damaged";
 
 export interface CollectorNoticeAction {
@@ -66,6 +69,15 @@ export type CollectorNotice =
     readonly kind: "alpha1-migration";
     /** Shown once; dismissal (or the setup action) is remembered. */
     readonly clearsWhen: "dismissed";
+  })
+  | (NoticeBase & {
+    readonly kind: "remove-failed";
+    /**
+     * Not persisted. Raised in the session where a confirmed remove threw, and again at startup while
+     * `removeRequested` is set and the installation is `outdated` (the state in which the automatic refresh
+     * is paused). Cleared by any remove / setup / repair result, or closed for the session by dismissal.
+     */
+    readonly clearsWhen: "remove-or-setup-applied-or-dismissed";
   });
 
 export function buildUpdatedNotice(extensionVersion: string, createdAt: string): CollectorNotice {
@@ -110,6 +122,26 @@ export function buildAlpha1MigrationNotice(): CollectorNotice {
     actions: Object.freeze([
       { commandId: COLLECTOR_SETUP_COMMAND_ID, label: "設定する", closesNoticeId: COLLECTOR_NOTICE_IDS.alpha1Migration },
       { commandId: COLLECTOR_DISMISS_NOTICE_COMMAND_ID, label: "今はしない", argument: { noticeId: COLLECTOR_NOTICE_IDS.alpha1Migration } },
+    ]),
+  });
+}
+
+/**
+ * Decision 4: a remove that threw leaves `removeRequested` set, and while it is set (and the state is
+ * `outdated`) the startup refresh does not run. The text therefore says that the automatic update is paused
+ * and how to end that: retry the removal, or cancel it with a repair.
+ */
+export function buildRemoveFailedNotice(): CollectorNotice {
+  return Object.freeze({
+    id: COLLECTOR_NOTICE_IDS.removeFailed,
+    kind: "remove-failed" as const,
+    title: "Collector 連携の解除に失敗しました",
+    detail: "解除をやり直すか、「確認・修復…」で解除を取り消すまで、Collector の自動更新は止まっています。本棚・引用データは削除されていません。",
+    clearsWhen: "remove-or-setup-applied-or-dismissed" as const,
+    actions: Object.freeze([
+      { commandId: COLLECTOR_REMOVE_COMMAND_ID, label: "解除をやり直す…" },
+      { commandId: COLLECTOR_REPAIR_COMMAND_ID, label: "確認・修復…" },
+      { commandId: COLLECTOR_DISMISS_NOTICE_COMMAND_ID, label: "閉じる", argument: { noticeId: COLLECTOR_NOTICE_IDS.removeFailed } },
     ]),
   });
 }
