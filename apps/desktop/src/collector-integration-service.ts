@@ -259,7 +259,7 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
     }
   }
 
-  /** `chosenBrowser` (setup only): remembered once the apply has run, so the returned status already shows it. */
+  /** `chosenBrowser` (setup only): remembered once the apply succeeded (applied / noop) and the row is usable, so the returned status already shows it. */
   async function runApply(request: CollectorApplyRequest, chosenBrowser?: CollectorBrowserId): Promise<CollectorIntegrationResponse> {
     const outcome = await deps.gate.tryRun(runExclusive);
     if (!outcome.ran) return { kind: "busy" };
@@ -291,7 +291,11 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
       }
       const result = await deps.apply(request);
       await recordSafely(result);
-      if (chosenBrowser !== undefined) await rememberBrowser(chosenBrowser);
+      if (chosenBrowser !== undefined && (result.outcome === "applied" || result.outcome === "noop")) {
+        // Only a usable choice is remembered: verified, installed and not blocked by policy.
+        const entry = result.inspection.browsers.entries.find((candidate) => candidate.id === chosenBrowser);
+        if (entry !== undefined && entry.verification === "verified" && entry.installed === "found" && !entry.policy.blocked) await rememberBrowser(chosenBrowser);
+      }
       return { kind: "result", result, extra } as const;
     }
 

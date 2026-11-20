@@ -592,14 +592,45 @@ describe("collector integration service", () => {
   it("setup with a browser remembers it once the apply ran; the returned status already shows it", async () => {
     const r = rig();
     const service = createCollectorIntegrationService(r.deps);
-    const response = await service.handle({ intent: "setup", browser: "edge" });
-    expect(response).toMatchObject({ kind: "apply", status: { browsers: { preferred: "edge" } } });
-    expect(r.rememberCalls).toEqual(["edge"]);
+    const response = await service.handle({ intent: "setup", browser: "chrome" });
+    expect(response).toMatchObject({ kind: "apply", status: { browsers: { preferred: "chrome" } } });
+    expect(r.rememberCalls).toEqual(["chrome"]);
     expect(r.applies).toEqual([{ action: "setup" }]); // the browser never reaches the apply request
     // without a browser nothing is remembered and nothing is cleared
     await service.handle({ intent: "setup" });
-    expect(r.rememberCalls).toEqual(["edge"]);
-    expect(r.preferred).toBe("edge");
+    expect(r.rememberCalls).toEqual(["chrome"]);
+    expect(r.preferred).toBe("chrome");
+  });
+
+  it("setup remembers the browser only for applied / noop, never for refused, failed or partial", async () => {
+    for (const [outcome, saved] of [["applied", true], ["noop", true], ["refused", false], ["failed", false], ["partial", false]] as const) {
+      const r = rig();
+      r.applyImpl = async (request) => applyResult(request.action, outcome, outcome === "applied" || outcome === "noop" ? null : "write-failed");
+      const service = createCollectorIntegrationService(r.deps);
+      expect((await service.handle({ intent: "setup", browser: "chrome" })).kind).toBe("apply");
+      expect(r.rememberCalls, outcome).toEqual(saved ? ["chrome"] : []);
+    }
+  });
+
+  it("setup does not remember a browser row that is unverified, not installed or blocked by policy", async () => {
+    const cases: Array<[string, CollectorBrowserStatus[]]> = [
+      ["unverified", [browserStatus("edge", { installed: "found" }), browserStatus("chrome", { installed: "found" }), browserStatus("vivaldi")]],
+      ["not-found", [browserStatus("edge"), browserStatus("chrome", { installed: "found" }), browserStatus("vivaldi")]],
+      ["unknown", [browserStatus("edge"), browserStatus("chrome", { installed: "found" }), browserStatus("vivaldi", { installed: "unknown" })]],
+      ["blocked", [browserStatus("edge"), browserStatus("chrome", { installed: "found", policy: { ...NO_POLICY, userLevelHostsDisabled: true, blocked: true } }), browserStatus("vivaldi")]],
+    ];
+    for (const [name, entries] of cases) {
+      const r = rig();
+      r.applyImpl = async (request) => {
+        const result = applyResult(request.action);
+        return { ...result, inspection: inspection("ready", { browsers: browsers({ entries }) }) };
+      };
+      const service = createCollectorIntegrationService(r.deps);
+      const chosen = name === "unverified" ? "edge" : name === "not-found" ? "edge" : name === "unknown" ? "vivaldi" : "chrome";
+      expect((await service.handle({ intent: "setup", proceedWithoutSupportedBrowser: true, browser: chosen })).kind).toBe("apply");
+      expect(r.rememberCalls, name).toEqual([]);
+      expect(r.preferred, name).toBeNull();
+    }
   });
 
   it("setup does not remember a browser when it was refused as browser-required, busy, or threw", async () => {
