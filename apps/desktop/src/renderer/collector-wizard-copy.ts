@@ -65,6 +65,8 @@ export const WIZARD_MESSAGE_IDS = [
   "self-check-failed",
   "register-failed",
   "outdated-pending",
+  // blocking request without an answer for a long time (watchdog)
+  "inflight-slow",
   // step C
   "destination-configured",
   "destination-writes-disabled",
@@ -111,6 +113,7 @@ export const WIZARD_MESSAGE_ROLE: Readonly<Record<WizardMessageId, WizardMessage
   "self-check-failed": "alert",
   "register-failed": "alert",
   "outdated-pending": "status",
+  "inflight-slow": "alert",
   "destination-configured": "status",
   "destination-writes-disabled": "alert",
   "destination-cancelled": "status",
@@ -284,6 +287,8 @@ export interface WizardCopy {
     readonly retry: string;
     readonly recheck: string;
     readonly finish: string;
+    /** The watchdog action: stop waiting for a request that has not answered (nothing is rolled back). */
+    readonly cancelWait: string;
   };
   readonly stepA: {
     readonly title: string;
@@ -315,6 +320,8 @@ export interface WizardCopy {
     readonly detail: string;
     readonly confirm: string;
     readonly confirmAgain: string;
+    readonly chooseAgain: string;
+    readonly cancelSetup: string;
     readonly nextWritesDisabled: string;
   };
   readonly stepD: {
@@ -399,6 +406,7 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
       close: "閉じる",
       retry: "もう一度試す",
       recheck: "もう一度確認",
+      cancelWait: "キャンセル",
       finish: "完了",
     },
     stepA: {
@@ -468,6 +476,8 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
       detail: "次に表示される確認画面で本棚の名前を確かめ、［この本棚に設定］を押してください。本棚のファイルや識別マーカーは変更されません。",
       confirm: "保存先を確認する",
       confirmAgain: "もう一度確認する",
+      chooseAgain: "保存先を選び直す",
+      cancelSetup: "Collector のセットアップをキャンセル",
       nextWritesDisabled: "次へ（保存は無効のまま）",
     },
     stepD: {
@@ -654,7 +664,7 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
       },
       "self-check-failed": {
         headline: "連携プログラムを起動できませんでした。",
-        detail: "Windows のセキュリティ機能で起動が止められた可能性があります。保存しようとした引用は、ブラウザー内に保留されます。",
+        detail: "Windows のセキュリティ機能で起動が止められた可能性があります。保存しようとした引用は、ブラウザー内に保留されます。ウィザードをいったん閉じて開き直してください。",
       },
       "register-failed": {
         headline: "連携プログラムを登録できませんでした。",
@@ -662,7 +672,11 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
       },
       "outdated-pending": {
         headline: "連携プログラムは登録済みです。",
-        detail: "新しい版への更新は、MAGINALIA の次回起動時に自動で行われます。このまま次へ進めます。",
+        detail: "連携プログラムの新しい版へは、次回起動時に自動で更新されます。このまま次へ進めます。",
+      },
+      "inflight-slow": {
+        headline: "応答に時間がかかっています。",
+        detail: "このまま待つこともできます。待つのをやめるときは［キャンセル］を押してください。すでに登録された内容は元に戻りません。",
       },
       "destination-configured": {
         headline: "保存先を設定しました。",

@@ -63,6 +63,13 @@ import {
 export const WIZARD_POLL_INTERVAL_MS = 2_000;
 /** Waiting for the extension ends here (design 4.6: "Timed out (3 min)"). Inclusive. */
 export const WIZARD_CONNECTION_TIMEOUT_MS = 180_000;
+/**
+ * A blocking request (setup, repair, destination, placement ...) that has not answered after this much
+ * wall-clock time offers 「キャンセル」. Measured from timestamps (`event.now`), never from counted ticks,
+ * so minimising the window or a sleeping machine cannot stall it. The connection-check poll is excluded
+ * (it has `WIZARD_CONNECTION_TIMEOUT_MS`).
+ */
+export const WIZARD_INFLIGHT_CANCEL_MS = 180_000;
 /** How often the panel should send `tick` while a `ticker` effect is active. Resolution only; not a poll interval. */
 export const WIZARD_TICK_INTERVAL_MS = 1_000;
 
@@ -105,6 +112,10 @@ type WizardOperation =
 export interface WizardInFlight {
   readonly requestId: number;
   readonly operation: WizardOperation;
+  /** `now` of the event that issued the request (stamped by `reduceWizard`); `null` only inside the reducer. */
+  readonly startedAt: number | null;
+  /** The watchdog fired: `cancelInFlight` is allowed and the panel should show the slow-response notice. */
+  readonly cancelOffered: boolean;
 }
 
 export type WizardClosedOutcome = "later" | "finished";
@@ -171,6 +182,13 @@ export type WizardUserEvent =
   | { readonly type: "confirmForeign" }
   | { readonly type: "declineForeign" }
   | { readonly type: "confirmDestination" }
+  /** Step C after destination-error / destination-busy: opens the destination picker again (same effect as `confirmDestination`). */
+  | { readonly type: "chooseDestinationAgain" }
+  /**
+   * Abort a blocking request that has not answered for `WIZARD_INFLIGHT_CANCEL_MS`. Only forgets the request:
+   * nothing already written is rolled back, and a late answer is discarded.
+   */
+  | { readonly type: "cancelInFlight" }
   | { readonly type: "retryPlacement" }
   | { readonly type: "openBrowserExtensions" }
   | { readonly type: "copyAddress" }
@@ -408,6 +426,8 @@ const STEP_B_TERMINAL: readonly WizardMessageId[] = [
   "unavailable-e2e-isolation",
   "unavailable-payload-unavailable",
   "unavailable-startup-failed",
+  // No self-check-only retry exists. Re-opening the wizard re-evaluates the installation state from scratch (verified by B5).
+  "self-check-failed",
 ];
 const STEP_C_PROCEED: readonly WizardMessageId[] = ["destination-configured", "destination-writes-disabled", "destination-cancelled"];
 
@@ -441,7 +461,7 @@ function isMutating(state: WizardState): boolean {
 
 function issue(state: WizardState, operation: WizardOperation, request: CollectorIntegrationRequest | null): { state: WizardState; effect: WizardEffect } {
   const requestId = state.nextRequestId + 1;
-  const next: WizardState = { ...state, nextRequestId: requestId, inFlight: { requestId, operation: operation } };
+  const next: WizardState = { ...state, nextRequestId: requestId, inFlight: { requestId, operation, startedAt: null, cancelOffered: false } };
   return {
     state: next,
     effect: request === null
@@ -481,6 +501,7 @@ export function isWizardEventAllowed(state: WizardState, event: WizardUserEvent)
   if (state.closed !== null) return false;
   // After a finished check the only way out is 完了 then 閉じる: leaving early would hide that it worked.
   const completed = state.step === "E" && (state.connection?.phase === "connected" || state.connection?.phase === "user-confirmed");
+  if (event.type === "cancelInFlight") return isBlocking(state) && state.inFlight?.cancelOffered === true;
   if (event.type === "later") return state.step !== "done" && !completed && !isMutating(state);
   if (event.type === "escape") return !completed && !isMutating(state);
   if (state.step === "done") return event.type === "close";
@@ -534,6 +555,8 @@ export function isWizardEventAllowed(state: WizardState, event: WizardUserEvent)
           return true;
         case "confirmDestination":
           return current === undefined || !(current === "destination-configured" || current === "destination-writes-disabled");
+        case "chooseDestinationAgain":
+          return current === "destination-error" || current === "destination-busy";
         case "next":
           return current !== undefined && STEP_C_PROCEED.includes(current);
         default:
@@ -840,7 +863,42 @@ export function reduceWizard(state: WizardState, event: WizardEvent): WizardRedu
   if (state.closed !== null) return unchanged(state);
   // A non-finite clock value would make every tick look due: ignore the event.
   if (!Number.isFinite(event.now)) return unchanged(state);
+  return applyWatchdog(state, event, reduceCore(state, event));
+}
 
+/** Whether the panel must be sending `tick`: the connection wait, or a blocking request that the watchdog times. */
+function needsTicker(state: WizardState): boolean {
+  if (state.closed !== null) return false;
+  if (state.step === "E" && state.connection?.phase === "waiting") return true;
+  return isBlocking(state);
+}
+
+/**
+ * Stamps new requests with the event time, fires the in-flight watchdog from timestamps (a clock jump
+ * counts as elapsed time; a backward jump never un-offers) and keeps the `ticker` effect in step with `needsTicker`.
+ */
+function applyWatchdog(before: WizardState, event: WizardEvent, reduced: WizardReduction): WizardReduction {
+  let state = reduced.state;
+  let inFlight = state.inFlight;
+  if (inFlight !== null && inFlight.startedAt === null) inFlight = { ...inFlight, startedAt: event.now };
+  if (inFlight !== null && inFlight.operation !== "poll" && !inFlight.cancelOffered && inFlight.startedAt !== null
+    && event.now - inFlight.startedAt >= WIZARD_INFLIGHT_CANCEL_MS) {
+    inFlight = { ...inFlight, cancelOffered: true };
+  }
+  if (inFlight !== state.inFlight) state = { ...state, inFlight };
+  const effects = [...reduced.effects];
+  let current = needsTicker(before);
+  for (const effect of effects) if (effect.type === "ticker") current = effect.active;
+  const wanted = needsTicker(state);
+  if (wanted !== current) {
+    const closeAt = effects.findIndex((effect) => effect.type === "close");
+    if (closeAt >= 0) effects.splice(closeAt, 0, ticker(wanted));
+    else effects.push(ticker(wanted));
+  }
+  return { state, effects };
+}
+
+function reduceCore(state: WizardState, event: WizardEvent): WizardReduction {
   switch (event.type) {
     case "opened": {
       if (state.nextRequestId !== 0 || state.inFlight !== null || state.status !== null) return unchanged(state);
@@ -923,9 +981,22 @@ function reduceUserEvent(state: WizardState, event: WizardUserEvent & { readonly
     case "declineForeign":
       return unchanged(withResult(state, "B", "foreign-declined"));
 
-    case "confirmDestination": {
+    case "confirmDestination":
+    case "chooseDestinationAgain": {
       const issued = issue(withResult(state, "C", null), "destination", null);
       return reduction(issued.state, issued.effect);
+    }
+
+    case "cancelInFlight": {
+      // Abort only: forget the request (a late answer then fails the requestId guard) and keep every result as it is.
+      // Registrations that already happened stay. Only states that would otherwise be stuck on "waiting" are reset.
+      const operation = state.inFlight?.operation;
+      return unchanged({
+        ...state,
+        placement: operation === "placement" ? "unknown" : state.placement,
+        statusLoad: operation === "inspect" && state.status === null ? "failed" : state.statusLoad,
+        inFlight: null,
+      });
     }
 
     case "retryPlacement": {
@@ -1062,6 +1133,15 @@ export function wizardIsBusy(state: WizardState): boolean {
   return isBlocking(state);
 }
 
+/**
+ * The slow-response notice, only after `WIZARD_INFLIGHT_CANCEL_MS` of a blocking request (shown together with the
+ * `cancelInFlight` action), else `null`.
+ */
+export function wizardInFlightNotice(state: WizardState): WizardMessageView | null {
+  if (!isBlocking(state) || state.inFlight?.cancelOffered !== true) return null;
+  return { id: "inflight-slow", role: WIZARD_MESSAGE_ROLE["inflight-slow"], copy: wizardCopy(state).messages["inflight-slow"] };
+}
+
 /** The step E line 「保存先：…」. */
 export function wizardDestinationConfigured(state: WizardState): boolean {
   return state.results.C === "destination-configured";
@@ -1131,7 +1211,7 @@ export function wizardActions(state: WizardState): readonly WizardAction[] {
         later(result === "folder-unsafe" ? copy.common.later : copy.common.close);
         break;
       } else {
-        const label = result === "self-check-failed" ? copy.common.recheck : failure || result === "foreign-declined" ? copy.common.retry : copy.stepB.register;
+        const label = failure || result === "foreign-declined" ? copy.common.retry : copy.stepB.register;
         add("register", label, { type: "register" }, true);
       }
       back();
@@ -1144,6 +1224,12 @@ export function wizardActions(state: WizardState): readonly WizardAction[] {
         add("next", copy.common.next, { type: "next" }, true);
       } else if (result === "destination-writes-disabled") {
         add("next", copy.stepC.nextWritesDisabled, { type: "next" }, true);
+      } else if (result === "destination-error" || result === "destination-busy") {
+        // Exactly these three (no 戻る, 次へ, 閉じる). Cancel only closes the wizard (`later`); nothing registered is rolled back.
+        add("confirmDestination", copy.common.retry, { type: "confirmDestination" }, true);
+        add("chooseDestinationAgain", copy.stepC.chooseAgain, { type: "chooseDestinationAgain" });
+        add("cancelSetup", copy.stepC.cancelSetup, { type: "later" });
+        break;
       } else {
         add("confirmDestination", result === undefined ? copy.stepC.confirm : copy.stepC.confirmAgain, { type: "confirmDestination" }, !proceed);
         if (proceed) add("next", copy.common.next, { type: "next" }, true);
@@ -1200,6 +1286,9 @@ export function wizardActions(state: WizardState): readonly WizardAction[] {
       break;
     default:
       unreachable(state.step);
+  }
+  if (isBlocking(state) && state.inFlight?.cancelOffered === true) {
+    add("cancelInFlight", copy.common.cancelWait, { type: "cancelInFlight" });
   }
   return actions;
 }
