@@ -291,6 +291,8 @@ export interface WizardCopy {
     readonly bullets: readonly string[];
     readonly menuNote: string;
     readonly radiogroupLabel: string;
+    /** Shown beside a disabled 「次へ」 while no browser is selected (B3 addition: the reason a button is disabled). */
+    readonly selectBrowserFirst: string;
     readonly optionRecommendedSuffix: string;
     readonly optionPolicyBlocked: string;
     readonly optionDetectionUnknown: string;
@@ -414,6 +416,7 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
       ],
       menuNote: "あとからでも、メニューの「ファイル」→「Collector 連携を設定…」で始められます。",
       radiogroupLabel: "Collector を使うブラウザー",
+      selectBrowserFirst: "ブラウザーを選ぶと、次へ進めます。",
       optionRecommendedSuffix: "（おすすめ）",
       optionPolicyBlocked: "組織の管理設定により使えません",
       optionDetectionUnknown: "確認できませんでした",
