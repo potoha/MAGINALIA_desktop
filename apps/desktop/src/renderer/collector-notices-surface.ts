@@ -43,9 +43,13 @@ export function startCollectorNotices(deps: CollectorNoticesDeps): CollectorNoti
     })
     : null;
   if (typeof api.getCollectorNotices === "function") {
-    api.getCollectorNotices().then((notices) => {
-      if (!stopped && !pushed) deps.present(notices);
-    }).catch(onError);
+    try {
+      api.getCollectorNotices().then((notices) => {
+        if (!stopped && !pushed) deps.present(notices);
+      }).catch(onError);
+    } catch (error: unknown) {
+      onError(error); // a synchronous throw (for example a validation error in the preload)
+    }
   }
   return {
     stop(): void {
@@ -67,15 +71,22 @@ export function createCollectorNoticePresenter(
   region.id = "collector-notices";
   region.className = "collector-notices";
   region.setAttribute("aria-label", "Collector の通知");
+  region.setAttribute("aria-live", "polite");
   region.hidden = true;
   doc.body.append(region);
 
+  /** The buttons of the last render, keyed by notice id + action index, to carry focus across a re-render. */
+  let buttons: Array<{ readonly key: string; readonly element: HTMLButtonElement }> = [];
+
   return (notices) => {
+    const focusedKey = buttons.find((entry) => entry.element === doc.activeElement)?.key;
+    buttons = [];
     region.replaceChildren();
     for (const notice of notices) {
       const card = doc.createElement("div");
       card.className = "collector-notice";
-      card.setAttribute("role", "group");
+      // The remove-failed notice needs the user's attention (a removal half done); the others are polite.
+      card.setAttribute("role", notice.kind === "remove-failed" ? "alert" : "group");
       card.setAttribute("aria-label", notice.title);
       card.dataset.noticeId = notice.id;
       const title = doc.createElement("p");
@@ -90,17 +101,25 @@ export function createCollectorNoticePresenter(
       }
       const actions = doc.createElement("div");
       actions.className = "collector-notice-actions";
-      for (const action of notice.actions) {
+      for (const [index, action] of notice.actions.entries()) {
         const button = doc.createElement("button");
         button.type = "button";
         button.className = "collector-notice-button";
         button.textContent = action.label;
         button.addEventListener("click", () => onAction(action));
         actions.append(button);
+        buttons.push({ key: `${notice.id}:${index}`, element: button });
       }
       card.append(actions);
       region.append(card);
     }
     region.hidden = notices.length === 0;
+    if (focusedKey !== undefined) {
+      // Focus was on a notice button: keep it on the same button when it still exists. Otherwise (the notice was
+      // dismissed or changed) move it to the first remaining button, or to the page body when none is left, so
+      // keyboard focus never falls to a removed element.
+      (buttons.find((entry) => entry.key === focusedKey) ?? buttons[0])?.element.focus();
+      if (buttons.length === 0) doc.body.focus();
+    }
   };
 }

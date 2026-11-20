@@ -129,18 +129,18 @@ export function buildAlpha1MigrationNotice(): CollectorNotice {
 /**
  * Decision 4: a remove that threw leaves `removeRequested` set, and while it is set (and the state is
  * `outdated`) the startup refresh does not run. The text therefore says that the automatic update is paused
- * and how to end that: retry the removal, or cancel it with a repair.
+ * and the only way to end that: retry the removal until it finishes. (A repair or setup from `outdated` does not
+ * clear `removeRequested`, so no "cancel" is offered.)
  */
 export function buildRemoveFailedNotice(): CollectorNotice {
   return Object.freeze({
     id: COLLECTOR_NOTICE_IDS.removeFailed,
     kind: "remove-failed" as const,
     title: "Collector 連携の解除に失敗しました",
-    detail: "解除をやり直すか、「確認・修復…」で解除を取り消すまで、Collector の自動更新は止まっています。本棚・引用データは削除されていません。",
+    detail: "解除を完了できませんでした。解除をやり直して完了するまで、Collector の自動更新は止まったままです。本棚・引用データは削除されていません。",
     clearsWhen: "remove-or-setup-applied-or-dismissed" as const,
     actions: Object.freeze([
       { commandId: COLLECTOR_REMOVE_COMMAND_ID, label: "解除をやり直す…" },
-      { commandId: COLLECTOR_REPAIR_COMMAND_ID, label: "確認・修復…" },
       { commandId: COLLECTOR_DISMISS_NOTICE_COMMAND_ID, label: "閉じる", argument: { noticeId: COLLECTOR_NOTICE_IDS.removeFailed } },
     ]),
   });

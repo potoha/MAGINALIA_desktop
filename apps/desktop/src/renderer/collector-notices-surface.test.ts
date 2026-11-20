@@ -56,6 +56,16 @@ describe("startCollectorNotices", () => {
     expect(shown).toEqual([]);
   });
 
+  it("a synchronous throw from getCollectorNotices is reported, not thrown", () => {
+    const errors: unknown[] = [];
+    expect(() => startCollectorNotices({
+      api: { getCollectorNotices: () => { throw new Error("sync"); } },
+      present: () => {},
+      onError: (error) => { errors.push(error); },
+    })).not.toThrow();
+    expect(errors).toHaveLength(1);
+  });
+
   it("reports a failed pull and keeps running; stop() unsubscribes and drops later lists", async () => {
     const errors: unknown[] = [];
     let unsubscribed = 0;
@@ -86,17 +96,23 @@ class FakeElement {
   public id = "";
   public className = "";
   public type = "";
-  public constructor(public readonly tag: string) {}
+  public constructor(public readonly tag: string, private readonly owner?: { activeElement: FakeElement | null }) {}
+  public focus(): void { if (this.owner !== undefined) this.owner.activeElement = this; }
   public append(...nodes: FakeElement[]): void { this.children.push(...nodes); }
   public replaceChildren(): void { this.children.length = 0; }
   public setAttribute(name: string, value: string): void { this.attributes.set(name, value); }
   public addEventListener(name: string, listener: () => void): void { this.listeners.set(name, listener); }
 }
 
-function fakeDocument(): { doc: Document; body: FakeElement } {
-  const body = new FakeElement("body");
-  const doc = { body, createElement: (tag: string) => new FakeElement(tag) } as unknown as Document;
-  return { doc, body };
+function fakeDocument(): { doc: Document; body: FakeElement; state: { activeElement: FakeElement | null } } {
+  const state: { activeElement: FakeElement | null } = { activeElement: null };
+  const body = new FakeElement("body", state);
+  const doc = {
+    body,
+    get activeElement() { return state.activeElement; },
+    createElement: (tag: string) => new FakeElement(tag, state),
+  } as unknown as Document;
+  return { doc, body, state };
 }
 
 describe("createCollectorNoticePresenter", () => {
@@ -110,13 +126,45 @@ describe("createCollectorNoticePresenter", () => {
     expect(region.hidden).toBe(false);
     const card = region.children[0]!;
     expect(card.children[0]!.textContent).toBe("Collector 連携の解除に失敗しました");
-    expect(card.children[1]!.textContent).toContain("自動更新は止まっています");
+    expect(card.children[1]!.textContent).toContain("自動更新は止まったまま");
     const buttons = card.children[2]!.children;
-    expect(buttons.map((button) => button.textContent)).toEqual(["解除をやり直す…", "確認・修復…", "閉じる"]);
+    expect(buttons.map((button) => button.textContent)).toEqual(["解除をやり直す…", "閉じる"]);
+    expect(region.attributes.get("aria-live")).toBe("polite");
+    expect(card.attributes.get("role")).toBe("alert");
     buttons[0]!.listeners.get("click")!();
     expect(clicked).toEqual(["maginalia.collector.removeIntegration"]);
     present([]);
     expect(region.hidden).toBe(true);
     expect(region.children).toHaveLength(0);
+  });
+
+  it("other notices are plain groups, not alerts", () => {
+    const { doc, body } = fakeDocument();
+    createCollectorNoticePresenter(doc, () => {})([buildAlpha1MigrationNotice()]);
+    expect(body.children[0]!.children[0]!.attributes.get("role")).toBe("group");
+  });
+
+  it("keeps focus on the same button across a re-render, and moves it to the first remaining button or the body after a dismissal", () => {
+    const { doc, body, state } = fakeDocument();
+    const present = createCollectorNoticePresenter(doc, () => {});
+    const region = body.children[0]!;
+    present([buildRemoveFailedNotice(), buildAlpha1MigrationNotice()]);
+    const secondRetry = region.children[1]!.children[1]!.children[0]!;
+    secondRetry.focus();
+    present([buildRemoveFailedNotice(), buildAlpha1MigrationNotice()]);
+    const again = region.children[1]!.children[1]!.children[0]!;
+    expect(again).not.toBe(secondRetry);
+    expect(state.activeElement).toBe(again);
+    // the focused notice goes away: focus moves to the first remaining button
+    present([buildRemoveFailedNotice()]);
+    expect(state.activeElement).toBe(region.children[0]!.children[2]!.children[0]);
+    // nothing left: body (documented fallback)
+    present([]);
+    expect(state.activeElement).toBe(body);
+    // focus elsewhere is left alone
+    present([buildRemoveFailedNotice()]);
+    state.activeElement = null;
+    present([buildRemoveFailedNotice()]);
+    expect(state.activeElement).toBeNull();
   });
 });

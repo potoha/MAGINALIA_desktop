@@ -156,13 +156,16 @@ export function registerCollectorIntegrationCommands(registry: CommandRegistry, 
 }
 
 /**
- * Runs one notice button: its command, then (for the alpha1 "設定する" button) closes the notice.
+ * Runs one notice button: its command, then (for the alpha1 "設定する" button) closes the notice, but only
+ * when the command did not fail.
  * The caller supplies `execute` (the renderer's `executeCommand`).
  */
 export async function dispatchCollectorNoticeAction(
   action: CollectorNoticeAction,
-  execute: (commandId: string, args?: CommandArgs) => Promise<void>,
+  /** Resolves `false` when the command failed; `void` / `true` count as success. */
+  execute: (commandId: string, args?: CommandArgs) => Promise<boolean | void>,
 ): Promise<void> {
-  await execute(action.commandId, action.argument === undefined ? undefined : { noticeId: action.argument.noticeId });
-  if (action.closesNoticeId !== undefined) await execute(COLLECTOR_DISMISS_NOTICE_COMMAND, { noticeId: action.closesNoticeId });
+  const ok = await execute(action.commandId, action.argument === undefined ? undefined : { noticeId: action.argument.noticeId });
+  // A failed command (for example the wizard cannot open) must not close the notice that offered it.
+  if (ok !== false && action.closesNoticeId !== undefined) await execute(COLLECTOR_DISMISS_NOTICE_COMMAND, { noticeId: action.closesNoticeId });
 }

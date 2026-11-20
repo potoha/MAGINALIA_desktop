@@ -103,10 +103,9 @@ describe("notice data", () => {
   it("the remove-failed notice (decision 4) has the fixed title, says the automatic update is paused, and retries through the remove command", () => {
     const notice = buildRemoveFailedNotice();
     expect(notice.title).toBe("Collector 連携の解除に失敗しました");
-    expect(notice.detail).toContain("Collector の自動更新は止まっています");
+    expect(notice.detail).toContain("Collector の自動更新は止まったまま");
     expect(notice.actions.map((action) => [action.commandId, action.label])).toEqual([
       ["maginalia.collector.removeIntegration", "解除をやり直す…"],
-      ["maginalia.collector.repair", "確認・修復…"],
       ["maginalia.collector.dismissNotice", "閉じる"],
     ]);
     // nothing about it is persisted: the state schema is unchanged (still version 2, same four-plus-one fields)

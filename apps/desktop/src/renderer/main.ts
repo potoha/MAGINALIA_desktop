@@ -1431,12 +1431,14 @@ const commandAvailability = {
 };
 let shelfResultSelected = false;
 let refreshNativeApplicationMenu: () => void = () => undefined;
-function executeCommand(id: string, args?: CommandArgs): Promise<void> {
+function executeCommand(id: string, args?: CommandArgs): Promise<boolean> {
   return commandRegistry.execute(id, commandContext.snapshot(), args).then((result) => {
     if (result.kind === "failed") {
       documentStatus.dataset.state = "error";
       documentStatus.textContent = `Command failed: ${result.error.message}`;
+      return false;
     }
+    return true;
   });
 }
 function requestProjectFileOpen(fileId: string): void {
@@ -4819,7 +4821,7 @@ if (writingSmokeMode) {
     setProjectMenuOpen(projectOverflowMenu, projectOverflowButton, false);
     openStandaloneProject();
   });
-  openMarkdownAction = () => executeCommand("maginalia.project.open");
+  openMarkdownAction = () => executeCommand("maginalia.project.open").then(() => undefined);
   openProjectButton.addEventListener("click", () => {
     void commandRegistry.execute("maginalia.project.open", commandContext.snapshot());
   });

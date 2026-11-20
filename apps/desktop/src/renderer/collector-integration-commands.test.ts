@@ -152,6 +152,21 @@ describe("Collector integration commands", () => {
     expect(registry.get("maginalia.collector.openBrowserDownloadPage")).toBeNull();
   });
 
+  it("a failed command does not close the notice that offered it (alpha1 setup with the wizard unavailable)", async () => {
+    const registry = new CommandRegistry();
+    const dismissed: string[] = [];
+    registerCollectorIntegrationCommands(registry, { run: null, dismiss: async (id) => { dismissed.push(id); return []; }, openWizard: null });
+    const context = new ContextKeyService().snapshot();
+    const execute = async (id: string, args?: Readonly<Record<string, string>>) => (await registry.execute(id, context, args)).kind !== "failed";
+    await dispatchCollectorNoticeAction(buildAlpha1MigrationNotice().actions[0]!, execute);
+    expect(dismissed).toEqual([]);
+    // and with a working wizard the notice is closed afterwards
+    const ok = new CommandRegistry();
+    registerCollectorIntegrationCommands(ok, { run: null, dismiss: async (id) => { dismissed.push(id); return []; }, openWizard: () => {} });
+    await dispatchCollectorNoticeAction(buildAlpha1MigrationNotice().actions[0]!, async (id, args) => (await ok.execute(id, context, args)).kind !== "failed");
+    expect(dismissed).toEqual([COLLECTOR_NOTICE_IDS.alpha1Migration]);
+  });
+
   it("the remove-failed notice's retry button runs the remove command, and nothing else", async () => {
     const notice = buildRemoveFailedNotice();
     const executed: Array<[string, unknown]> = [];
