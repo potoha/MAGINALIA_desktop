@@ -20,6 +20,8 @@ export interface WizardPanelOptions {
   readonly document: Document;
   /** Called for every user action (click, key). The controller stamps `now`. */
   readonly onEvent: (event: WizardUserEvent) => void;
+  /** The dialog closed on its own and could not be re-opened (for example it was detached). The controller should close. */
+  readonly onBroken?: () => void;
 }
 
 export interface WizardPanel {
@@ -47,6 +49,9 @@ const IDS = {
   reason: "collector-wizard-reason",
 } as const;
 
+/** Existing app controls that may take focus when the opener disappeared (no new DOM). */
+const FALLBACK_FOCUS_IDS = ["workdesk-home", "toggle-primary-sidebar"] as const;
+
 export const createWizardPanel: WizardPanelFactory = (options) => new DomWizardPanel(options);
 
 class DomWizardPanel implements WizardPanel {
@@ -61,6 +66,7 @@ class DomWizardPanel implements WizardPanel {
   private readonly keydownListener: (event: KeyboardEvent) => void;
   private readonly keyupListener: () => void;
   private readonly cancelListener: (event: Event) => void;
+  private readonly closeListener: () => void;
 
   private previousFocus: HTMLElement | null = null;
   private contentKey = "";
@@ -71,6 +77,10 @@ class DomWizardPanel implements WizardPanel {
   private readonly byFocusKey = new Map<string, HTMLElement>();
   private readonly radios = new Map<CollectorBrowserId, HTMLElement>();
   private escapeKeyDown = false;
+  /** Key of a focused element that vanished in a rebuild; focus waits on the heading until it exists again. */
+  private lostFocusKey: string | null = null;
+  private readonly detailsEls = new Map<string, HTMLElement>();
+  private readonly openDetails = new Set<string>();
   private disposed = false;
 
   public constructor(private readonly options: WizardPanelOptions) {
@@ -118,13 +128,16 @@ class DomWizardPanel implements WizardPanel {
       this.escapeKeyDown = false;
     };
     this.cancelListener = (event) => {
-      // The native cancel (Esc) must never close the dialog by itself: the model decides.
-      event.preventDefault();
+      // The native cancel (Esc) must never close the dialog by itself: the model decides. A second
+      // cancel is not cancelable in Chromium; the `close` listener below re-opens the dialog then.
+      if (event.cancelable) event.preventDefault();
       if (!this.escapeKeyDown) this.options.onEvent({ type: "escape" });
     };
+    this.closeListener = () => this.onNativeClose();
     this.dialog.addEventListener("keydown", this.keydownListener, true);
     this.dialog.addEventListener("keyup", this.keyupListener, true);
     this.dialog.addEventListener("cancel", this.cancelListener);
+    this.dialog.addEventListener("close", this.closeListener);
   }
 
   public show(): void {
@@ -141,7 +154,9 @@ class DomWizardPanel implements WizardPanel {
     this.setText(this.progress, view.progress ?? "");
     if (view.progress === null) this.dialog.removeAttribute("aria-describedby");
     else this.dialog.setAttribute("aria-describedby", IDS.progress);
-    this.dialog.setAttribute("aria-busy", String(view.busy));
+    // aria-busy only on the content containers: the live regions must stay outside it.
+    this.body.setAttribute("aria-busy", String(view.busy));
+    this.actions.setAttribute("aria-busy", String(view.busy));
 
     this.renderLive(this.statusRegion, view.live.status, "status");
     this.renderLive(this.alertRegion, view.live.alert, "alert");
@@ -149,13 +164,30 @@ class DomWizardPanel implements WizardPanel {
     const key = JSON.stringify([view.blocks, view.buttons, view.reasonText, view.busy]);
     if (key === this.contentKey) return;
     this.contentKey = key;
+    const active = this.doc.activeElement;
     const focusedKey = this.focusedKey();
+    const hadFocusInside = focusedKey !== null || (active !== null && (active === this.heading || this.focusables.includes(active as HTMLElement)));
+    for (const [name, element] of this.detailsEls) {
+      if ((element as HTMLDetailsElement).open) this.openDetails.add(name);
+      else this.openDetails.delete(name);
+    }
     this.rebuildContent(view);
-    if (focusedKey !== null) this.byFocusKey.get(focusedKey)?.focus();
+    const wanted = focusedKey ?? (active === this.heading ? this.lostFocusKey : null);
+    const target = wanted === null ? undefined : this.byFocusKey.get(wanted);
+    if (target !== undefined) {
+      target.focus();
+      this.lostFocusKey = null;
+    } else if (hadFocusInside) {
+      // The focused element is gone: never leave focus on <body> behind a modal dialog.
+      if (focusedKey !== null) this.lostFocusKey = focusedKey;
+      this.heading.focus();
+    }
   }
 
   public focusHeading(): void {
-    if (!this.disposed) this.heading.focus();
+    if (this.disposed) return;
+    this.lostFocusKey = null;
+    this.heading.focus();
   }
 
   public focusRadio(browser: CollectorBrowserId): void {
@@ -188,6 +220,7 @@ class DomWizardPanel implements WizardPanel {
     this.dialog.removeEventListener("keydown", this.keydownListener, true);
     this.dialog.removeEventListener("keyup", this.keyupListener, true);
     this.dialog.removeEventListener("cancel", this.cancelListener);
+    this.dialog.removeEventListener("close", this.closeListener);
     if (this.dialog.open) this.dialog.close();
     this.dialog.remove();
     this.focusables = [];
@@ -195,7 +228,32 @@ class DomWizardPanel implements WizardPanel {
     this.radios.clear();
     const previous = this.previousFocus;
     this.previousFocus = null;
-    if (previous !== null) previous.focus();
+    if (previous !== null && previous.isConnected !== false) {
+      previous.focus();
+      return;
+    }
+    // The opener is gone: use an existing app control, else leave focus on the document.
+    for (const id of FALLBACK_FOCUS_IDS) {
+      const candidate = this.doc.getElementById(id) as HTMLButtonElement | null;
+      if (candidate !== null && candidate.isConnected !== false && !candidate.disabled) {
+        candidate.focus();
+        return;
+      }
+    }
+    (this.doc.activeElement as HTMLElement | null)?.blur?.();
+  }
+
+  private onNativeClose(): void {
+    if (this.disposed || this.dialog.open) return;
+    // Closed behind our back (a second Esc cannot be cancelled). Re-open first so a running write
+    // is never left without its modal, then let the model decide through `escape`.
+    try {
+      this.dialog.showModal();
+    } catch {
+      this.options.onBroken?.();
+      return;
+    }
+    if (!this.escapeKeyDown) this.options.onEvent({ type: "escape" });
   }
 
   // ----- Rendering -------------------------------------------------------------------------------
@@ -232,6 +290,7 @@ class DomWizardPanel implements WizardPanel {
     this.focusables = [];
     this.byFocusKey.clear();
     this.radios.clear();
+    this.detailsEls.clear();
     const inlineButtons = new Map<string, WizardViewButton>();
     for (const button of view.buttons) if (button.group === "inline") inlineButtons.set(button.id, button);
 
@@ -271,6 +330,8 @@ class DomWizardPanel implements WizardPanel {
         case "disclosure": {
           const details = this.doc.createElement("details");
           details.className = "collector-wizard-disclosure";
+          if (this.openDetails.has(block.summary)) details.open = true;
+          this.detailsEls.set(block.summary, details);
           const summary = this.doc.createElement("summary");
           summary.textContent = block.summary;
           this.register(summary, `summary:${disclosureIndex}`);
@@ -397,10 +458,16 @@ class DomWizardPanel implements WizardPanel {
     if (view.enabled) {
       button.addEventListener("click", () => this.options.onEvent(view.event));
       this.register(button, `button:${view.id}`);
+      return button;
+    }
+    if (view.describedBy === "busy") {
+      // Busy: stay focusable (aria-disabled, click ignored) so focus is not lost while the step works.
+      button.setAttribute("aria-disabled", "true");
+      button.setAttribute("aria-describedby", IDS.status);
+      this.register(button, `button:${view.id}`);
     } else {
       button.disabled = true;
-      if (view.describedBy === "busy") button.setAttribute("aria-describedby", IDS.status);
-      else if (view.describedBy === "reason") button.setAttribute("aria-describedby", IDS.reason);
+      if (view.describedBy === "reason") button.setAttribute("aria-describedby", IDS.reason);
     }
     return button;
   }
@@ -461,7 +528,7 @@ class DomWizardPanel implements WizardPanel {
     const restore = this.doc.activeElement as HTMLElement | null;
     this.dialog.append(area);
     try {
-      area.focus();
+      area.focus({ preventScroll: true });
       area.select();
       return this.doc.execCommand("copy");
     } catch {

@@ -2955,8 +2955,12 @@ body.first-run-mode #app {
   outline-offset: 2px;
 }
 
+/* Live regions stay in the accessibility tree when empty (no display:none): only their box collapses. */
 .collector-wizard-live:empty {
-  display: none;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: none;
 }
 
 .collector-wizard-live {
@@ -3085,11 +3089,14 @@ body.first-run-mode #app {
 }
 
 .collector-wizard-actions {
+  position: sticky;
+  bottom: 0;
   display: flex;
   flex-direction: column;
   gap: 0.6rem;
-  padding-top: 0.75rem;
+  padding: 0.75rem 0 0.15rem;
   border-top: 1px solid var(--wizard-border);
+  background: var(--wizard-surface);
 }
 
 .collector-wizard-actions-tools,
@@ -3140,6 +3147,63 @@ body.first-run-mode #app {
   width: 1px;
   height: 1px;
   opacity: 0;
+}
+
+.collector-wizard-button[aria-disabled="true"] {
+  border-style: dashed;
+  color: var(--wizard-muted);
+  background: var(--wizard-subtle);
+  cursor: not-allowed;
+}
+
+@media (forced-colors: active) {
+  .collector-wizard-radio {
+    border-color: ButtonText;
+  }
+
+  .collector-wizard-radio[aria-checked="true"] {
+    border: 3px solid Highlight;
+    forced-color-adjust: none;
+    color: HighlightText;
+    background: Highlight;
+  }
+
+  .collector-wizard-radio[aria-checked="true"] .collector-wizard-radio-note {
+    color: HighlightText;
+  }
+
+  .collector-wizard-radio[aria-disabled="true"] {
+    border-style: dashed;
+    border-color: GrayText;
+    color: GrayText;
+  }
+
+  .collector-wizard-button-primary {
+    border: 3px solid ButtonText;
+    color: ButtonText;
+    background: ButtonFace;
+  }
+
+  .collector-wizard-button:disabled,
+  .collector-wizard-button[aria-disabled="true"] {
+    border-style: dashed;
+    border-color: GrayText;
+    color: GrayText;
+    background: ButtonFace;
+  }
+
+  .collector-wizard-live-alert {
+    border: 3px double ButtonText;
+  }
+
+  .collector-wizard-live:empty {
+    border: 0;
+  }
+
+  .collector-wizard-actions {
+    border-top-color: ButtonText;
+    background: Canvas;
+  }
 }
 
 @media (max-width: 480px) {

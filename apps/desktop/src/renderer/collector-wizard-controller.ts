@@ -46,6 +46,8 @@ export interface CollectorWizardDeps {
   readonly requestAnimationFrame?: (callback: () => void) => void;
   /** Default: the real `<dialog>` panel on the global `document`. */
   readonly createPanel?: WizardPanelFactory;
+  /** Receives an unexpected exception from rendering or an effect. Default: `console.error`. */
+  readonly onError?: (error: unknown) => void;
   /** Called once when the wizard closes by its own event (`later` / `finished`), after cleanup. */
   readonly onClosed?: (outcome: WizardClosedOutcome) => void;
 }
@@ -113,6 +115,12 @@ class WizardInstance {
     this.panel = createPanel({
       document: globalThis.document,
       onEvent: (event: WizardUserEvent) => this.dispatch(event),
+      onBroken: () => {
+        // The dialog is gone and cannot be re-opened: end the wizard (nothing is undone).
+        if (this.disposed) return;
+        this.dispose();
+        this.deps.onClosed?.("later");
+      },
     });
     this.handle = {
       close: () => this.dispose(),
@@ -134,10 +142,21 @@ class WizardInstance {
     const stamped = { ...event, now: this.now() } as WizardEvent;
     const reduction = reduceWizard(this.state, stamped);
     this.state = reduction.state;
-    this.panel.render(buildWizardView(this.state));
+    // A throwing render must not strand the wizard: the state is already updated, the effects
+    // still run, and later / Esc stay possible.
+    this.guard(() => this.panel.render(buildWizardView(this.state)));
     for (const effect of reduction.effects) {
       if (this.disposed) return;
-      this.run(effect);
+      this.guard(() => this.run(effect));
+    }
+  }
+
+  private guard(action: () => void): void {
+    try {
+      action();
+    } catch (error) {
+      if (this.deps.onError !== undefined) this.deps.onError(error);
+      else console.error("Collector wizard error", error);
     }
   }
 
@@ -190,10 +209,8 @@ class WizardInstance {
         });
         break;
       case "focusRadio": {
-        const { browser } = effect;
-        this.raf(() => {
-          if (!this.disposed) this.panel.focusRadio(browser);
-        });
+        // Rendering is synchronous, so the radio already exists: focus it directly.
+        this.panel.focusRadio(effect.browser);
         break;
       }
       case "close": {
