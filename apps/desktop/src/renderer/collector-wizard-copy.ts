@@ -49,6 +49,7 @@ export const WIZARD_MESSAGE_IDS = [
   "download-opened",
   "download-failed",
   "download-not-offered",
+  "all-browsers-policy-blocked",
   // step B
   "registered",
   "registered-verified",
@@ -63,6 +64,7 @@ export const WIZARD_MESSAGE_IDS = [
   "file-locked",
   "self-check-failed",
   "register-failed",
+  "outdated-pending",
   // step C
   "destination-configured",
   "destination-writes-disabled",
@@ -71,6 +73,7 @@ export const WIZARD_MESSAGE_IDS = [
   "destination-busy",
   // step D
   "extension-not-placed",
+  "check-incomplete",
   "browser-opened",
   "browser-not-opened",
   "address-copied",
@@ -93,6 +96,7 @@ export const WIZARD_MESSAGE_ROLE: Readonly<Record<WizardMessageId, WizardMessage
   "download-opened": "status",
   "download-failed": "alert",
   "download-not-offered": "alert",
+  "all-browsers-policy-blocked": "alert",
   "registered": "status",
   "registered-verified": "status",
   "already-ready": "status",
@@ -106,12 +110,14 @@ export const WIZARD_MESSAGE_ROLE: Readonly<Record<WizardMessageId, WizardMessage
   "file-locked": "alert",
   "self-check-failed": "alert",
   "register-failed": "alert",
+  "outdated-pending": "status",
   "destination-configured": "status",
   "destination-writes-disabled": "alert",
   "destination-cancelled": "status",
   "destination-error": "alert",
   "destination-busy": "alert",
   "extension-not-placed": "alert",
+  "check-incomplete": "alert",
   "browser-opened": "status",
   "browser-not-opened": "alert",
   "address-copied": "status",
@@ -128,6 +134,8 @@ export interface WizardCopyContext {
   readonly browser: CollectorBrowserId | null;
   /** The recommended browser of the latest inspection, or `null`. */
   readonly recommended: CollectorBrowserId | null;
+  /** Verified browsers an organization policy blocks (names for the all-blocked message). Default: none. */
+  readonly blocked?: readonly CollectorBrowserId[];
   /** The browser the user chose last time (remembered by the main process), or `null`. */
   readonly preferred: CollectorBrowserId | null;
   /** A classification only (never a ProgId). */
@@ -221,6 +229,16 @@ const OPEN_BUTTON_OPENS_PAGE: Readonly<Record<CollectorBrowserId, boolean>> = {
   vivaldi: true,
 };
 
+/**
+ * Whether loading by dragging the folder onto the extensions page was observed. Edge drag-and-drop
+ * was not measured (spike results 7), so the alternative is not offered there.
+ */
+const DRAG_LOAD_MEASURED: Readonly<Record<CollectorBrowserId, boolean>> = {
+  chrome: true,
+  edge: false,
+  vivaldi: true,
+};
+
 /** Edge asks 「開発者モードをオフにしますか？」 at every start (spike results 4). */
 const STARTUP_DEVELOPER_MODE_NOTE: Readonly<Record<CollectorBrowserId, string | null>> = {
   chrome: null,
@@ -309,7 +327,8 @@ export interface WizardCopy {
     readonly stepsLabel: string;
     readonly steps: readonly string[];
     readonly addressNote: string;
-    readonly alternative: string;
+    /** `null` when drag-and-drop loading was not observed for the selected browser (Edge) or no browser is selected. */
+    readonly alternative: string | null;
     readonly cautionsLabel: string;
     readonly cautions: readonly string[];
     readonly multiBrowserSummary: string;
@@ -357,6 +376,10 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
   const selectedRow = rowOf(table, context.browser);
   const startupNote = selectedRow === undefined ? null : STARTUP_DEVELOPER_MODE_NOTE[selectedRow.id];
   const opensPage = selectedRow !== undefined && OPEN_BUTTON_OPENS_PAGE[selectedRow.id];
+
+  const blockedNames = (context.blocked ?? []).map((id) => browserName(table, id));
+  const blockedList = blockedNames.length === 0 ? GENERIC_BROWSER : blockedNames.join("、");
+  const dragOk = selectedRow !== undefined && DRAG_LOAD_MEASURED[selectedRow.id];
 
   const recommendThen = `${rec} をおすすめします。引用を集めるときは、${rec} で Web ページを開いてください。`;
 
@@ -473,7 +496,7 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
         : opensPage
         ? fill("開かない場合は、{name} のアドレスバーに {address} と入力して Enter キーを押してください。", { name, address })
         : fill("ボタンを押しても拡張機能の画面が開かないことがあります。その場合は、{name} のアドレスバーに {address} と入力して Enter キーを押してください。", { name, address }),
-      alternative: fill(
+      alternative: !dragOk ? null : fill(
         "ドラッグでも読み込めます。［フォルダーを開く］で表示される「extension」フォルダーを、{name} の拡張機能の画面にドラッグしてください（{label}がオンのとき）。",
         { name, label: devLabel },
       ),
@@ -570,6 +593,10 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
         headline: "ダウンロードページを開きました。",
         detail: "インストールが終わったら、［もう一度確認］を押してください。",
       },
+      "all-browsers-policy-blocked": {
+        headline: fill("組織の管理設定により、{names} はこの種類の連携プログラムを使えないようになっています。", { names: blockedList }),
+        detail: "このパソコンでは Collector から本棚へ保存できません。設定は行っていません。管理者にお問い合わせください。",
+      },
       "download-failed": {
         headline: "ダウンロードページを開けませんでした。",
         detail: "ブラウザーの公式ダウンロードページを、直接開いてください。",
@@ -630,6 +657,10 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
         headline: "連携プログラムを登録できませんでした。",
         detail: "もう一度お試しください。解決しない場合は、メニューの「Collector 連携を確認・修復…」をお使いください。",
       },
+      "outdated-pending": {
+        headline: "連携プログラムは登録済みです。",
+        detail: "新しい版への更新は、MAGINALIA の次回起動時に自動で行われます。このまま次へ進めます。",
+      },
       "destination-configured": {
         headline: "保存先を設定しました。",
         detail: null,
@@ -652,7 +683,11 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
       },
       "extension-not-placed": {
         headline: "拡張機能のフォルダーを確認できませんでした。",
-        detail: "［戻る］で手順 2 / 5 に戻り、連携プログラムの登録をやり直してください。",
+        detail: "［戻る］は 1 つずつ前の手順（手順 3 / 5、手順 2 / 5）へ戻ります。手順 2 / 5 に戻り、連携プログラムの登録をやり直してください。",
+      },
+      "check-incomplete": {
+        headline: "確認できませんでした。",
+        detail: "［もう一度試す］を押して、拡張機能のフォルダーをもう一度確認してください。",
       },
       "browser-opened": {
         headline: fill("{name} を前面に表示しました。", { name }),

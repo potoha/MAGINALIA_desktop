@@ -19,6 +19,10 @@ import {
   moveRadioSelection,
   reduceWizard,
   wizardActions,
+  wizardAView,
+  wizardConnectionView,
+  wizardDoneView,
+  wizardStepDView,
   wizardBrowserOptions,
   wizardCopy,
   wizardDestinationConfigured,
@@ -225,7 +229,7 @@ describe("wizard model: start and step A", () => {
     respond(h, statusResponse({ applyInProgress: true }));
     expect(h.state.status).toBeNull();
     expect(h.state.statusLoad).toBe("failed");
-    expect(wizardMessage(h.state)?.id).toBe("inspect-failed");
+    expect(wizardMessage(h.state)?.id).toBe("busy");
     expect(action(h, "recheckBrowsers").enabled).toBe(true);
     send(h, { type: "recheckBrowsers" });
     respond(h, statusResponse());
@@ -446,7 +450,7 @@ describe("wizard model: step B", () => {
     }));
     expect(wizardMessage(h.state)?.id).toBe("policy-blocked-browser");
     expect(wizardMessage(h.state)?.copy.headline).toBe("組織の管理設定により、Google Chrome はこの種類の連携プログラムを使えないようになっています。");
-    expect(actionLabels(h)).toEqual(["閉じる", "戻る"]);
+    expect(actionLabels(h)).toEqual(["戻る", "閉じる"]);
     expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(false);
     expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
 
@@ -573,7 +577,7 @@ describe("wizard model: one operation at a time", () => {
     send(h, { type: "register" });
     respond(h, { kind: "unavailable", reason: "e2e-isolation" });
     expect(wizardMessage(h.state)?.id).toBe("unavailable-e2e-isolation");
-    expect(actionLabels(h)).toEqual(["閉じる", "戻る"]);
+    expect(actionLabels(h)).toEqual(["戻る", "閉じる"]);
   });
 });
 
@@ -865,9 +869,11 @@ describe("wizard model: step E connection check (design 4.6)", () => {
     const connected = { state: "connected", extensionVersion: "0.3.0", hostVersion: "0.2.0", contactedAt: "x" } as const;
     respond(h, connection(connected, true));
     expect(h.state.connection?.phase).toBe("waiting");
-    expect(h.state.connection?.lastPollAt).toBeNull();
+    expect(h.state.connection?.lastPollAt).toBe(T0 + 10_000);
     expect(h.state.verification).toBeNull();
-    expect(requestsOf(send(h, { type: "tick" }, T0 + 10_000 + 1))).toEqual([{ intent: "checkConnection" }]);
+    // Not on the very next tick: the normal interval applies.
+    expect(send(h, { type: "tick" }, T0 + 10_000 + 1_000)).toEqual([]);
+    expect(requestsOf(send(h, { type: "tick" }, T0 + 10_000 + WIZARD_POLL_INTERVAL_MS))).toEqual([{ intent: "checkConnection" }]);
     respond(h, connection(connected));
     expect(h.state.connection?.phase).toBe("connected");
   });
@@ -1000,3 +1006,302 @@ describe("wizard model: purity and safety", () => {
     }
   });
 });
+
+// ----- review follow-up ---------------------------------------------------------------------------
+
+describe("wizard model: outdated installation (no refresh intent for the renderer)", () => {
+  it("sends no request on register, shows outdated-pending and lets the user go on", () => {
+    const h = atStepB({ state: "outdated" });
+    const requestsBefore = requestsOf(h.log).length;
+    const effects = send(h, { type: "register" });
+    expect(requestsOf(effects)).toEqual([]);
+    expect(h.state.inFlight).toBeNull();
+    expect(requestsOf(h.log).length).toBe(requestsBefore);
+    expect(wizardMessage(h.state)).toMatchObject({ id: "outdated-pending", role: "status" });
+    expect(wizardMessage(h.state)?.copy.detail).toContain("次回起動時");
+    expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(false);
+    expect(actionLabels(h)).toEqual(["次へ", "戻る", "あとで設定"]);
+    send(h, { type: "next" });
+    expect(h.state.step).toBe("C");
+  });
+});
+
+describe("wizard model: retry after a failed self-check", () => {
+  function afterSelfCheckFailure(): Harness {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, applyResponse({ outcome: "failed", reason: "self-check-failed", selfCheck: "failed", status: status({ state: "damaged" }) }));
+    return h;
+  }
+
+  it("is labelled もう一度確認 and repairs (the status says damaged)", () => {
+    const h = afterSelfCheckFailure();
+    expect(wizardMessage(h.state)?.id).toBe("self-check-failed");
+    expect(action(h, "register").label).toBe("もう一度確認");
+    expect(requestsOf(send(h, { type: "register" }))).toEqual([{ intent: "repair" }]);
+  });
+
+  it("a noop answer after the failure is not shown as success", () => {
+    const h = afterSelfCheckFailure();
+    send(h, { type: "register" });
+    respond(h, applyResponse({ action: "repair", outcome: "noop", selfCheck: "skipped", status: status({ state: "ready" }) }));
+    expect(wizardMessage(h.state)?.id).toBe("self-check-failed");
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
+    // A real success (the self-check ran and passed) is accepted.
+    send(h, { type: "register" });
+    respond(h, applyResponse({ action: "repair", outcome: "applied", selfCheck: "ok" }));
+    expect(wizardMessage(h.state)?.id).toBe("registered-verified");
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(true);
+  });
+
+  it("an unsafe program folder is terminal: only 戻る and あとで設定", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, applyResponse({ outcome: "refused", reason: "program-folder-unsafe" }));
+    expect(wizardMessage(h.state)?.id).toBe("folder-unsafe");
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定"]);
+    expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(false);
+  });
+});
+
+describe("wizard model: step A when browsers are blocked by policy", () => {
+  const chromeBlocked = { browsers: { recommended: null, recommendationReason: "none-installed" as const, entries: [entry("edge"), entry("chrome", { policyBlocked: true }), entry("vivaldi")] } };
+
+  it("Chrome found but blocked: a dedicated message, only もう一度確認 and あとで設定", () => {
+    const h = atStepA(chromeBlocked);
+    const view = wizardAView(h.state);
+    expect(view.allBlocked).toBe(true);
+    expect(view.notice?.copy.headline).toBe("組織の管理設定により、Google Chrome はこの種類の連携プログラムを使えないようになっています。");
+    expect(view.notice?.role).toBe("alert");
+    expect(view.reasonCopy).toBeNull();
+    expect(actionLabels(h)).toEqual(["もう一度確認", "あとで設定"]);
+    for (const event of [{ type: "next" }, { type: "continueWithoutBrowser" }, { type: "openDownloadPage", browser: "chrome" }] as const) {
+      expect(isWizardEventAllowed(h.state, event), event.type).toBe(false);
+    }
+    expect(view.options).toEqual([expect.objectContaining({ id: "chrome", selectable: false, noteText: "組織の管理設定により使えません" })]);
+  });
+
+  it("the aggregate policy-blocked state alone is enough (browsers not found)", () => {
+    const h = atStepA({ state: "policy-blocked", browsers: { recommended: null, recommendationReason: "none-installed", entries: [entry("chrome", { installed: "not-found" })] } });
+    expect(wizardAView(h.state).allBlocked).toBe(true);
+    expect(wizardAView(h.state).notice?.copy.headline).toContain("ブラウザー はこの種類");
+    expect(actionLabels(h)).toEqual(["もう一度確認", "あとで設定"]);
+  });
+
+  it("an unverified browser that is blocked does not block the usable one", () => {
+    const h = atStepA({ browsers: { entries: [entry("edge", { policyBlocked: true }), entry("chrome"), entry("vivaldi")] } });
+    expect(wizardAView(h.state).allBlocked).toBe(false);
+    expect(actionLabels(h)).toEqual(["次へ", "あとで設定"]);
+  });
+
+  it("not blocked and nothing installed keeps the download and continue buttons", () => {
+    const h = atStepA({ browsers: { recommended: null, recommendationReason: "none-installed", entries: [entry("chrome", { installed: "not-found" })] } });
+    expect(wizardAView(h.state).allBlocked).toBe(false);
+    expect(actionLabels(h)).toContain("ブラウザーは入っています（このまま続ける）");
+  });
+});
+
+describe("wizard model: the first inspection keeps its specific failure", () => {
+  it("unavailable reasons are terminal: shown as such, no recheck button", () => {
+    for (const [reason, id] of [["e2e-isolation", "unavailable-e2e-isolation"], ["payload-unavailable", "unavailable-payload-unavailable"], ["startup-failed", "unavailable-startup-failed"]] as const) {
+      const h = start();
+      send(h, { type: "opened" });
+      respond(h, { kind: "unavailable", reason });
+      expect(h.state.statusLoad).toBe("failed");
+      expect(wizardMessage(h.state)?.id).toBe(id);
+      expect(actionLabels(h)).toEqual(["あとで設定"]);
+      expect(isWizardEventAllowed(h.state, { type: "recheckBrowsers" })).toBe(false);
+    }
+  });
+
+  it("busy keeps the busy wording and a retry; a generic failure reads inspect-failed", () => {
+    const h = start();
+    send(h, { type: "opened" });
+    respond(h, { kind: "busy" });
+    expect(wizardMessage(h.state)?.id).toBe("busy");
+    expect(actionLabels(h)).toEqual(["もう一度確認", "あとで設定"]);
+    send(h, { type: "recheckBrowsers" });
+    respond(h, { kind: "error" });
+    expect(wizardMessage(h.state)?.id).toBe("inspect-failed");
+  });
+});
+
+describe("wizard model: step E shows the result of opening the browser", () => {
+  it("a failed launch on a version mismatch is visible in the message and the connection view", () => {
+    const h = atStepE();
+    respond(h, connection({ state: "extension-version-differs", loadedVersion: "0.3.0", placedVersion: "0.4.0" }));
+    send(h, { type: "openBrowserExtensions" });
+    respond(h, { kind: "browser-extensions", browser: "chrome", result: "failed" });
+    expect(wizardMessage(h.state)).toMatchObject({ id: "browser-not-opened", role: "alert" });
+    expect(wizardMessage(h.state)?.copy.detail).toContain("chrome://extensions");
+    expect(wizardConnectionView(h.state)?.launchMessage?.id).toBe("browser-not-opened");
+  });
+
+  it("a stale step D result is not carried into step E", () => {
+    const h = atStepD();
+    send(h, { type: "copyPath" });
+    respond(h, { kind: "extension-folder", intent: "copyExtensionPath", result: "done" });
+    expect(wizardMessage(h.state)?.id).toBe("path-copied");
+    send(h, { type: "loaded" }, T0 + 1);
+    expect(wizardMessage(h.state)).toBeNull();
+  });
+});
+
+describe("wizard model: unknown values degrade instead of sticking", () => {
+  const cast = (value: unknown) => value as CollectorIntegrationResponse;
+
+  it("an unknown response kind clears the request and shows a retryable error", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, cast({ kind: "from-the-future" }));
+    expect(h.state.inFlight).toBeNull();
+    expect(wizardMessage(h.state)?.id).toBe("request-failed");
+    expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(true);
+    expect(isWizardEventAllowed(h.state, { type: "later" })).toBe(true);
+  });
+
+  it("an unknown unavailable reason never puts undefined into the results", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, cast({ kind: "unavailable", reason: "new-reason" }));
+    expect(h.state.results.B).toBe("request-failed");
+    expect(h.state.inFlight).toBeNull();
+  });
+
+  it("an unknown apply reason reads as a generic failure", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, cast({ ...(applyResponse({ outcome: "refused" }) as object), reason: "brand-new" }));
+    expect(wizardMessage(h.state)?.id).toBe("register-failed");
+  });
+
+  it("an unknown destination result reads as an error", () => {
+    const h = atStepC();
+    send(h, { type: "confirmDestination" });
+    send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "mystery" } as unknown as CollectorSaveDestinationIpcResult });
+    expect(wizardMessage(h.state)?.id).toBe("destination-error");
+    expect(h.state.inFlight).toBeNull();
+  });
+
+  it("an unknown connection state is treated as transient and an unknown kind on the first inspect is retryable", () => {
+    const h = atStepE();
+    respond(h, cast({ kind: "connection", state: "ready", applyInProgress: false, connection: { state: "novel" } }));
+    expect(h.state.connection?.phase).toBe("waiting");
+    expect(h.state.inFlight).toBeNull();
+    const first = start();
+    send(first, { type: "opened" });
+    respond(first, cast({ kind: "novel" }));
+    expect(wizardMessage(first.state)?.id).toBe("inspect-failed");
+    expect(send(first, { type: "later" })).toEqual([{ type: "close", outcome: "later" }]);
+  });
+});
+
+describe("wizard model: completion, clock and address safety", () => {
+  it("after the connection is confirmed, later and Esc are refused; the way out is 完了 then 閉じる", () => {
+    for (const how of ["connected", "user-confirmed"] as const) {
+      const h = atStepE();
+      if (how === "connected") respond(h, connection({ state: "connected", extensionVersion: "0.3.0", hostVersion: "0.2.0", contactedAt: "x" }));
+      else { send(h, { type: "tick" }, T0 + 10_000 + WIZARD_CONNECTION_TIMEOUT_MS); send(h, { type: "userConfirmed" }); }
+      expect(send(h, { type: "later" })).toEqual([]);
+      expect(send(h, { type: "escape" })).toEqual([]);
+      expect(h.state.closed).toBeNull();
+      send(h, { type: "finish" });
+      expect(send(h, { type: "close" })).toEqual([{ type: "close", outcome: "finished" }]);
+    }
+  });
+
+  it("ignores a non-finite clock value instead of polling on every tick", () => {
+    const h = atStepE();
+    respond(h, connection({ state: "waiting" }));
+    const before = h.state;
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, undefined as unknown as number]) {
+      const reduction = reduceWizard(h.state, { type: "tick", now: bad });
+      expect(reduction.effects).toEqual([]);
+      expect(reduction.state).toBe(before);
+    }
+    expect(reduceWizard(initialWizardState(), { type: "opened", now: Number.NaN }).effects).toEqual([]);
+  });
+
+  it("the copied address is the table constant, not the IPC value", () => {
+    const h = atStepA({ browsers: { entries: [entry("edge"), entry("chrome", { extensionsAddress: "https://evil.example/" }), entry("vivaldi")] } });
+    send(h, { type: "next" });
+    send(h, { type: "register" });
+    respond(h, applyResponse());
+    send(h, { type: "next" });
+    send(h, { type: "confirmDestination" });
+    send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "configured", writesEnabled: true } });
+    send(h, { type: "next" });
+    respond(h, statusResponse({ state: "ready", browsers: { entries: [entry("edge"), entry("chrome", { extensionsAddress: "https://evil.example/" }), entry("vivaldi")] } }));
+    expect(send(h, { type: "copyAddress" })).toEqual([{ type: "copyText", purpose: "address", text: "chrome://extensions" }]);
+  });
+
+  it("an incomplete folder check is not reported as 'not placed'", () => {
+    const h = atStepC();
+    send(h, { type: "confirmDestination" });
+    send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "cancelled" } });
+    send(h, { type: "next" });
+    respond(h, statusResponse({ inspectionComplete: false, extensionFolderPlaced: false }));
+    expect(wizardMessage(h.state)).toMatchObject({ id: "check-incomplete", role: "alert" });
+    expect(h.state.placement).toBe("unknown");
+    expect(actionLabels(h)).toEqual(["もう一度試す", "戻る", "あとで設定"]);
+  });
+
+  it("the not-placed message explains that 戻る goes one step at a time", () => {
+    const h = atStepD(false);
+    expect(wizardMessage(h.state)?.copy.detail).toContain("1 つずつ");
+  });
+});
+
+describe("wizard model: views for the panel", () => {
+  it("step A view: names, recommended suffix, previously-chosen only when it differs", () => {
+    const h = atStepA();
+    const view = wizardAView(h.state);
+    expect(view.options).toEqual([expect.objectContaining({ id: "chrome", displayName: "Google Chrome", label: "Google Chrome（おすすめ）", selected: true, selectable: true })]);
+    expect(view.reason).toBe("default-supported");
+    expect(view.reasonCopy?.lead).toBe("ふだんお使いのブラウザー（Google Chrome）で使えます。");
+    expect(view.previouslyChosen).toBeNull();
+    const differs = atStepA({ browsers: { preferred: "edge" } });
+    expect(wizardAView(differs.state).previouslyChosen).toBe("前回は Microsoft Edge を選びました。");
+    expect(wizardAView(atStepA({ browsers: { preferred: "chrome" } }).state).previouslyChosen).toBeNull();
+    expect(wizardAView(start().state)).toMatchObject({ loading: true, reasonCopy: null, options: [] });
+  });
+
+  it("step D view: policy warning flag, address note position, drag text", () => {
+    const h = atStepD();
+    const view = wizardStepDView(h.state);
+    expect(view.addressNoteAfterStep).toBe(1);
+    expect(view.showPolicyWarning).toBe(false);
+    expect(view.alternative).toContain("ドラッグ");
+    expect(view.steps).toHaveLength(5);
+    const blocked = atStepA({ browsers: { entries: [entry("edge"), entry("chrome", { extensionLoadMayBeBlocked: true }), entry("vivaldi")] } });
+    expect(wizardStepDView(blocked.state).showPolicyWarning).toBe(true);
+  });
+
+  it("step E view: role per phase, destination line, checklist, how-to-open only while waiting", () => {
+    const h = atStepE();
+    expect(wizardConnectionView(h.state)).toMatchObject({ phase: "waiting", role: "status", howToOpen: expect.objectContaining({ summary: expect.any(String) }) });
+    respond(h, connection({ state: "connected", extensionVersion: "0.3.0", hostVersion: "0.2.0", contactedAt: "x" }));
+    expect(wizardConnectionView(h.state)).toMatchObject({ phase: "connected", role: "status", destinationLine: "保存先：設定済み", howToOpen: null });
+    expect(wizardDoneViewOf(h)).toMatchObject({ verified: true, title: "MAGINALIA Collector の準備ができました。" });
+
+    const timeout = atStepE();
+    send(timeout, { type: "tick" }, T0 + 10_000 + WIZARD_CONNECTION_TIMEOUT_MS);
+    const timedOut = wizardConnectionView(timeout.state);
+    expect(timedOut).toMatchObject({ phase: "timed-out", role: "alert" });
+    expect(timedOut?.checklist).toHaveLength(3);
+    send(timeout, { type: "userConfirmed" });
+    send(timeout, { type: "finish" });
+    expect(wizardDoneViewOf(timeout)).toMatchObject({ verified: false, title: "Collector の設定を終了しました。" });
+
+    for (const [summary, phase] of [[{ state: "protocol-differs" }, "protocol-differs"], [{ state: "unavailable" }, "unavailable"], [{ state: "extension-version-differs", loadedVersion: "0.3.0", placedVersion: null }, "extension-version-differs"]] as const) {
+      const other = atStepE();
+      respond(other, connection(summary));
+      expect(wizardConnectionView(other.state)).toMatchObject({ phase, role: "alert" });
+    }
+    expect(wizardConnectionView(atStepB().state)).toBeNull();
+  });
+});
+
+function wizardDoneViewOf(h: Harness) {
+  return wizardDoneView(h.state);
+}

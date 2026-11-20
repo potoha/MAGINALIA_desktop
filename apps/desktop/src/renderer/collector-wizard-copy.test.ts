@@ -39,6 +39,7 @@ function contexts(): WizardCopyContext[] {
       for (const defaultBrowser of DEFAULT_KINDS) {
         for (const [loadedVersion, placedVersion] of VERSIONS) {
           list.push({ browser, recommended, preferred: browser, defaultBrowser, loadedVersion, placedVersion });
+          list.push({ browser, recommended, preferred: null, blocked: [...COLLECTOR_BROWSER_IDS], defaultBrowser, loadedVersion, placedVersion });
         }
       }
     }
@@ -184,6 +185,11 @@ describe("wizard copy: step D per browser (multi-browser design 2.4, spike resul
     expect(d.addressNote).toContain("edge://extensions");
     expect(d.cautions.join("\n")).toContain("「開発者モードをオフにしますか？」");
     expect(d.cautions.join("\n")).toContain("「今は実行しない」");
+    // Edge drag-and-drop was not measured (spike results 7): no claim there. Chrome and Vivaldi keep it.
+    expect(d.alternative).toBeNull();
+    expect(buildWizardCopy({ ...BASE, browser: "chrome" }, table).stepD.alternative).toContain("ドラッグ");
+    expect(buildWizardCopy({ ...BASE, browser: "vivaldi" }, table).stepD.alternative).toContain("ドラッグ");
+    expect(buildWizardCopy({ ...BASE, browser: null }, table).stepD.alternative).toBeNull();
   });
 
   it("Vivaldi: the same wording as Chrome, and the page opens by itself", () => {

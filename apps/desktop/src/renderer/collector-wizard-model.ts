@@ -10,6 +10,19 @@
  * Design: docs/collector-wizard-integration-design.md 4 (steps A to E, 4.6 connection check, 4.7
  * keyboard) as amended by docs/collector-multi-browser-design.md 2.3, 2.4, 7.
  *
+ * EFFECT EXECUTOR CONTRACT (the panel, slice B3, must honour all of this):
+ * - `event.now` must come from `performance.now()` (monotonic), never `Date.now()`: a wall-clock jump would
+ *   fire or skip a poll or the 3-minute timeout. A non-finite `now` is ignored; a clock that goes backwards
+ *   counts as no time passing.
+ * - Run `focusHeading` after the render that shows the new step, not before.
+ * - `ticker` is idempotent: start it if inactive, stop it if active, never stack timers. Stop it when the panel closes.
+ * - `copyText` must be answered with exactly one `clipboardResult` (after the clipboard call settles).
+ * - Every async result (`response`, `destinationResult`, `requestFailed`, `clipboardResult`) must be bound to the
+ *   wizard instance that issued the effect and DROPPED after that instance closed. `nextRequestId` restarts at 0
+ *   when a wizard is recreated, so an old instance's pending promise must never answer a new instance.
+ * - Dispatch only the events `wizardActions(state)` lists as enabled, plus `tick`, `radioKey`, `selectBrowser`,
+ *   `escape` and the result events above. A disallowed event is ignored by the model anyway.
+ *
  * Invariants kept here:
  * - Nothing is written before the user presses the step B button. `confirmReplaceForeign` and
  *   `proceedWithoutSupportedBrowser` are sent only after an explicit user event for each.
@@ -23,6 +36,7 @@ import {
   COLLECTOR_BROWSERS,
   type CollectorBrowserId,
   type CollectorBrowserSpec,
+  type CollectorRecommendationReason,
 } from "../collector-browser-table";
 import type { CollectorApplyReason } from "../collector-integration-apply-types";
 import type {
@@ -40,6 +54,7 @@ import {
   type WizardMessageCopy,
   type WizardMessageId,
   type WizardMessageRole,
+  type WizardReasonCopy,
 } from "./collector-wizard-copy";
 
 // ----- Timing (design 4.6) -----------------------------------------------------------------------
@@ -114,6 +129,8 @@ export interface WizardState {
   readonly connection: WizardConnection | null;
   /** How the wizard ended, for the done screen: `user-confirmed` is never shown as verified. */
   readonly verification: "connected" | "user-confirmed" | null;
+  /** The last step B attempt ended in a failed self-check: a later `noop` must not read as success. */
+  readonly selfCheckFailed: boolean;
   readonly inFlight: WizardInFlight | null;
   readonly nextRequestId: number;
 }
@@ -130,6 +147,7 @@ export function initialWizardState(): WizardState {
     placement: "unknown",
     connection: null,
     verification: null,
+    selfCheckFailed: false,
     inFlight: null,
     nextRequestId: 0,
   });
@@ -263,6 +281,25 @@ function reconcileSelection(current: CollectorBrowserId | null, status: Collecto
   return null;
 }
 
+/** Verified browsers that were found but are blocked by an organization policy. */
+export function wizardBlockedBrowsers(status: CollectorIntegrationStatus | null): readonly CollectorBrowserId[] {
+  return wizardBrowserOptions(status).filter((option) => option.note === "policy-blocked").map((option) => option.id);
+}
+
+/**
+ * Every usable-looking browser is blocked by policy: the aggregate state says so, or the radiogroup is
+ * not empty and nothing in it can be selected. The table reports this as "none-installed", which would
+ * be the wrong message (the browsers are installed).
+ */
+export function wizardAllBrowsersBlocked(status: CollectorIntegrationStatus | null): boolean {
+  if (status === null) return false;
+  if (status.state === "policy-blocked") return true;
+  const options = wizardBrowserOptions(status);
+  return options.length > 0 && options.every((option) => !option.selectable && option.note === "policy-blocked");
+}
+
+const TERMINAL_UNAVAILABLE: readonly WizardMessageId[] = ["unavailable-e2e-isolation", "unavailable-payload-unavailable", "unavailable-startup-failed"];
+
 function isSelectable(state: WizardState, browser: CollectorBrowserId | null): boolean {
   return browser !== null && wizardBrowserOptions(state.status).some((option) => option.id === browser && option.selectable);
 }
@@ -288,15 +325,21 @@ const UNAVAILABLE_MESSAGE: Readonly<Record<Extract<CollectorIntegrationResponse,
   "startup-failed": "unavailable-startup-failed",
 };
 
-function assertNever(value: never): never {
-  throw new Error(`Unhandled Collector wizard value: ${JSON.stringify(value)}`);
+/**
+ * Compile-time exhaustiveness without a runtime throw: a value outside the type (a newer main process,
+ * a malformed IPC answer) must degrade to a retryable error, never leave the wizard stuck.
+ */
+function unreachable(_value: never): void {
+  // intentionally empty
 }
 
 /** One `switch` over every response kind; adding a kind to the IPC contract breaks the build here. */
 export function classifyWizardResponse(response: CollectorIntegrationResponse): ResponseClass {
   switch (response.kind) {
-    case "unavailable":
-      return { class: "unavailable", message: UNAVAILABLE_MESSAGE[response.reason] };
+    case "unavailable": {
+      const message = (UNAVAILABLE_MESSAGE as Readonly<Record<string, WizardMessageId | undefined>>)[response.reason];
+      return message === undefined ? { class: "invalid" } : { class: "unavailable", message };
+    }
     case "invalid-request":
     case "error":
       return { class: "invalid" };
@@ -319,7 +362,8 @@ export function classifyWizardResponse(response: CollectorIntegrationResponse): 
     case "connection":
       return { class: "connection", response };
     default:
-      return assertNever(response);
+      unreachable(response);
+      return { class: "invalid" };
   }
 }
 
@@ -354,9 +398,11 @@ export const APPLY_REASON_MESSAGE: Readonly<Record<CollectorApplyReason, WizardM
   "self-check-failed": "self-check-failed",
 };
 
-const STEP_B_SUCCESS: readonly WizardMessageId[] = ["registered", "registered-verified", "already-ready", "refreshed"];
+/** `outdated-pending`: registered, and the main process updates it itself at the next start; the user may go on. */
+const STEP_B_SUCCESS: readonly WizardMessageId[] = ["registered", "registered-verified", "already-ready", "refreshed", "outdated-pending"];
 /** After these the step B button is gone: retrying cannot help. */
 const STEP_B_TERMINAL: readonly WizardMessageId[] = [
+  "folder-unsafe",
   "policy-blocked",
   "policy-blocked-browser",
   "unavailable-e2e-isolation",
@@ -415,10 +461,10 @@ function setupRequest(state: WizardState, confirmReplaceForeign: boolean): Colle
   };
 }
 
-function addressOf(state: WizardState, browser: CollectorBrowserId): string | null {
-  const entry = state.status?.browsers.entries.find((candidate) => candidate.id === browser);
-  if (entry !== undefined) return entry.extensionsAddress;
-  return COLLECTOR_BROWSERS.find((row) => row.id === browser)?.extensionsPage.displayUrl ?? null;
+/** The fixed table constant (not the IPC copy), or `null` when empty. */
+function addressOf(browser: CollectorBrowserId): string | null {
+  const address = COLLECTOR_BROWSERS.find((row) => row.id === browser)?.extensionsPage.displayUrl;
+  return address === undefined || address === "" ? null : address;
 }
 
 function recommendationReason(state: WizardState) {
@@ -433,8 +479,10 @@ function recommendationReason(state: WizardState) {
  */
 export function isWizardEventAllowed(state: WizardState, event: WizardUserEvent): boolean {
   if (state.closed !== null) return false;
-  if (event.type === "later") return state.step !== "done" && !isMutating(state);
-  if (event.type === "escape") return !isMutating(state);
+  // After a finished check the only way out is 完了 then 閉じる: leaving early would hide that it worked.
+  const completed = state.step === "E" && (state.connection?.phase === "connected" || state.connection?.phase === "user-confirmed");
+  if (event.type === "later") return state.step !== "done" && !completed && !isMutating(state);
+  if (event.type === "escape") return !completed && !isMutating(state);
   if (state.step === "done") return event.type === "close";
   if (event.type === "close") return false;
   if (isBlocking(state)) return false;
@@ -443,7 +491,9 @@ export function isWizardEventAllowed(state: WizardState, event: WizardUserEvent)
   switch (state.step) {
     case "A": {
       if (state.statusLoad === "loading") return false;
+      if (event.type === "recheckBrowsers" && state.statusLoad === "failed" && state.results.A !== undefined && TERMINAL_UNAVAILABLE.includes(state.results.A)) return false;
       const reason = recommendationReason(state);
+      const blocked = wizardAllBrowsersBlocked(state.status);
       switch (event.type) {
         case "recheckBrowsers":
           return true;
@@ -452,11 +502,11 @@ export function isWizardEventAllowed(state: WizardState, event: WizardUserEvent)
         case "radioKey":
           return state.statusLoad === "ready" && wizardBrowserOptions(state.status).some((option) => option.selectable);
         case "next":
-          return state.statusLoad === "ready" && reason !== "none-installed" && reason !== "detection-failed" && isSelectable(state, state.selectedBrowser);
+          return state.statusLoad === "ready" && !blocked && reason !== "none-installed" && reason !== "detection-failed" && isSelectable(state, state.selectedBrowser);
         case "continueWithoutBrowser":
-          return state.statusLoad === "ready" && (reason === "none-installed" || (reason === "detection-failed" && isSelectable(state, state.selectedBrowser)));
+          return state.statusLoad === "ready" && !blocked && (reason === "none-installed" || (reason === "detection-failed" && isSelectable(state, state.selectedBrowser)));
         case "openDownloadPage":
-          return state.statusLoad === "ready" && reason === "none-installed" && COLLECTOR_BROWSERS.some((row) => row.id === event.browser && row.verification === "verified" && row.downloadUrl !== null);
+          return state.statusLoad === "ready" && !blocked && reason === "none-installed" && COLLECTOR_BROWSERS.some((row) => row.id === event.browser && row.verification === "verified" && row.downloadUrl !== null);
         default:
           return false;
       }
@@ -565,7 +615,11 @@ function failed(state: WizardState, operation: WizardOperation, message: WizardM
   switch (operation) {
     case "inspect":
     case "recheck-browsers":
-      return { ...withResult(state, "A", state.status === null ? "inspect-failed" : message), statusLoad: state.status === null ? "failed" : "ready" };
+      // Keep the specific reason (busy, unavailable) on the first inspection; only a generic failure reads as inspect-failed.
+      return {
+        ...withResult(state, "A", state.status === null && message === "request-failed" ? "inspect-failed" : message),
+        statusLoad: state.status === null ? "failed" : "ready",
+      };
     case "download":
       return withResult(state, "A", message);
     case "setup":
@@ -581,7 +635,8 @@ function failed(state: WizardState, operation: WizardOperation, message: WizardM
     case "poll":
       return state;
     default:
-      return assertNever(operation);
+      unreachable(operation);
+      return state;
   }
 }
 
@@ -629,10 +684,10 @@ function acceptStatus(state: WizardState, status: CollectorIntegrationStatus, re
   return { ...state, status, selectedBrowser: reconcile ? reconcileSelection(state.selectedBrowser, status) : state.selectedBrowser };
 }
 
-function handleResponse(state: WizardState, operation: WizardOperation, response: CollectorIntegrationResponse): WizardReduction {
+function handleResponse(state: WizardState, operation: WizardOperation, response: CollectorIntegrationResponse, now: number): WizardReduction {
   const classified = classifyWizardResponse(response);
 
-  if (operation === "poll") return handlePollResponse(state, classified);
+  if (operation === "poll") return handlePollResponse(state, classified, now);
 
   // Problems that read the same on every operation.
   if (classified.class === "unavailable") return unchanged(failed(state, operation, classified.message));
@@ -659,6 +714,9 @@ function handleResponse(state: WizardState, operation: WizardOperation, response
       if (classified.class !== "status") return unchanged(failed(state, operation, "request-failed"));
       const accepted = acceptStatus(state, classified.status);
       if (accepted === null) return unchanged(failed(state, operation, "busy"));
+      if (!classified.status.inspectionComplete) {
+        return unchanged({ ...withResult(accepted, "D", "check-incomplete"), placement: "unknown" });
+      }
       return unchanged(
         classified.status.extensionFolderPlaced
           ? { ...withResult(accepted, "D", null), placement: "placed" }
@@ -680,7 +738,8 @@ function handleResponse(state: WizardState, operation: WizardOperation, response
       // Answered by `destinationResult`, never by an integration response.
       return unchanged(failed(state, operation, "request-failed"));
     default:
-      return assertNever(operation);
+      unreachable(operation);
+      return unchanged(state);
   }
 }
 
@@ -699,13 +758,17 @@ function handleSetupResponse(state: WizardState, classified: ResponseClass): Wiz
   const accepted = acceptStatus(state, apply.status, false);
   const base = accepted ?? state;
 
+  if (apply.outcome === "noop" && state.selfCheckFailed) {
+    // The files look intact again, but the earlier start-up check never succeeded: not a success.
+    return unchanged(withResult(base, "B", "self-check-failed"));
+  }
   if (apply.outcome === "applied" || apply.outcome === "noop") {
     const message: WizardMessageId = apply.action === "refresh"
       ? "refreshed"
       : apply.outcome === "noop"
         ? "already-ready"
         : apply.selfCheck === "ok" ? "registered-verified" : "registered";
-    return unchanged(withResult(base, "B", message));
+    return unchanged({ ...withResult(base, "B", message), selfCheckFailed: false });
   }
 
   let message: WizardMessageId;
@@ -718,20 +781,21 @@ function handleSetupResponse(state: WizardState, classified: ResponseClass): Wiz
       const entry = selected === null ? undefined : base.status?.browsers.entries.find((candidate) => candidate.id === selected);
       message = entry?.policyBlocked === true ? "policy-blocked-browser" : "policy-blocked";
     } else {
-      message = mapped;
+      message = mapped ?? "register-failed"; // a reason this build does not know
     }
   }
-  return unchanged(withResult(base, "B", message));
+  return unchanged({ ...withResult(base, "B", message), selfCheckFailed: message === "self-check-failed" ? true : state.selfCheckFailed });
 }
 
-function handlePollResponse(state: WizardState, classified: ResponseClass): WizardReduction {
+function handlePollResponse(state: WizardState, classified: ResponseClass, now: number): WizardReduction {
   const connection = state.connection;
   if (state.step !== "E" || connection === null || connection.phase !== "waiting") return unchanged(state);
   if (classified.class === "unavailable") return leaveWaiting(state, { phase: "unavailable" });
   if (classified.class !== "connection") return unchanged(state); // busy / error: transient, the next poll asks again
 
   const { applyInProgress, connection: summary } = classified.response;
-  if (applyInProgress) return unchanged({ ...state, connection: { ...connection, lastPollAt: null } }); // discard and re-poll at the next tick
+  // Discard it, and ask again after the normal interval (never on the very next tick).
+  if (applyInProgress) return unchanged({ ...state, connection: { ...connection, lastPollAt: now } });
   switch (summary.state) {
     case "waiting":
       return unchanged(state);
@@ -744,7 +808,8 @@ function handlePollResponse(state: WizardState, classified: ResponseClass): Wiza
     case "unavailable":
       return leaveWaiting(state, { phase: "unavailable" });
     default:
-      return assertNever(summary);
+      unreachable(summary);
+      return unchanged(state); // an unknown connection state is treated as transient
   }
 }
 
@@ -762,7 +827,8 @@ function destinationMessage(result: CollectorSaveDestinationIpcResult): WizardMe
     case "cleared":
       return "destination-error";
     default:
-      return assertNever(result);
+      unreachable(result);
+      return "destination-error";
   }
 }
 
@@ -772,6 +838,8 @@ function destinationMessage(result: CollectorSaveDestinationIpcResult): WizardMe
  */
 export function reduceWizard(state: WizardState, event: WizardEvent): WizardReduction {
   if (state.closed !== null) return unchanged(state);
+  // A non-finite clock value would make every tick look due: ignore the event.
+  if (!Number.isFinite(event.now)) return unchanged(state);
 
   switch (event.type) {
     case "opened": {
@@ -784,7 +852,7 @@ export function reduceWizard(state: WizardState, event: WizardEvent): WizardRedu
     case "response": {
       if (state.inFlight === null || state.inFlight.requestId !== event.requestId) return unchanged(state);
       const operation = state.inFlight.operation;
-      return handleResponse({ ...state, inFlight: null }, operation, event.response);
+      return handleResponse({ ...state, inFlight: null }, operation, event.response, event.now);
     }
     case "destinationResult": {
       if (state.inFlight === null || state.inFlight.requestId !== event.requestId || state.inFlight.operation !== "destination") return unchanged(state);
@@ -840,6 +908,11 @@ function reduceUserEvent(state: WizardState, event: WizardUserEvent & { readonly
       return reduceBack(state);
 
     case "register": {
+      if (state.status?.state === "outdated") {
+        // `apply` can only refresh an outdated installation, and no renderer intent exists for that: the main process
+        // refreshes it at the next start. Registration is already in place, so let the user go on.
+        return unchanged(withResult(state, "B", "outdated-pending"));
+      }
       const issued = issue(withResult(state, "B", null), "setup", setupRequest(state, false));
       return reduction(issued.state, issued.effect);
     }
@@ -864,7 +937,7 @@ function reduceUserEvent(state: WizardState, event: WizardUserEvent & { readonly
       return reduction(issued.state, issued.effect);
     }
     case "copyAddress": {
-      const text = state.selectedBrowser === null ? null : addressOf(state, state.selectedBrowser);
+      const text = state.selectedBrowser === null ? null : addressOf(state.selectedBrowser);
       if (text === null) return unchanged(state);
       return reduction(withResult(state, "D", null), { type: "copyText", purpose: "address", text });
     }
@@ -877,7 +950,7 @@ function reduceUserEvent(state: WizardState, event: WizardUserEvent & { readonly
       return reduction(issued.state, issued.effect);
     }
     case "loaded": {
-      const entered = goTo(state, "E");
+      const entered = goTo(withResult(state, "D", null), "E");
       const started = startConnection(entered.state, event.now, state.connection);
       return { state: started.state, effects: [...entered.effects, ...started.effects] };
     }
@@ -890,7 +963,8 @@ function reduceUserEvent(state: WizardState, event: WizardUserEvent & { readonly
     case "finish":
       return goTo(state, "done");
     default:
-      return assertNever(event);
+      unreachable(event);
+      return unchanged(state);
   }
 }
 
@@ -935,7 +1009,9 @@ export function wizardStepNumber(step: WizardStepId): number | null {
     case "D": return 4;
     case "E": return 5;
     case "done": return null;
-    default: return assertNever(step);
+    default:
+      unreachable(step);
+      return null;
   }
 }
 
@@ -950,6 +1026,7 @@ export function wizardCopyContext(state: WizardState): WizardCopyContext {
     browser: state.selectedBrowser,
     recommended: state.status?.browsers.recommended ?? null,
     preferred: state.status?.browsers.preferred ?? null,
+    blocked: wizardBlockedBrowsers(state.status),
     defaultBrowser: state.status?.browsers.defaultBrowser ?? "unknown",
     loadedVersion: state.connection?.loadedVersion ?? null,
     placedVersion: state.connection?.placedVersion ?? null,
@@ -968,10 +1045,14 @@ export interface WizardMessageView {
   readonly copy: WizardMessageCopy;
 }
 
-/** The result or notice of the current step, or `null`. Steps E and done carry their state in `connection`. */
+/**
+ * The result or notice of the current step, or `null`. Step E's connection state is in
+ * `wizardConnectionView`; here step E only carries the result of 「…で拡張機能の画面を開く」 (shown on a
+ * version mismatch), which is stored with step D's results.
+ */
 export function wizardMessage(state: WizardState): WizardMessageView | null {
-  if (state.step === "E" || state.step === "done") return null;
-  const id = state.results[state.step];
+  if (state.step === "done") return null;
+  const id = state.results[state.step === "E" ? "D" : state.step];
   if (id === undefined) return null;
   return { id, role: WIZARD_MESSAGE_ROLE[id], copy: wizardCopy(state).messages[id] };
 }
@@ -1015,11 +1096,14 @@ export function wizardActions(state: WizardState): readonly WizardAction[] {
     case "A": {
       const reason = recommendationReason(state);
       if (state.statusLoad !== "ready") {
-        add("recheckBrowsers", copy.common.recheck, { type: "recheckBrowsers" }, true);
+        // A terminal failure (this environment cannot run the integration) has nothing to retry.
+        if (result === undefined || !TERMINAL_UNAVAILABLE.includes(result)) add("recheckBrowsers", copy.common.recheck, { type: "recheckBrowsers" }, true);
         later();
         break;
       }
-      if (reason === "none-installed") {
+      if (wizardAllBrowsersBlocked(state.status)) {
+        add("recheckBrowsers", copy.common.recheck, { type: "recheckBrowsers" }, true);
+      } else if (reason === "none-installed") {
         for (const row of COLLECTOR_BROWSERS) {
           if (row.verification === "verified" && row.downloadUrl !== null) {
             add(`openDownloadPage-${row.id}`, copy.stepA.downloadButtons[row.id], { type: "openDownloadPage", browser: row.id });
@@ -1042,11 +1126,13 @@ export function wizardActions(state: WizardState): readonly WizardAction[] {
       } else if (result !== undefined && STEP_B_SUCCESS.includes(result)) {
         add("next", copy.common.next, { type: "next" }, true);
       } else if (result !== undefined && STEP_B_TERMINAL.includes(result)) {
-        later(copy.common.close);
+        // Nothing to retry. 戻る comes first, as everywhere else. Policy and unavailable end in 閉じる; an unsafe folder in あとで設定 (design 4.3).
         back();
+        later(result === "folder-unsafe" ? copy.common.later : copy.common.close);
         break;
       } else {
-        add("register", failure || result === "foreign-declined" ? copy.common.retry : copy.stepB.register, { type: "register" }, true);
+        const label = result === "self-check-failed" ? copy.common.recheck : failure || result === "foreign-declined" ? copy.common.retry : copy.stepB.register;
+        add("register", label, { type: "register" }, true);
       }
       back();
       later();
@@ -1113,7 +1199,183 @@ export function wizardActions(state: WizardState): readonly WizardAction[] {
       add("close", copy.common.close, { type: "close" }, true);
       break;
     default:
-      return assertNever(state.step);
+      unreachable(state.step);
   }
   return actions;
+}
+
+// ----- Views for the panel (pure, derived) -------------------------------------------------------
+
+export interface WizardAOption {
+  readonly id: CollectorBrowserId;
+  readonly displayName: string;
+  /** Radio label: the name plus 「（おすすめ）」 when recommended. */
+  readonly label: string;
+  readonly recommended: boolean;
+  readonly selectable: boolean;
+  readonly selected: boolean;
+  readonly note: WizardBrowserOption["note"];
+  /** The 「組織の管理設定により使えません」 / 「確認できませんでした」 text for `note`, or `null`. */
+  readonly noteText: string | null;
+}
+
+export interface WizardAView {
+  /** The first inspection is running. */
+  readonly loading: boolean;
+  readonly title: string;
+  readonly body: string;
+  readonly bullets: readonly string[];
+  readonly menuNote: string;
+  readonly radiogroupLabel: string;
+  /** Every usable browser is blocked by policy: show `notice` instead of the reason text and offer no browser actions. */
+  readonly allBlocked: boolean;
+  /** The all-blocked message (names inserted), or `null`. */
+  readonly notice: WizardMessageView | null;
+  readonly reason: CollectorRecommendationReason | null;
+  /** The recommendation wording for `reason`; `null` while loading or when all are blocked. */
+  readonly reasonCopy: WizardReasonCopy | null;
+  /** 「前回は {name} を選びました。」, only when the remembered browser differs from the recommended one. */
+  readonly previouslyChosen: string | null;
+  readonly options: readonly WizardAOption[];
+}
+
+export function wizardAView(state: WizardState): WizardAView {
+  const copy = wizardCopy(state);
+  const status = state.status;
+  const reason = status?.browsers.recommendationReason ?? null;
+  const allBlocked = wizardAllBrowsersBlocked(status);
+  const preferred = status?.browsers.preferred ?? null;
+  const recommended = status?.browsers.recommended ?? null;
+  const options = wizardBrowserOptions(status).map((option): WizardAOption => {
+    const displayName = COLLECTOR_BROWSERS.find((row) => row.id === option.id)?.displayName ?? option.id;
+    return {
+      id: option.id,
+      displayName,
+      label: option.recommended ? `${displayName}${copy.stepA.optionRecommendedSuffix}` : displayName,
+      recommended: option.recommended,
+      selectable: option.selectable,
+      selected: state.selectedBrowser === option.id,
+      note: option.note,
+      noteText: option.note === "policy-blocked" ? copy.stepA.optionPolicyBlocked : option.note === "detection-unknown" ? copy.stepA.optionDetectionUnknown : null,
+    };
+  });
+  return {
+    loading: state.statusLoad === "loading",
+    title: copy.stepA.title,
+    body: copy.stepA.body,
+    bullets: copy.stepA.bullets,
+    menuNote: copy.stepA.menuNote,
+    radiogroupLabel: copy.stepA.radiogroupLabel,
+    allBlocked,
+    notice: allBlocked ? { id: "all-browsers-policy-blocked", role: WIZARD_MESSAGE_ROLE["all-browsers-policy-blocked"], copy: copy.messages["all-browsers-policy-blocked"] } : null,
+    reason,
+    reasonCopy: reason === null || allBlocked ? null : copy.stepA.reasons[reason],
+    previouslyChosen: preferred !== null && preferred !== recommended ? copy.stepA.previouslyChosen : null,
+    options,
+  };
+}
+
+export interface WizardDView {
+  readonly placement: WizardState["placement"];
+  readonly title: string;
+  readonly intro: string;
+  readonly pathNote: string;
+  readonly stepsLabel: string;
+  /** The five numbered instructions. */
+  readonly steps: readonly string[];
+  /** Render this directly under instruction 1 (`steps[0]`), together with the [アドレスをコピー] button. */
+  readonly addressNote: string;
+  readonly addressNoteAfterStep: 1;
+  /** Drag-and-drop loading text, or `null` (not observed for this browser: do not render). */
+  readonly alternative: string | null;
+  readonly cautionsLabel: string;
+  readonly cautions: readonly string[];
+  readonly multiBrowserSummary: string;
+  readonly multiBrowserNote: string;
+  /** The selected browser's `extensionLoadMayBeBlocked` flag (organization policy may block loading an extension). */
+  readonly showPolicyWarning: boolean;
+  readonly policyWarning: string;
+  readonly checkingFolder: string;
+}
+
+export function wizardStepDView(state: WizardState): WizardDView {
+  const d = wizardCopy(state).stepD;
+  const entry = state.selectedBrowser === null ? undefined : state.status?.browsers.entries.find((candidate) => candidate.id === state.selectedBrowser);
+  return {
+    placement: state.placement,
+    title: d.title,
+    intro: d.intro,
+    pathNote: d.pathNote,
+    stepsLabel: d.stepsLabel,
+    steps: d.steps,
+    addressNote: d.addressNote,
+    addressNoteAfterStep: 1,
+    alternative: d.alternative,
+    cautionsLabel: d.cautionsLabel,
+    cautions: d.cautions,
+    multiBrowserSummary: d.multiBrowserSummary,
+    multiBrowserNote: d.multiBrowserNote,
+    showPolicyWarning: entry?.extensionLoadMayBeBlocked === true,
+    policyWarning: d.policyWarning,
+    checkingFolder: d.checkingFolder,
+  };
+}
+
+export interface WizardConnectionView {
+  readonly phase: WizardConnectionPhase;
+  readonly title: string;
+  /** `status` (polite): waiting, connected, user-confirmed. `alert`: version or protocol mismatch, timeout, unavailable. */
+  readonly role: WizardMessageRole;
+  readonly headline: string;
+  readonly detail: string | null;
+  readonly checklistLabel: string | null;
+  /** The timeout checklist, or `null`. */
+  readonly checklist: readonly string[] | null;
+  /** 「保存先：…」, only when connected. */
+  readonly destinationLine: string | null;
+  /** The 「「はじめに」画面を開く方法」 disclosure, only while waiting. */
+  readonly howToOpen: { readonly summary: string; readonly detail: string } | null;
+  /** The result of 「…で拡張機能の画面を開く」 pressed on step E (version mismatch), or `null`. */
+  readonly launchMessage: WizardMessageView | null;
+}
+
+/** Step E, or `null` before the user pressed 「読み込みました」. */
+export function wizardConnectionView(state: WizardState): WizardConnectionView | null {
+  const connection = state.connection;
+  if (connection === null) return null;
+  const e = wizardCopy(state).stepE;
+  const base = { phase: connection.phase, title: e.title, checklistLabel: null, checklist: null, destinationLine: null, howToOpen: null, launchMessage: wizardMessage(state) } as const;
+  switch (connection.phase) {
+    case "waiting":
+      return { ...base, role: "status", headline: e.waiting.headline, detail: e.waiting.detail, howToOpen: { summary: e.howToOpenSummary, detail: e.howToOpenDetail } };
+    case "connected":
+      return { ...base, role: "status", headline: e.connected.headline, detail: e.connected.detail, destinationLine: wizardDestinationConfigured(state) ? e.destinationConfigured : e.destinationNotConfigured };
+    case "extension-version-differs":
+      return { ...base, role: "alert", headline: e.versionDiffers.headline, detail: e.versionDiffers.detail };
+    case "protocol-differs":
+      return { ...base, role: "alert", headline: e.protocolDiffers.headline, detail: e.protocolDiffers.detail };
+    case "timed-out":
+      return { ...base, role: "alert", headline: e.timedOut.headline, detail: null, checklistLabel: e.timedOut.checklistLabel, checklist: e.timedOut.checklist };
+    case "unavailable":
+      return { ...base, role: "alert", headline: e.unavailable.headline, detail: e.unavailable.detail };
+    case "user-confirmed":
+      return { ...base, role: "status", headline: e.userConfirmed.headline, detail: e.userConfirmed.detail };
+    default:
+      unreachable(connection.phase);
+      return null;
+  }
+}
+
+export interface WizardDoneView {
+  /** `true` only when the contact record proved the connection. A user confirmation is never shown as verified. */
+  readonly verified: boolean;
+  readonly title: string;
+  readonly body: string;
+}
+
+export function wizardDoneView(state: WizardState): WizardDoneView {
+  const done = wizardCopy(state).done;
+  return state.verification === "connected"
+    ? { verified: true, title: done.title, body: done.body }
+    : { verified: false, title: done.unverifiedTitle, body: done.unverifiedBody };
 }
