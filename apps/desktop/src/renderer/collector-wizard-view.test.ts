@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { initialWizardState, isWizardEventAllowed, moveRadioSelection, reduceWizard, wizardBrowserOptions, type WizardState } from "./collector-wizard-model";
+import { WIZARD_INFLIGHT_CANCEL_MS, initialWizardState, isWizardEventAllowed, moveRadioSelection, reduceWizard, wizardBrowserOptions, type WizardState } from "./collector-wizard-model";
 import { buildWizardView, isRadioKey, type WizardView } from "./collector-wizard-view";
 import {
   CONNECTED,
@@ -266,15 +266,15 @@ describe("wizard view: steps B and C", () => {
     expectClean(v);
   });
 
-  it("B self-check-failed is an alert, offers もう一度確認, and has no 次へ", () => {
+  it("B self-check-failed is an alert; only 戻る and 閉じる remain (no register, no 次へ)", () => {
     const h = atStepB();
     send(h, { type: "register" });
     respond(h, applyResponse({ outcome: "failed", reason: "self-check-failed", selfCheck: "failed", status: status({ state: "damaged" }) }));
     const v = view(h);
     expect(v.live.alert).toHaveLength(1);
     expect(v.live.status).toEqual([]);
-    expect(v.buttons.find((button) => button.id === "register")?.label).toBe("もう一度確認");
-    expect(v.buttons.some((button) => button.id === "next")).toBe(false);
+    expect(labels(v)).toEqual(["戻る", "閉じる"]);
+    expect(v.live.alert[0]!.detail).toContain("開き直して");
     expectClean(v);
   });
 
@@ -437,6 +437,41 @@ describe("wizard view: steps D and E and the done screen", () => {
     const verifiedView = view(verified);
     expect(verifiedView.title).not.toBe(done.title);
     expectClean(verifiedView);
+  });
+
+  it("C destination-error and destination-busy show exactly the three buttons, with 保存先を選び直す dispatching its own event", () => {
+    for (const result of [{ kind: "error" }, { kind: "busy" }] as const) {
+      const h = atStepC();
+      send(h, { type: "confirmDestination" });
+      send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: result as never });
+      const v = view(h);
+      expect(labels(v)).toEqual(["もう一度試す", "保存先を選び直す", "Collector のセットアップをキャンセル"]);
+      expect(v.buttons.map((button) => button.event.type)).toEqual(["confirmDestination", "chooseDestinationAgain", "later"]);
+      expect(v.buttons.every((button) => button.enabled)).toBe(true);
+      expect(v.live.alert).toHaveLength(1);
+      expectClean(v);
+    }
+  });
+
+  it("the slow-response alert and 「キャンセル」 appear only after 3 minutes of a blocking request", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    expect(view(h).live.alert).toEqual([]);
+    expect(labels(view(h))).not.toContain("キャンセル");
+    send(h, { type: "tick" }, T0 + WIZARD_INFLIGHT_CANCEL_MS - 1);
+    expect(view(h).live.alert).toEqual([]);
+    send(h, { type: "tick" }, T0 + WIZARD_INFLIGHT_CANCEL_MS);
+    const v = view(h);
+    expect(v.live.alert).toHaveLength(1);
+    expect(v.live.alert[0]!.headline).toBe("応答に時間がかかっています。");
+    const cancel = v.buttons.find((button) => button.id === "cancelInFlight")!;
+    expect(cancel.label).toBe("キャンセル");
+    expect(cancel.enabled).toBe(true);
+    expect(cancel.event).toEqual({ type: "cancelInFlight" });
+    expect(cancel.group).toBe("nav");
+    // A later tick leaves the view data identical (nothing to re-announce).
+    send(h, { type: "tick" }, T0 + WIZARD_INFLIGHT_CANCEL_MS + 5_000);
+    expect(view(h)).toEqual(v);
   });
 
   it("every button's enabled flag equals what the model allows", () => {

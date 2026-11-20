@@ -13,6 +13,7 @@ import {
   wizardConnectionView,
   wizardCopy,
   wizardDoneView,
+  wizardInFlightNotice,
   wizardIsBusy,
   wizardMessage,
   wizardProgress,
@@ -143,6 +144,9 @@ export function buildWizardView(state: WizardState): WizardView {
 
   const message = wizardMessage(state);
   if (message !== null) pushLive(live, message.role, { headline: message.copy.headline, detail: message.copy.detail });
+  // The watchdog notice appears once (the alert region only re-announces when its content changes).
+  const slow = wizardInFlightNotice(state);
+  if (slow !== null) pushLive(live, slow.role, { headline: slow.copy.headline, detail: slow.copy.detail });
 
   switch (state.step) {
     case "A": {

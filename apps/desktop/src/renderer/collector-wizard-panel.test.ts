@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { WizardUserEvent } from "./collector-wizard-model";
+import { WIZARD_INFLIGHT_CANCEL_MS, type WizardUserEvent } from "./collector-wizard-model";
 import { createWizardPanel, type WizardPanel } from "./collector-wizard-panel";
 import { buildWizardView } from "./collector-wizard-view";
 import type { CollectorIntegrationResponse } from "../collector-integration-ipc";
 import { isCollectorWizardOpen, openCollectorWizard } from "./collector-wizard-controller";
-import { applyResponse, atStepA, atStepB, atStepC, atStepD, atStepE, entry, respond, send, start, statusResponse } from "./collector-wizard-test-support";
+import { T0, applyResponse, atStepA, atStepB, atStepC, atStepD, atStepE, entry, respond, send, start, statusResponse } from "./collector-wizard-test-support";
 
 // A hand-made document stub (the node test environment has no DOM). It only implements what the
 // adapter uses. Real rendering, layout and focus rings are NOT VERIFIED here (checked by hand in B5).
@@ -409,6 +409,88 @@ describe("wizard panel: buttons", () => {
     send(h, { type: "tick" }, 1_000_000 + 10_000 + 180_000);
     rig.panel.render(buildWizardView(h.state));
     expect(rig.dialog.findAll((element) => element.tagName === "li").length).toBeGreaterThan(0);
+  });
+});
+
+describe("wizard panel: failure screens and the in-flight watchdog", () => {
+  const actionIds = (rig: Rig) => rig.dialog.findAll((element) => element.tagName === "button").map((button) => button.dataset.action);
+
+  function destinationError(kind: "error" | "busy") {
+    const h = atStepC();
+    send(h, { type: "confirmDestination" });
+    send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind } as never });
+    return h;
+  }
+
+  it("destination-error and destination-busy render exactly three buttons, each dispatching its event; no 閉じる or 次へ", () => {
+    for (const kind of ["error", "busy"] as const) {
+      const rig = setup();
+      rig.panel.render(buildWizardView(destinationError(kind).state));
+      expect(actionIds(rig)).toEqual(["confirmDestination", "chooseDestinationAgain", "cancelSetup"]);
+      expect(buttonOf(rig, "confirmDestination").textContent).toBe("もう一度試す");
+      expect(buttonOf(rig, "chooseDestinationAgain").textContent).toBe("保存先を選び直す");
+      expect(buttonOf(rig, "cancelSetup").textContent).toBe("Collector のセットアップをキャンセル");
+      for (const id of ["confirmDestination", "chooseDestinationAgain", "cancelSetup"]) buttonOf(rig, id).dispatch(makeEvent("click"));
+      expect(rig.events).toEqual([{ type: "confirmDestination" }, { type: "chooseDestinationAgain" }, { type: "later" }]);
+      expect(rig.dialog.find((element) => element.tagName === "button" && ["閉じる", "次へ"].includes(element.textContent))).toBeUndefined();
+    }
+  });
+
+  it("Esc on the destination-error screen goes to the model as `escape` (which the model treats like cancelSetup)", () => {
+    const rig = setup();
+    const h = destinationError("error");
+    rig.panel.render(buildWizardView(h.state));
+    rig.dialog.dispatch(makeEvent("keydown", { key: "Escape" }));
+    expect(rig.events).toEqual([{ type: "escape" }]);
+    expect(send(h, { type: "escape" }).some((effect) => effect.type === "close")).toBe(true);
+    expect(h.state.closed).toBe("later");
+  });
+
+  it("the slow-response alert is announced once, the cancel button is a focusable enabled button, and later ticks re-render nothing", () => {
+    const rig = setup();
+    const h = atStepB();
+    send(h, { type: "register" });
+    rig.panel.render(buildWizardView(h.state));
+    const alert = byId(rig, "collector-wizard-alert");
+    expect(alert.textContent).toBe("");
+    expect(actionIds(rig)).not.toContain("cancelInFlight");
+    buttonOf(rig, "register").focus();
+    send(h, { type: "tick" }, T0 + WIZARD_INFLIGHT_CANCEL_MS);
+    rig.panel.render(buildWizardView(h.state));
+    expect(alert.textContent).toContain("応答に時間がかかっています");
+    const cancel = buttonOf(rig, "cancelInFlight");
+    expect(cancel.disabled).toBe(false);
+    expect(cancel.getAttribute("aria-disabled")).toBeNull();
+    expect(rig.doc.activeElement).toBe(buttonOf(rig, "register"));
+    const tabStops = rig.dialog.findAll((element) => element.tagName === "button" && !element.disabled);
+    expect(tabStops).toContain(cancel);
+    const announced = alert.replaceCount;
+    const body = rig.dialog.find((element) => element.className === "collector-wizard-body")!;
+    const bodyBefore = body.replaceCount;
+    send(h, { type: "tick" }, T0 + WIZARD_INFLIGHT_CANCEL_MS + 1_000);
+    rig.panel.render(buildWizardView(h.state));
+    send(h, { type: "tick" }, T0 + WIZARD_INFLIGHT_CANCEL_MS + 2_000);
+    rig.panel.render(buildWizardView(h.state));
+    expect(alert.replaceCount).toBe(announced);
+    expect(body.replaceCount).toBe(bodyBefore);
+    cancel.dispatch(makeEvent("click"));
+    expect(rig.events).toEqual([{ type: "cancelInFlight" }]);
+  });
+
+  it("focus on the cancel button survives the re-render that follows and the alert region clears once the request is forgotten", () => {
+    const rig = setup();
+    const h = atStepB();
+    send(h, { type: "register" });
+    send(h, { type: "tick" }, T0 + WIZARD_INFLIGHT_CANCEL_MS);
+    rig.panel.render(buildWizardView(h.state));
+    buttonOf(rig, "cancelInFlight").focus();
+    send(h, { type: "tick" }, T0 + WIZARD_INFLIGHT_CANCEL_MS + 1_000);
+    rig.panel.render(buildWizardView(h.state));
+    expect(rig.doc.activeElement).toBe(buttonOf(rig, "cancelInFlight"));
+    send(h, { type: "cancelInFlight" });
+    rig.panel.render(buildWizardView(h.state));
+    expect(byId(rig, "collector-wizard-alert").textContent).toBe("");
+    expect(actionIds(rig)).not.toContain("cancelInFlight");
   });
 });
 

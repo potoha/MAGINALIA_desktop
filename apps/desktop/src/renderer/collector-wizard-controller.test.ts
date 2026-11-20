@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CollectorIntegrationRequest, CollectorIntegrationResponse } from "../collector-integration-ipc";
 import type { CollectorSaveDestinationIpcResult } from "../collector-save-destination-ipc";
 import type { WizardClosedOutcome, WizardUserEvent } from "./collector-wizard-model";
-import { WIZARD_POLL_INTERVAL_MS, WIZARD_TICK_INTERVAL_MS } from "./collector-wizard-model";
+import { WIZARD_INFLIGHT_CANCEL_MS, WIZARD_POLL_INTERVAL_MS, WIZARD_TICK_INTERVAL_MS } from "./collector-wizard-model";
 import { isCollectorWizardOpen, openCollectorWizard, type CollectorWizardDeps, type CollectorWizardHandle } from "./collector-wizard-controller";
 import type { WizardPanel, WizardPanelOptions } from "./collector-wizard-panel";
 import type { WizardView } from "./collector-wizard-view";
@@ -340,6 +340,160 @@ describe("wizard controller: time", () => {
     timer.callback();
     expect(rig.panel.views.length).toBe(renders);
     expect(rig.runs.filter((run) => run.request?.intent === "checkConnection")).toHaveLength(1);
+  });
+});
+
+describe("wizard controller: in-flight watchdog and cancel", () => {
+  const active = (rig: Rig) => rig.intervals.filter((interval) => !interval.cleared);
+
+  async function toRegisterInFlight(rig: Rig): Promise<void> {
+    await readyA(rig);
+    rig.panel.press("next");
+    rig.panel.press("register");
+  }
+
+  it("a ticker runs during the setup request, uses the injected clock, and stops once it answers", async () => {
+    const rig = makeRig();
+    open(rig);
+    await toRegisterInFlight(rig);
+    expect(active(rig)).toHaveLength(1);
+    expect(active(rig)[0]!.intervalMs).toBe(WIZARD_TICK_INTERVAL_MS);
+    rig.tick(1_000);
+    expect(rig.panel.view.buttons.some((button) => button.id === "cancelInFlight")).toBe(false);
+    rig.runs.at(-1)!.resolve(applyResponse());
+    await settle();
+    expect(active(rig)).toHaveLength(0);
+  });
+
+  it("a ticker also runs during the destination request", async () => {
+    const rig = makeRig();
+    open(rig);
+    await readyA(rig);
+    rig.panel.press("next");
+    rig.panel.press("register");
+    rig.runs.at(-1)!.resolve(applyResponse());
+    await settle();
+    rig.panel.press("next");
+    rig.panel.press("confirmDestination");
+    expect(active(rig)).toHaveLength(1);
+    rig.configures[0]!.resolve({ kind: "configured", writesEnabled: true });
+    await settle();
+    expect(active(rig)).toHaveLength(0);
+  });
+
+  it("a wall-clock jump of 3 minutes with no ticks in between surfaces the cancel button on the next tick", async () => {
+    const rig = makeRig();
+    open(rig);
+    await toRegisterInFlight(rig);
+    expect(rig.panel.view.live.alert).toEqual([]);
+    rig.clock.now += WIZARD_INFLIGHT_CANCEL_MS;
+    expect(rig.panel.view.buttons.some((button) => button.id === "cancelInFlight")).toBe(false);
+    active(rig)[0]!.callback();
+    expect(rig.panel.view.buttons.some((button) => button.id === "cancelInFlight" && button.enabled)).toBe(true);
+    expect(rig.panel.view.live.alert.map((message) => message.headline)).toEqual(["応答に時間がかかっています。"]);
+  });
+
+  it("cancel stops the ticker, and a late response, rejection or destination result leaves the screen unchanged", async () => {
+    const rig = makeRig();
+    open(rig);
+    await toRegisterInFlight(rig);
+    const lateRun = rig.runs.at(-1)!;
+    rig.tick(WIZARD_INFLIGHT_CANCEL_MS);
+    rig.panel.press("cancelInFlight");
+    expect(active(rig)).toHaveLength(0);
+    const after = rig.panel.view;
+    const renders = rig.panel.views.length;
+    lateRun.resolve(applyResponse());
+    await settle();
+    expect(rig.panel.view).toEqual(after);
+    expect(rig.panel.view.step).toBe("B");
+    expect(rig.panel.view.busy).toBe(false);
+    expect(rig.closed).toEqual([]);
+    // Whatever was rendered after the late answer is identical to the screen before it.
+    for (const view of rig.panel.views.slice(renders)) expect(view).toEqual(after);
+  });
+
+  it("a late rejection after cancel changes nothing either", async () => {
+    const rig = makeRig();
+    open(rig);
+    await toRegisterInFlight(rig);
+    const lateRun = rig.runs.at(-1)!;
+    rig.tick(WIZARD_INFLIGHT_CANCEL_MS);
+    rig.panel.press("cancelInFlight");
+    const after = rig.panel.view;
+    lateRun.reject(new Error("late failure"));
+    await settle();
+    expect(rig.panel.view).toEqual(after);
+    expect(rig.panel.view.live.alert).toEqual([]);
+  });
+
+  it("a late destination result after cancel changes nothing", async () => {
+    const rig = makeRig();
+    open(rig);
+    await readyA(rig);
+    rig.panel.press("next");
+    rig.panel.press("register");
+    rig.runs.at(-1)!.resolve(applyResponse());
+    await settle();
+    rig.panel.press("next");
+    rig.panel.press("confirmDestination");
+    rig.tick(WIZARD_INFLIGHT_CANCEL_MS);
+    rig.panel.press("cancelInFlight");
+    const after = rig.panel.view;
+    rig.configures[0]!.resolve({ kind: "configured", writesEnabled: true });
+    await settle();
+    expect(rig.panel.view).toEqual(after);
+    expect(rig.panel.view.step).toBe("C");
+    expect(active(rig)).toHaveLength(0);
+  });
+
+  it("a late destination rejection after cancel changes nothing", async () => {
+    const rig = makeRig();
+    open(rig);
+    await readyA(rig);
+    rig.panel.press("next");
+    rig.panel.press("register");
+    rig.runs.at(-1)!.resolve(applyResponse());
+    await settle();
+    rig.panel.press("next");
+    rig.panel.press("confirmDestination");
+    rig.tick(WIZARD_INFLIGHT_CANCEL_MS);
+    rig.panel.press("cancelInFlight");
+    const after = rig.panel.view;
+    rig.configures[0]!.reject(new Error("late"));
+    await settle();
+    expect(rig.panel.view).toEqual(after);
+  });
+
+  it("the destination-error screen: 保存先を選び直す reopens the picker, キャンセル closes with later", async () => {
+    const rig = makeRig();
+    open(rig);
+    await readyA(rig);
+    rig.panel.press("next");
+    rig.panel.press("register");
+    rig.runs.at(-1)!.resolve(applyResponse());
+    await settle();
+    rig.panel.press("next");
+    rig.panel.press("confirmDestination");
+    rig.configures[0]!.resolve({ kind: "busy" });
+    await settle();
+    expect(rig.panel.view.buttons.map((button) => button.id)).toEqual(["confirmDestination", "chooseDestinationAgain", "cancelSetup"]);
+    rig.panel.press("chooseDestinationAgain");
+    expect(rig.configures).toHaveLength(2);
+    expect(rig.panel.view.busy).toBe(true);
+    rig.configures[1]!.resolve({ kind: "error" } as never);
+    await settle();
+    rig.panel.emit({ type: "escape" });
+    expect(rig.closed).toEqual(["later"]);
+    expect(rig.panel.disposed).toBe(true);
+  });
+
+  it("dispose while a request is slow clears the ticker", async () => {
+    const rig = makeRig();
+    const handle = open(rig);
+    await toRegisterInFlight(rig);
+    handle.close();
+    expect(active(rig)).toHaveLength(0);
   });
 });
 
