@@ -309,7 +309,8 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
       reason: result.reason,
       warnings: Object.freeze([...result.warnings]),
       selfCheck: result.selfCheck,
-      status: summarizeInspection(result.inspection, false, preferred),
+      // A failed self-check leaves the files "ready" on disk but the integration unusable: say so (apply reports it as damaged).
+      status: result.selfCheck === "failed" ? { ...summarizeInspection(result.inspection, false, preferred), state: result.state } : summarizeInspection(result.inspection, false, preferred),
       ...extra,
     };
     }

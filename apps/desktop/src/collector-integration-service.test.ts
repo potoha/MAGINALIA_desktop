@@ -582,6 +582,17 @@ describe("collector integration service", () => {
     expect(await service.handle({ intent: "setup" })).toMatchObject({ kind: "browser-required", status: { browsers: { preferred: "edge" } } });
   });
 
+  it("an apply whose self-check failed reports the integration as damaged although the files read ready", async () => {
+    const r = rig();
+    r.applyImpl = async () => ({ ...applyResult("setup", "failed", "self-check-failed"), selfCheck: "failed", state: "damaged" });
+    const service = createCollectorIntegrationService(r.deps);
+    const response = await service.handle({ intent: "setup" });
+    expect(response).toMatchObject({ kind: "apply", outcome: "failed", reason: "self-check-failed", selfCheck: "failed", status: { state: "damaged" } });
+    // Without a failed self-check the on-disk state is reported unchanged.
+    r.applyImpl = async () => applyResult("setup");
+    expect(await service.handle({ intent: "setup" })).toMatchObject({ kind: "apply", selfCheck: "skipped", status: { state: "ready" } });
+  });
+
   it("an unreadable remembered browser reads as none and is logged by code", async () => {
     const r = rig();
     const service = createCollectorIntegrationService({ ...r.deps, startupRefresh: { ...r.startup, preferredBrowser: async () => { throw new Error("C:\\x"); } } });
