@@ -504,12 +504,16 @@ describe("Collector integration preload boundary", () => {
     const calls: Array<{ channel: string; args: unknown[] }> = [];
     const api = createMarkdownPreloadApi(async (channel, ...args) => { calls.push({ channel, args: [...args] }); return { kind: "busy" }; });
     await api.runCollectorIntegration({ intent: "setup", confirmReplaceForeign: true });
-    for (const bad of [null, "setup", { intent: "run", command: "calc" }, { intent: "inspect", path: "C:\\x" }, { intent: "setup", proceedWithoutSupportedBrowser: "yes" }, { intent: "remove", confirmReplaceForeign: true }, { intent: "openBrowserExtensions", browser: "C:\\x\\chrome.exe" }, { intent: "openBrowserExtensions", browser: "brave" }, { intent: "setup", browser: "chrome" }]) {
+    for (const bad of [null, "setup", { intent: "run", command: "calc" }, { intent: "inspect", path: "C:\\x" }, { intent: "setup", proceedWithoutSupportedBrowser: "yes" }, { intent: "remove", confirmReplaceForeign: true }, { intent: "openBrowserExtensions", browser: "C:\\x\\chrome.exe" }, { intent: "openBrowserExtensions", browser: "brave" }, { intent: "setup", browser: "brave" }, { intent: "inspect", browser: "chrome" }, { intent: "openBrowserDownloadPage", url: "https://example.test" }, { intent: "openBrowserDownloadPage", browser: "https://example.test" }]) {
       expect(() => api.runCollectorIntegration(bad as never)).toThrow("request is invalid");
     }
     expect(calls).toEqual([{ channel: COLLECTOR_INTEGRATION_CHANNEL, args: [{ intent: "setup", confirmReplaceForeign: true }] }]);
     await api.runCollectorIntegration({ intent: "openBrowserExtensions", browser: "edge" });
     expect(calls[1]).toEqual({ channel: COLLECTOR_INTEGRATION_CHANNEL, args: [{ intent: "openBrowserExtensions", browser: "edge" }] });
+    await api.runCollectorIntegration({ intent: "setup", browser: "chrome" });
+    expect(calls[2]).toEqual({ channel: COLLECTOR_INTEGRATION_CHANNEL, args: [{ intent: "setup", browser: "chrome" }] });
+    await api.runCollectorIntegration({ intent: "openBrowserDownloadPage", browser: "edge" });
+    expect(calls[3]).toEqual({ channel: COLLECTOR_INTEGRATION_CHANNEL, args: [{ intent: "openBrowserDownloadPage", browser: "edge" }] });
   });
 
   it("validates notice ids going out and notice lists coming in", async () => {
