@@ -565,3 +565,61 @@ describe("wizard controller: focus, Esc, later, finish", () => {
     expect(rig.panel.disposed).toBe(true);
   });
 });
+
+describe("wizard controller: robustness", () => {
+  it("a throwing render is reported, the wizard keeps its state, and Esc still works", async () => {
+    const errors: unknown[] = [];
+    const rig = makeRig({ onError: (error) => errors.push(error) });
+    open(rig);
+    const panel = rig.panel;
+    const original = panel.render.bind(panel);
+    let throwing = false;
+    panel.render = (view) => {
+      if (throwing) throw new Error("render failed");
+      original(view);
+    };
+    throwing = true;
+    rig.runs[0]!.resolve(statusResponse());
+    await settle();
+    expect(errors).toHaveLength(1);
+    // The model state advanced (the first inspection is answered): Esc closes.
+    panel.emit({ type: "escape" });
+    expect(rig.closed).toEqual(["later"]);
+    expect(panel.disposed).toBe(true);
+  });
+
+  it("a throwing effect does not stop the remaining effects", async () => {
+    const errors: unknown[] = [];
+    const rig = makeRig({
+      onError: (error) => errors.push(error),
+      setInterval: () => {
+        throw new Error("no timers");
+      },
+    });
+    open(rig);
+    await toStepE(rig);
+    expect(errors.length).toBeGreaterThan(0);
+    expect(rig.runs.filter((run) => run.request?.intent === "checkConnection")).toHaveLength(1);
+  });
+
+  it("a panel that reports itself broken ends the wizard without leaking the ticker", async () => {
+    const rig = makeRig();
+    open(rig);
+    await toStepE(rig);
+    rig.panel.options.onBroken?.();
+    expect(rig.closed).toEqual(["later"]);
+    expect(isCollectorWizardOpen()).toBe(false);
+    expect(rig.intervals.every((interval) => interval.cleared)).toBe(true);
+  });
+
+  it("focusRadio runs directly, focusHeading still waits for the animation frame", async () => {
+    const rig = makeRig();
+    open(rig);
+    await readyA(rig);
+    rig.flushRaf();
+    rig.panel.calls.length = 0;
+    rig.panel.emit({ type: "radioKey", key: "ArrowDown" });
+    expect(rig.panel.calls).toContain("focusRadio:chrome");
+    expect(rig.rafQueue).toHaveLength(0);
+  });
+});

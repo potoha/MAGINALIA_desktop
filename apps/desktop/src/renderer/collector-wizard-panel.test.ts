@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WizardUserEvent } from "./collector-wizard-model";
 import { createWizardPanel, type WizardPanel } from "./collector-wizard-panel";
 import { buildWizardView } from "./collector-wizard-view";
-import { atStepA, atStepD, atStepE, entry, send, start } from "./collector-wizard-test-support";
+import type { CollectorIntegrationResponse } from "../collector-integration-ipc";
+import { isCollectorWizardOpen, openCollectorWizard } from "./collector-wizard-controller";
+import { applyResponse, atStepA, atStepB, atStepC, atStepD, atStepE, entry, respond, send, start, statusResponse } from "./collector-wizard-test-support";
 
 // A hand-made document stub (the node test environment has no DOM). It only implements what the
 // adapter uses. Real rendering, layout and focus rings are NOT VERIFIED here (checked by hand in B5).
@@ -25,17 +27,19 @@ interface FakeEvent {
   type: string;
   key?: string;
   shiftKey?: boolean;
+  cancelable: boolean;
   defaultPrevented: boolean;
   preventDefault(): void;
 }
 
-function makeEvent(type: string, init: { key?: string; shiftKey?: boolean } = {}): FakeEvent {
+function makeEvent(type: string, init: { key?: string; shiftKey?: boolean; cancelable?: boolean } = {}): FakeEvent {
   const event: FakeEvent = {
     type,
+    cancelable: true,
     ...init,
     defaultPrevented: false,
     preventDefault() {
-      event.defaultPrevented = true;
+      if (event.cancelable) event.defaultPrevented = true;
     },
   };
   return event;
@@ -54,6 +58,7 @@ class FakeElement extends FakeNode {
   public readonly dataset: Record<string, string> = {};
   public readonly listeners = new Map<string, Listener[]>();
   public replaceCount = 0;
+  public showModalCount = 0;
   public focusCount = 0;
   private text = "";
 
@@ -89,13 +94,28 @@ class FakeElement extends FakeNode {
   }
   public replaceChildren(...nodes: (FakeElement | FakeText | string)[]): void {
     this.replaceCount += 1;
-    for (const child of this.children) child.parent = null;
+    for (const child of this.children) {
+      child.parent = null;
+      this.doc.releaseFocusIn(child);
+    }
     this.children = [];
     this.text = "";
     this.append(...nodes);
   }
   public detach(child: FakeElement | FakeText): void {
     this.children = this.children.filter((candidate) => candidate !== child);
+    this.doc.releaseFocusIn(child);
+  }
+  public get isConnected(): boolean {
+    let node: FakeElement | null = this;
+    while (node !== null) {
+      if (node === this.doc.body) return true;
+      node = node.parent;
+    }
+    return false;
+  }
+  public blur(): void {
+    if (this.doc.activeElement === this) this.doc.activeElement = this.doc.body;
   }
   public remove(): void {
     this.parent?.detach(this);
@@ -119,15 +139,22 @@ class FakeElement extends FakeNode {
     for (const entry of this.listeners.get(event.type) ?? []) entry.handler(event);
     return event;
   }
-  public focus(): void {
+  public focus(_options?: { preventScroll?: boolean }): void {
     this.focusCount += 1;
     this.doc.activeElement = this;
+  }
+  /** Chromium: a native close (a second Esc that cannot be cancelled) fires `close`. */
+  public nativeClose(): void {
+    this.open = false;
+    this.dispatch(makeEvent("close", { cancelable: false }));
   }
   public select(): void {
     // no-op
   }
   public showModal(): void {
+    if (this.open || !this.isConnected) throw new Error("InvalidStateError");
     this.open = true;
+    this.showModalCount += 1;
   }
   public close(): void {
     this.open = false;
@@ -150,9 +177,19 @@ class FakeElement extends FakeNode {
 }
 
 class FakeDocument {
-  public activeElement: FakeElement | null = null;
   public readonly body = new FakeElement("body", this);
+  public activeElement: FakeElement | null = this.body;
   public execCalls: string[] = [];
+  public readonly byId = new Map<string, FakeElement>();
+  public getElementById(id: string): FakeElement | null {
+    return this.byId.get(id) ?? null;
+  }
+  /** A real DOM drops focus to <body> when the focused element (or an ancestor) leaves the document. */
+  public releaseFocusIn(node: FakeElement | FakeText): void {
+    const active = this.activeElement;
+    if (active === null || !(node instanceof FakeElement)) return;
+    if (active === node || node.descendants().includes(active)) this.activeElement = this.body;
+  }
   public execResult = true;
   public createElement(tag: string): FakeElement {
     return new FakeElement(tag, this);
@@ -219,7 +256,8 @@ describe("wizard panel: dialog structure and live regions", () => {
     expect(byId(rig, "collector-wizard-title").textContent).toBe("ブラウザーで集めた引用を本棚へ（MAGINALIA Collector）");
     expect(byId(rig, "collector-wizard-progress").textContent).toBe("手順 1 / 5");
     expect(rig.dialog.getAttribute("aria-describedby")).toBe("collector-wizard-progress");
-    expect(rig.dialog.getAttribute("aria-busy")).toBe("false");
+    expect(rig.dialog.getAttribute("aria-busy")).toBeNull();
+    expect(rig.dialog.find((element) => element.className === "collector-wizard-body")?.getAttribute("aria-busy")).toBe("false");
   });
 
   it("puts a failure in the alert region and a success in the status region", () => {
@@ -327,17 +365,19 @@ describe("wizard panel: buttons", () => {
     expect(rig.events).toEqual([{ type: "next" }]);
   });
 
-  it("a disabled button is disabled, has no click path, and points at the busy status", () => {
+  it("a busy button is aria-disabled (still focusable), ignores clicks, and points at the busy status", () => {
     const rig = setup();
     const h = start();
     send(h, { type: "opened" });
     rig.panel.render(buildWizardView(h.state));
     const recheck = buttonOf(rig, "recheckBrowsers");
-    expect(recheck.disabled).toBe(true);
+    expect(recheck.disabled).toBe(false);
+    expect(recheck.getAttribute("aria-disabled")).toBe("true");
     expect(recheck.getAttribute("aria-describedby")).toBe("collector-wizard-status");
     recheck.dispatch(makeEvent("click"));
     expect(rig.events).toEqual([]);
-    expect(rig.dialog.getAttribute("aria-busy")).toBe("true");
+    expect(rig.dialog.getAttribute("aria-busy")).toBeNull();
+    expect(rig.dialog.find((element) => element.className === "collector-wizard-body")?.getAttribute("aria-busy")).toBe("true");
     expect(byId(rig, "collector-wizard-status").textContent).toContain("確認しています");
   });
 
@@ -484,5 +524,221 @@ describe("wizard panel: dispose and clipboard", () => {
     vi.stubGlobal("navigator", {});
     rig.doc.execResult = false;
     await expect(rig.panel.copyText("chrome://extensions")).resolves.toBe(false);
+  });
+});
+
+describe("wizard panel: focus survives re-renders (busy transitions)", () => {
+  const insideDialog = (rig: Rig): boolean => {
+    const active = rig.doc.activeElement;
+    return active !== null && active !== rig.doc.body && (active === rig.dialog || rig.dialog.descendants().includes(active));
+  };
+
+  it("focus stays inside the dialog across every busy transition of a full walk-through", () => {
+    const rig = setup();
+    const h = atStepD();
+    // Walk the model through busy transitions, focusing the button that was "pressed" each time.
+    const press = (id: string, then: () => void) => {
+      rig.panel.render(buildWizardView(h.state));
+      const button = buttonOf(rig, id);
+      button.focus();
+      send(h, { type: id } as WizardUserEvent);
+      rig.panel.render(buildWizardView(h.state));
+      expect(h.state.inFlight, id).not.toBeNull();
+      expect(insideDialog(rig), `${id} while busy`).toBe(true);
+      expect(rig.doc.activeElement, `${id} keeps its key`).toBe(buttonOf(rig, id));
+      then();
+      rig.panel.render(buildWizardView(h.state));
+      expect(insideDialog(rig), `${id} after the answer`).toBe(true);
+    };
+    press("openBrowserExtensions", () => respond(h, { kind: "browser-extensions", browser: "chrome", result: "opened" }));
+    press("copyPath", () => respond(h, { kind: "extension-folder", intent: "copyExtensionPath", result: "done" }));
+    press("revealFolder", () => respond(h, { kind: "extension-folder", intent: "revealExtensionFolder", result: "done" }));
+  });
+
+  it("step B and C buttons keep focus while the register / destination operation runs", () => {
+    const rig = setup();
+    const b = atStepB();
+    rig.panel.render(buildWizardView(b.state));
+    buttonOf(rig, "register").focus();
+    send(b, { type: "register" });
+    rig.panel.render(buildWizardView(b.state));
+    expect(rig.doc.activeElement).toBe(buttonOf(rig, "register"));
+    expect(buttonOf(rig, "register").getAttribute("aria-disabled")).toBe("true");
+    respond(b, applyResponse());
+    rig.panel.render(buildWizardView(b.state));
+    expect(rig.doc.activeElement).not.toBe(rig.doc.body);
+
+    const c = atStepC();
+    rig.panel.render(buildWizardView(c.state));
+    buttonOf(rig, "confirmDestination").focus();
+    send(c, { type: "confirmDestination" });
+    rig.panel.render(buildWizardView(c.state));
+    expect(rig.doc.activeElement).toBe(buttonOf(rig, "confirmDestination"));
+  });
+
+  it("when the focused element really disappears focus goes to the heading, never <body>, and comes back to the key", () => {
+    const rig = setup();
+    const h = atStepD();
+    rig.panel.render(buildWizardView(h.state));
+    buttonOf(rig, "copyPath").focus();
+    // A step whose view has no copyPath button (step E).
+    const e = atStepE();
+    rig.panel.render(buildWizardView(e.state));
+    expect(rig.doc.activeElement).toBe(byId(rig, "collector-wizard-title"));
+    expect(rig.doc.activeElement).not.toBe(rig.doc.body);
+    // The old key exists again (back on step D): focus returns to it.
+    rig.panel.render(buildWizardView(h.state));
+    expect(rig.doc.activeElement).toBe(buttonOf(rig, "copyPath"));
+  });
+
+  it("an open <details> stays open across re-renders", () => {
+    const rig = setup();
+    const h = atStepE();
+    rig.panel.render(buildWizardView(h.state));
+    const details = rig.dialog.find((element) => element.tagName === "details")!;
+    expect(details.open).toBe(false);
+    details.open = true;
+    send(h, { type: "tick" }, 1_000_000 + 12_000);
+    send(h, { type: "tick" }, 1_000_000 + 12_500);
+    // Force a rebuild with changed buttons: a busy poll answer.
+    send(h, { type: "back" });
+    send(h, { type: "loaded" }, 1_000_000 + 20_000);
+    rig.panel.render(buildWizardView(h.state));
+    expect(rig.dialog.find((element) => element.tagName === "details")?.open).toBe(true);
+  });
+});
+
+describe("wizard panel: native close and cancel", () => {
+  it("a non-cancelable cancel followed by a native close re-opens the dialog and asks the model once", () => {
+    const rig = setup();
+    rig.panel.render(buildWizardView(atStepA().state));
+    const keydown = rig.dialog.dispatch(makeEvent("keydown", { key: "Escape" }));
+    expect(keydown.defaultPrevented).toBe(true);
+    const cancel = rig.dialog.dispatch(makeEvent("cancel", { cancelable: false }));
+    expect(cancel.defaultPrevented).toBe(false);
+    rig.dialog.nativeClose();
+    expect(rig.dialog.open).toBe(true);
+    expect(rig.dialog.showModalCount).toBe(2);
+    expect(rig.events).toEqual([{ type: "escape" }]);
+  });
+
+  it("a close with no key before it is re-opened and goes to the model as escape", () => {
+    const rig = setup();
+    rig.dialog.nativeClose();
+    expect(rig.dialog.open).toBe(true);
+    expect(rig.events).toEqual([{ type: "escape" }]);
+  });
+
+  it("when the dialog cannot be re-opened the panel reports it as broken", () => {
+    const doc = new FakeDocument();
+    const onBroken = vi.fn();
+    const panel = createWizardPanel({ document: doc as unknown as Document, onEvent: () => undefined, onBroken });
+    rigs.push({ doc, events: [], panel, dialog: undefined as unknown as FakeElement });
+    panel.show();
+    const dialog = doc.body.children.find((child): child is FakeElement => child instanceof FakeElement && child.tagName === "dialog")!;
+    dialog.remove();
+    dialog.nativeClose();
+    expect(onBroken).toHaveBeenCalledTimes(1);
+  });
+
+  it("dispose does not react to its own close", () => {
+    const rig = setup();
+    rig.panel.dispose();
+    rig.dialog.nativeClose();
+    expect(rig.events).toEqual([]);
+  });
+
+  function openWithRealPanel() {
+    const doc = new FakeDocument();
+    const closed: string[] = [];
+    const intervals: { cleared: boolean }[] = [];
+    const runs: ((value: CollectorIntegrationResponse) => void)[] = [];
+    let panelRef: WizardPanel | undefined;
+    const handle = openCollectorWizard({
+      runCollectorIntegration: () => new Promise((resolve) => runs.push(resolve)),
+      configureCollectorSaveDestination: () => new Promise(() => undefined),
+      setInterval: () => {
+        const entry = { cleared: false };
+        intervals.push(entry);
+        return entry;
+      },
+      clearInterval: (entry) => {
+        (entry as { cleared: boolean }).cleared = true;
+      },
+      requestAnimationFrame: (callback) => callback(),
+      createPanel: (options) => {
+        panelRef = createWizardPanel({ ...options, document: doc as unknown as Document });
+        return panelRef;
+      },
+      onClosed: (outcome) => closed.push(outcome),
+      onError: (error) => {
+        throw error;
+      },
+    });
+    const dialog = doc.body.children.find((child): child is FakeElement => child instanceof FakeElement && child.tagName === "dialog")!;
+    return { doc, dialog, handle, closed, intervals, runs, panel: panelRef! };
+  }
+
+  it("integration: an idle native close ends the wizard cleanly (active cleared, outcome later)", async () => {
+    const r = openWithRealPanel();
+    r.runs[0]!(statusResponse());
+    await Promise.resolve();
+    await Promise.resolve();
+    r.dialog.dispatch(makeEvent("keydown", { key: "Escape" }));
+    r.dialog.dispatch(makeEvent("cancel", { cancelable: false }));
+    r.dialog.nativeClose();
+    expect(r.closed).toEqual(["later"]);
+    expect(isCollectorWizardOpen()).toBe(false);
+    expect(r.doc.body.children.includes(r.dialog)).toBe(false);
+  });
+
+  it("integration: while setup runs a native close re-opens the dialog, the wizard stays consistent, and a ticker would not leak", async () => {
+    const r = openWithRealPanel();
+    r.runs[0]!(statusResponse());
+    for (let i = 0; i < 4; i += 1) await Promise.resolve();
+    r.panel.render(buildWizardView(atStepA().state));
+    const next = buttonOf({ dialog: r.dialog } as Rig, "next");
+    next.dispatch(makeEvent("click"));
+    buttonOf({ dialog: r.dialog } as Rig, "register").dispatch(makeEvent("click"));
+    // Setup is in flight: Esc is ignored by the model, the second cancel closes natively.
+    r.dialog.dispatch(makeEvent("keydown", { key: "Escape" }));
+    r.dialog.dispatch(makeEvent("cancel", { cancelable: false }));
+    r.dialog.nativeClose();
+    expect(r.dialog.open).toBe(true);
+    expect(r.closed).toEqual([]);
+    expect(isCollectorWizardOpen()).toBe(true);
+    r.handle.close();
+    expect(isCollectorWizardOpen()).toBe(false);
+    expect(r.intervals.every((entry) => entry.cleared)).toBe(true);
+  });
+});
+
+describe("wizard panel: dispose focus return", () => {
+  it("falls back to an existing app control when the opener is gone, else leaves focus on the document", () => {
+    const doc = new FakeDocument();
+    const opener = doc.createElement("button");
+    doc.body.append(opener);
+    opener.focus();
+    const panel = createWizardPanel({ document: doc as unknown as Document, onEvent: () => undefined });
+    rigs.push({ doc, events: [], panel, dialog: undefined as unknown as FakeElement });
+    panel.show();
+    const fallback = doc.createElement("button");
+    fallback.id = "toggle-primary-sidebar";
+    doc.body.append(fallback);
+    doc.byId.set("toggle-primary-sidebar", fallback);
+    opener.remove();
+    panel.dispose();
+    expect(doc.activeElement).toBe(fallback);
+
+    const doc2 = new FakeDocument();
+    const opener2 = doc2.createElement("button");
+    doc2.body.append(opener2);
+    opener2.focus();
+    const panel2 = createWizardPanel({ document: doc2 as unknown as Document, onEvent: () => undefined });
+    rigs.push({ doc: doc2, events: [], panel: panel2, dialog: undefined as unknown as FakeElement });
+    panel2.show();
+    opener2.remove();
+    panel2.dispose();
+    expect(doc2.activeElement).toBe(doc2.body);
   });
 });
