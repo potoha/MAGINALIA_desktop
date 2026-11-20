@@ -93,6 +93,8 @@ export interface CollectorIntegrationServiceDependencies {
   /** Detached launch of the validated browser executable with the row's fixed arguments. `false` on failure. */
   readonly launchBrowser: (executablePath: string, args: readonly string[]) => Promise<boolean>;
   readonly writeClipboardText: (text: string) => void;
+  /** Opens an https URL in the user's default browser. `false` on failure. Only ever called with a table constant. */
+  readonly openExternal: (url: string) => Promise<boolean>;
   /** Opens a folder in the shell. `false` when it could not be opened. */
   readonly openFolder: (folder: string) => Promise<boolean>;
   /** Native confirmation owned by the main process (design 5, removal copy). */
@@ -131,7 +133,11 @@ export interface CollectorIntegrationService {
 
 // ----- Summaries -----------------------------------------------------------------------------
 
-export function summarizeInspection(inspection: CollectorIntegrationInspection, applyInProgress = false): CollectorIntegrationStatus {
+export function summarizeInspection(
+  inspection: CollectorIntegrationInspection,
+  applyInProgress = false,
+  preferred: CollectorBrowserId | null = null,
+): CollectorIntegrationStatus {
   return Object.freeze({
     applyInProgress,
     state: inspection.state,
@@ -142,6 +148,7 @@ export function summarizeInspection(inspection: CollectorIntegrationInspection, 
       defaultBrowser: inspection.browsers.defaultBrowser,
       recommended: inspection.browsers.recommended,
       recommendationReason: inspection.browsers.recommendationReason,
+      preferred,
       entries: Object.freeze(inspection.browsers.entries.map((entry) => Object.freeze({
         id: entry.id,
         verification: entry.verification,
@@ -150,6 +157,8 @@ export function summarizeInspection(inspection: CollectorIntegrationInspection, 
         registrationVia: entry.effective.target,
         policyBlocked: entry.policy.blocked,
         extensionLoadMayBeBlocked: entry.policy.extensionLoadMayBeBlocked,
+        // A fixed table constant (for example "chrome://extensions"), never a path.
+        extensionsAddress: COLLECTOR_BROWSERS.find((row) => row.id === entry.id)?.extensionsPage.displayUrl ?? "",
       }))),
     }),
     policy: Object.freeze({
@@ -180,6 +189,14 @@ export function summarizeConnection(inspection: CollectorIntegrationInspection):
     return { state: "connected", extensionVersion: contact.record.extensionVersion, hostVersion: contact.record.hostVersion, contactedAt: contact.record.contactedAt };
   }
   return { state: "extension-version-differs", loadedVersion: contact.record.extensionVersion, placedVersion: inspection.installed.extensionVersion };
+}
+
+function isHttpsUrl(value: string): boolean {
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function noticeKey(notices: readonly CollectorNotice[]): string {
@@ -224,16 +241,41 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
     return entry.promise;
   }
 
-  async function runApply(request: CollectorApplyRequest): Promise<CollectorIntegrationResponse> {
+  /** The remembered browser; a failure reads as "none". */
+  async function preferredBrowser(): Promise<CollectorBrowserId | null> {
+    try {
+      return await deps.startupRefresh.preferredBrowser();
+    } catch (error: unknown) {
+      deps.logError("MAGINALIA_COLLECTOR_PREFERRED_BROWSER_READ_FAILED", error);
+      return null;
+    }
+  }
+
+  async function rememberBrowser(browser: CollectorBrowserId): Promise<void> {
+    try {
+      await deps.startupRefresh.setPreferredBrowser(browser);
+    } catch (error: unknown) {
+      deps.logError("MAGINALIA_COLLECTOR_PREFERRED_BROWSER_WRITE_FAILED", error);
+    }
+  }
+
+  /** `chosenBrowser` (setup only): remembered once the apply has run, so the returned status already shows it. */
+  async function runApply(request: CollectorApplyRequest, chosenBrowser?: CollectorBrowserId): Promise<CollectorIntegrationResponse> {
     const outcome = await deps.gate.tryRun(runExclusive);
     if (!outcome.ran) return { kind: "busy" };
-    return toResponse(outcome.value);
+    return toResponse(outcome.value, await preferredBrowser());
 
     async function runExclusive() {
       let extra: Partial<{ saveDestination: CollectorSaveDestinationIpcResult["kind"] }> = {};
       if (request.action === "remove") {
         const confirmation = await deps.confirmRemove();
         if (!confirmation.confirmed) return { kind: "cancelled" } as const;
+        // Q9: record the request before anything is deleted (a refused apply puts it back in recordApplyResult).
+        try {
+          await deps.startupRefresh.beginRemove();
+        } catch (error: unknown) {
+          deps.logError("MAGINALIA_COLLECTOR_BEGIN_REMOVE_FAILED", error);
+        }
         const result = await deps.apply(request);
         await recordSafely(result);
         // A refused removal changed nothing: the save destination setting stays too.
@@ -249,10 +291,11 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
       }
       const result = await deps.apply(request);
       await recordSafely(result);
+      if (chosenBrowser !== undefined) await rememberBrowser(chosenBrowser);
       return { kind: "result", result, extra } as const;
     }
 
-    function toResponse(value: Awaited<ReturnType<typeof runExclusive>>): CollectorIntegrationResponse {
+    function toResponse(value: Awaited<ReturnType<typeof runExclusive>>, preferred: CollectorBrowserId | null): CollectorIntegrationResponse {
     if (value.kind === "cancelled") return { kind: "cancelled" };
     const { result, extra } = value;
     return {
@@ -262,7 +305,7 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
       reason: result.reason,
       warnings: Object.freeze([...result.warnings]),
       selfCheck: result.selfCheck,
-      status: summarizeInspection(result.inspection),
+      status: summarizeInspection(result.inspection, false, preferred),
       ...extra,
     };
     }
@@ -280,7 +323,7 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
   async function handleValidated(request: CollectorIntegrationRequest): Promise<CollectorIntegrationResponse> {
     switch (request.intent) {
       case "inspect":
-        return { kind: "status", status: summarizeInspection(await inspectShared(), deps.gate.busy) };
+        return { kind: "status", status: summarizeInspection(await inspectShared(), deps.gate.busy, await preferredBrowser()) };
       case "checkConnection": {
         const inspection = await inspectShared();
         return { kind: "connection", state: inspection.state, applyInProgress: deps.gate.busy, connection: summarizeConnection(inspection) };
@@ -290,9 +333,9 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
           const inspection = await inspectShared();
           // Design 7.2: a verified, installed browser that policy does not block must exist.
           const usable = inspection.browsers.entries.some((entry) => entry.verification === "verified" && entry.installed === "found" && !entry.policy.blocked);
-          if (!usable) return { kind: "browser-required", status: summarizeInspection(inspection, deps.gate.busy) };
+          if (!usable) return { kind: "browser-required", status: summarizeInspection(inspection, deps.gate.busy, await preferredBrowser()) };
         }
-        return runApply({ action: "setup", ...(request.confirmReplaceForeign === true ? { confirmReplaceForeign: true } : {}) });
+        return runApply({ action: "setup", ...(request.confirmReplaceForeign === true ? { confirmReplaceForeign: true } : {}) }, request.browser);
       }
       case "repair":
         return runApply({ action: "repair", ...(request.confirmReplaceForeign === true ? { confirmReplaceForeign: true } : {}) });
@@ -301,13 +344,23 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
       case "openBrowserExtensions": {
         // The renderer names at most a table row id. The executable comes from the main-process locator
         // and the arguments from the row: nothing here is taken from the request.
-        const target: CollectorBrowserId | null = request.browser ?? (await inspectShared()).browsers.recommended;
+        // Order (design 7.2): the named row, then the remembered choice, then the recommendation.
+        const target: CollectorBrowserId | null = request.browser ?? (await preferredBrowser()) ?? (await inspectShared()).browsers.recommended;
         const row = target === null ? undefined : COLLECTOR_BROWSERS.find((entry) => entry.id === target);
         if (target === null || row === undefined) return { kind: "browser-extensions", browser: target, result: "browser-not-found" };
         const location = await deps.locateBrowser(target);
         if (location.status !== "found") return { kind: "browser-extensions", browser: target, result: "browser-not-found" };
         const launched = await deps.launchBrowser(location.executablePath, row.extensionsPage.launchArguments);
+        // Only an explicit choice is remembered: a recommendation the user never saw is not a preference.
+        if (launched && request.browser !== undefined) await rememberBrowser(request.browser);
         return { kind: "browser-extensions", browser: target, result: launched ? "opened" : "failed" };
+      }
+      case "openBrowserDownloadPage": {
+        // The renderer names at most a table row id; the URL is the row's main-process constant (https only).
+        const row = request.browser === undefined ? undefined : COLLECTOR_BROWSERS.find((entry) => entry.id === request.browser);
+        const url = row?.downloadUrl;
+        if (typeof url !== "string" || !isHttpsUrl(url)) return { kind: "browser-download", result: "not-offered" };
+        return { kind: "browser-download", result: (await deps.openExternal(url)) ? "opened" : "failed" };
       }
       case "copyExtensionPath":
       case "revealExtensionFolder": {

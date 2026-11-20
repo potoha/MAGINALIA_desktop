@@ -21,19 +21,22 @@ describe("Collector integration IPC contract", () => {
     expect(isCollectorIntegrationRequest({ intent: "repair", confirmReplaceForeign: true })).toBe(true);
   });
 
-  it("accepts a browser row id on openBrowserExtensions only", () => {
+  it("accepts a browser row id on setup, openBrowserExtensions and openBrowserDownloadPage only", () => {
+    const allowed = ["setup", "openBrowserExtensions", "openBrowserDownloadPage"];
+    expect(COLLECTOR_INTEGRATION_INTENTS as readonly string[]).toContain("openBrowserDownloadPage");
     for (const id of COLLECTOR_BROWSER_IDS) {
-      expect(isCollectorIntegrationRequest({ intent: "openBrowserExtensions", browser: id })).toBe(true);
       for (const intent of COLLECTOR_INTEGRATION_INTENTS) {
-        if (intent !== "openBrowserExtensions") expect(isCollectorIntegrationRequest({ intent, browser: id })).toBe(false);
+        expect(isCollectorIntegrationRequest({ intent, browser: id })).toBe(allowed.includes(intent));
       }
     }
   });
 
   it("rejects a browser that is not a table row id, in any spelling, or that carries a path or URL", () => {
     const bad: unknown[] = ["", "Chrome", "CHROME", "brave", "chromium", "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "chrome://extensions/", "https://example.test", "chrome ", null, 1, true, {}, ["chrome"]];
-    for (const browser of bad) expect(isCollectorIntegrationRequest({ intent: "openBrowserExtensions", browser })).toBe(false);
-    expect(isCollectorIntegrationRequest({ intent: "openBrowserExtensions", browser: undefined })).toBe(true);
+    for (const intent of ["setup", "openBrowserExtensions", "openBrowserDownloadPage"] as const) {
+      for (const browser of bad) expect(isCollectorIntegrationRequest({ intent, browser })).toBe(false);
+      expect(isCollectorIntegrationRequest({ intent, browser: undefined })).toBe(true);
+    }
   });
 
   it("no longer knows the Chrome-only intent or flag", () => {
@@ -46,6 +49,9 @@ describe("Collector integration IPC contract", () => {
     const bad: unknown[] = [
       undefined, null, 1, "setup", [], [{ intent: "setup" }], {}, { intent: "unknown" }, { intent: "SETUP" },
       { intent: "setup", path: "C:\\Windows" }, { intent: "openBrowserExtensions", url: "https://example.test" },
+      { intent: "openBrowserDownloadPage", url: "https://example.test" }, { intent: "openBrowserDownloadPage", browser: "chrome", url: "https://example.test" },
+      { intent: "openBrowserDownloadPage", confirmReplaceForeign: true }, { intent: "openBrowserDownloadPage", proceedWithoutSupportedBrowser: true },
+      { intent: "setup", browser: "chrome", path: "C:\\x" },
       { intent: "copyExtensionPath", target: "x" }, { intent: "setup", confirmReplaceForeign: 1 },
       { intent: "remove", proceedWithoutSupportedBrowser: true }, { intent: "inspect", confirmReplaceForeign: false },
       { intent: "repair", proceedWithoutSupportedBrowser: false }, Object.create({ intent: "setup" }),

@@ -469,6 +469,158 @@ describe("remove requested", () => {
   });
 });
 
+describe("remove requested before the apply (Q9)", () => {
+  const removeResult = (outcome: CollectorApplyResult["outcome"], reason: CollectorApplyResult["reason"] = null): CollectorApplyResult => applyResult(outcome, reason, "remove");
+
+  it("persists removeRequested before any apply result exists, so a crash midway raises no repair notice", async () => {
+    const r = rig("ready");
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.beginRemove();
+    expect(r.store.state.removeRequested).toBe(true);
+    // the process dies here: the next start sees a half-removed installation
+    for (const state of ["registration-missing", "damaged"] as const) {
+      r.current = inspection(state);
+      const result = await createCollectorStartupRefresh(r.deps).runStartup();
+      expect(result.outcome).toBe("remove-requested");
+      expect(result.notices).toEqual([]);
+    }
+    expect(r.applies).toEqual([]);
+  });
+
+  it("drops a repair notice that is showing", async () => {
+    const r = rig("damaged");
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.runStartup();
+    expect(kinds(startup.currentNotices())).toEqual(["repair"]);
+    await startup.beginRemove();
+    expect(startup.currentNotices()).toEqual([]);
+  });
+
+  it("puts the previous value back when the remove was refused (nothing changed)", async () => {
+    for (const reason of ["busy", "wrong-state"] as const) {
+      const r = rig("ready");
+      const startup = createCollectorStartupRefresh(r.deps);
+      await startup.beginRemove();
+      expect(r.store.state.removeRequested).toBe(true);
+      await startup.recordApplyResult(removeResult("refused", reason));
+      expect(r.store.state.removeRequested).toBe(false);
+    }
+  });
+
+  it("a refused remove keeps removeRequested when it was already set before", async () => {
+    const r = rig("ready");
+    r.store.state = { ...DEFAULT_COLLECTOR_NOTICE_STATE, removeRequested: true };
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.beginRemove();
+    await startup.recordApplyResult(removeResult("refused", "wrong-state"));
+    expect(r.store.state.removeRequested).toBe(true);
+  });
+
+  it("keeps it for applied, partial and failed removes, and the rollback does not apply to a later refused remove", async () => {
+    for (const outcome of ["applied", "partial", "failed"] as const) {
+      const r = rig("ready");
+      const startup = createCollectorStartupRefresh(r.deps);
+      await startup.beginRemove();
+      await startup.recordApplyResult(removeResult(outcome, outcome === "failed" ? "write-failed" : null));
+      expect(r.store.state.removeRequested).toBe(true);
+      // a refused remove that never called beginRemove changes nothing
+      await startup.recordApplyResult(removeResult("refused", "busy"));
+      expect(r.store.state.removeRequested).toBe(true);
+    }
+  });
+
+  it("a refused remove without beginRemove leaves no removeRequested (existing behavior)", async () => {
+    const r = rig("ready");
+    await createCollectorStartupRefresh(r.deps).recordApplyResult(removeResult("refused", "wrong-state"));
+    expect(r.store.state.removeRequested).toBe(false);
+    expect(r.store.writes).toEqual([]);
+  });
+
+  it("does not touch the pending updated notice or the remembered browser", async () => {
+    const r = rig("ready");
+    r.store.state = { ...DEFAULT_COLLECTOR_NOTICE_STATE, alpha1: "shown", updated: { extensionVersion: "0.4.0", createdAt: T0 }, browser: "edge" };
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.beginRemove();
+    expect(r.store.state).toEqual({ ...DEFAULT_COLLECTOR_NOTICE_STATE, alpha1: "shown", updated: { extensionVersion: "0.4.0", createdAt: T0 }, browser: "edge", removeRequested: true });
+    await startup.recordApplyResult(removeResult("refused", "busy"));
+    expect(r.store.state).toEqual({ ...DEFAULT_COLLECTOR_NOTICE_STATE, alpha1: "shown", updated: { extensionVersion: "0.4.0", createdAt: T0 }, browser: "edge" });
+  });
+
+  it("never throws when the state cannot be written, and writes nothing under E2E isolation", async () => {
+    const failing = rig("ready");
+    failing.store.failWrites = true;
+    await expect(createCollectorStartupRefresh(failing.deps).beginRemove()).resolves.toBeUndefined();
+    const isolated = rig("ready");
+    isolated.isolated = true;
+    await createCollectorStartupRefresh(isolated.deps).beginRemove();
+    expect(isolated.store.writes).toEqual([]);
+  });
+});
+
+describe("remembered browser (multi-browser design 7.4)", () => {
+  it("is null by default and round-trips through the notice state", async () => {
+    const r = rig("ready");
+    const startup = createCollectorStartupRefresh(r.deps);
+    expect(await startup.preferredBrowser()).toBeNull();
+    await startup.setPreferredBrowser("edge");
+    expect(await startup.preferredBrowser()).toBe("edge");
+    expect(r.store.state.browser).toBe("edge");
+    expect(await createCollectorStartupRefresh(r.deps).preferredBrowser()).toBe("edge");
+  });
+
+  it("writes only when the value changes and keeps every other field", async () => {
+    const r = rig("ready");
+    r.store.state = { ...DEFAULT_COLLECTOR_NOTICE_STATE, removeRequested: true, alpha1: "dismissed", updated: { extensionVersion: "0.4.0", createdAt: T0 } };
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.setPreferredBrowser("chrome");
+    await startup.setPreferredBrowser("chrome");
+    expect(r.store.writes).toHaveLength(1);
+    expect(r.store.state).toEqual({ ...DEFAULT_COLLECTOR_NOTICE_STATE, removeRequested: true, alpha1: "dismissed", updated: { extensionVersion: "0.4.0", createdAt: T0 }, browser: "chrome" });
+  });
+
+  it("survives every other state change (dismiss, apply record, startup)", async () => {
+    const r = rig("damaged");
+    r.store.state = { ...DEFAULT_COLLECTOR_NOTICE_STATE, browser: "vivaldi" };
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.runStartup();
+    await startup.dismiss(COLLECTOR_NOTICE_IDS.alpha1Migration);
+    await startup.recordApplyResult(applyResult("applied", null, "setup"));
+    await startup.recordApplyResult(applyResult("applied", null, "remove"));
+    expect(r.store.state.browser).toBe("vivaldi");
+  });
+
+  it("goes through the serialized state chain: concurrent writes never lose each other", async () => {
+    const r = rig("ready");
+    r.store.state = { ...DEFAULT_COLLECTOR_NOTICE_STATE, alpha1: "shown", updated: { extensionVersion: "0.4.0", createdAt: T0 } };
+    const slowRead = r.store.read.bind(r.store);
+    r.store.read = async () => { const value = await slowRead(); await new Promise((resolve) => setTimeout(resolve, 5)); return value; };
+    const startup = createCollectorStartupRefresh(r.deps);
+    await Promise.all([
+      startup.setPreferredBrowser("edge"),
+      startup.dismiss(COLLECTOR_NOTICE_IDS.updated),
+      startup.recordApplyResult(applyResult("applied", null, "remove")),
+      startup.setPreferredBrowser("chrome"),
+    ]);
+    expect(r.store.state).toEqual({ ...DEFAULT_COLLECTOR_NOTICE_STATE, alpha1: "shown", removeRequested: true, updated: null, browser: "chrome" });
+  });
+
+  it("never throws when the write fails (the preference is only forgotten) and does nothing under E2E isolation", async () => {
+    const failing = rig("ready");
+    failing.store.failWrites = true;
+    await expect(createCollectorStartupRefresh(failing.deps).setPreferredBrowser("edge")).resolves.toBeUndefined();
+    const isolated = rig("ready");
+    isolated.isolated = true;
+    await createCollectorStartupRefresh(isolated.deps).setPreferredBrowser("edge");
+    expect(isolated.store.writes).toEqual([]);
+  });
+
+  it("a read failure reads as no preference", async () => {
+    const r = rig("ready");
+    r.store.read = async () => { throw new Error("denied"); };
+    expect(await createCollectorStartupRefresh(r.deps).preferredBrowser()).toBeNull();
+  });
+});
+
 describe("notice state serialization", () => {
   it("concurrent record / dismiss / reconcile never overwrite each other with a stale copy", async () => {
     const r = rig("ready");

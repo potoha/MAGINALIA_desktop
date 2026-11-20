@@ -23,11 +23,45 @@ describe("notice state", () => {
     const file = path.join(directory, "sub", "collector-notices.json");
     const store = createFileCollectorNoticeStore(file);
     expect(await store.read()).toEqual(DEFAULT_COLLECTOR_NOTICE_STATE);
-    const state = { version: 1 as const, removeRequested: true, alpha1: "shown" as const, updated: { extensionVersion: "0.4.0", createdAt: "2026-11-16T09:00:00.000Z" } };
+    const state = { version: 2 as const, removeRequested: true, alpha1: "shown" as const, updated: { extensionVersion: "0.4.0", createdAt: "2026-11-16T09:00:00.000Z" }, browser: "edge" as const };
     await store.write(state);
     expect(await store.read()).toEqual(state);
     expect(await readdir(path.dirname(file))).toEqual(["collector-notices.json"]);
     expect(await readFile(file, "utf8")).not.toMatch(/[A-Za-z]:\\/u);
+  });
+
+  it("defaults to version 2 with no remembered browser", () => {
+    expect(DEFAULT_COLLECTOR_NOTICE_STATE).toEqual({ version: 2, removeRequested: false, alpha1: "unseen", updated: null, browser: null });
+  });
+
+  it("reads a version 1 file as version 2 with no browser, and the next write is version 2", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "maginalia-notices-"));
+    directories.push(directory);
+    const file = path.join(directory, "collector-notices.json");
+    const v1 = { version: 1, removeRequested: true, alpha1: "dismissed", updated: { extensionVersion: "0.4.0", createdAt: "2026-11-16T09:00:00.000Z" } };
+    await writeFile(file, JSON.stringify(v1), "utf8");
+    const store = createFileCollectorNoticeStore(file);
+    const read = await store.read();
+    expect(read).toEqual({ ...v1, version: 2, browser: null });
+    await store.write({ ...read, browser: "chrome" });
+    expect(JSON.parse(await readFile(file, "utf8"))).toEqual({ ...v1, version: 2, browser: "chrome" });
+  });
+
+  it.each([
+    ["an unknown id", "brave"],
+    ["a path", "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"],
+    ["a URL", "https://example.test"],
+    ["a wrong case", "Chrome"],
+    ["a number", 7],
+    ["an object", { id: "chrome" }],
+    ["a boolean", true],
+  ])("ignores %s as the saved browser and keeps the rest of the state", (_name, browser) => {
+    const text = JSON.stringify({ version: 2, removeRequested: true, alpha1: "shown", updated: null, browser });
+    expect(parseCollectorNoticeState(text)).toEqual({ version: 2, removeRequested: true, alpha1: "shown", updated: null, browser: null });
+  });
+
+  it.each(["edge", "chrome", "vivaldi"] as const)("keeps the saved browser %s", (browser) => {
+    expect(parseCollectorNoticeState(JSON.stringify({ version: 2, removeRequested: false, alpha1: "unseen", updated: null, browser }))?.browser).toBe(browser);
   });
 
   it("reads a damaged file as the defaults", async () => {
@@ -40,7 +74,12 @@ describe("notice state", () => {
 
   it.each([
     ["extra field", { version: 1, removeRequested: false, alpha1: "unseen", updated: null, path: "C:\\x" }],
-    ["wrong version", { version: 2, removeRequested: false, alpha1: "unseen", updated: null }],
+    ["extra field in version 2", { version: 2, removeRequested: false, alpha1: "unseen", updated: null, browser: null, path: "C:\\x" }],
+    ["a browser field in version 1", { version: 1, removeRequested: false, alpha1: "unseen", updated: null, browser: "chrome" }],
+    ["version 2 without the browser field", { version: 2, removeRequested: false, alpha1: "unseen", updated: null }],
+    ["unknown version", { version: 3, removeRequested: false, alpha1: "unseen", updated: null, browser: null }],
+    ["version 0", { version: 0, removeRequested: false, alpha1: "unseen", updated: null }],
+    ["a damaged flag in version 2", { version: 2, removeRequested: "yes", alpha1: "unseen", updated: null, browser: "chrome" }],
     ["bad alpha1", { version: 1, removeRequested: false, alpha1: "maybe", updated: null }],
     ["bad extension version", { version: 1, removeRequested: false, alpha1: "unseen", updated: { extensionVersion: "x", createdAt: "2026-11-16T09:00:00.000Z" } }],
     ["bad timestamp", { version: 1, removeRequested: false, alpha1: "unseen", updated: { extensionVersion: "0.4.0", createdAt: "yesterday" } }],

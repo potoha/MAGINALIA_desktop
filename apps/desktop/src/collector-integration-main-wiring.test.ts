@@ -23,6 +23,10 @@ describe("main.ts Collector integration wiring (source scan)", () => {
     expect(source).toMatch(/wrapApply: \(apply\) => \(request\) => collectorApplyGate\.queue/u);
   });
 
+  it("the download page opener is the shell, handed to the service as a dependency (the URL is a service-side constant)", () => {
+    expect(source).toMatch(/openExternal: async \(url\) => \{\s*try \{\s*await shell\.openExternal\(url\);\s*return true;\s*\} catch \{\s*return false;/u);
+  });
+
   it("a composition failure is caught and logged by code, leaving the app starting", () => {
     expect(source).toMatch(/catch \(error: unknown\) \{\s*logCollectorIntegrationError\("MAGINALIA_COLLECTOR_INTEGRATION_UNAVAILABLE", error\);\s*return undefined;/u);
   });

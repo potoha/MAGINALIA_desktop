@@ -478,6 +478,14 @@ function createCollectorIntegrationForMain(): CollectorIntegrationService | unde
       gate: collectorApplyGate,
       launchBrowser: launchDetachedProcess,
       writeClipboardText: (text) => clipboard.writeText(text),
+      openExternal: async (url) => {
+        try {
+          await shell.openExternal(url);
+          return true;
+        } catch {
+          return false;
+        }
+      },
       openFolder: async (folder) => (await shell.openPath(folder)) === "",
       confirmRemove: confirmCollectorRemoval,
       clearSaveDestination: () => runCollectorSaveDestinationCommand(clearCollectorSaveDestination),

@@ -40,6 +40,7 @@ export const COLLECTOR_INTEGRATION_INTENTS = [
   "repair",
   "remove",
   "openBrowserExtensions",
+  "openBrowserDownloadPage",
   "copyExtensionPath",
   "revealExtensionFolder",
   "checkConnection",
@@ -60,9 +61,11 @@ export interface CollectorIntegrationRequest {
    */
   readonly proceedWithoutSupportedBrowser?: boolean;
   /**
-   * `openBrowserExtensions` only. A table row id (an enumeration, never a path or URL). Omitted: the
-   * recommended browser of the current inspection. The main process still locates and validates the
-   * executable itself.
+   * `setup` / `openBrowserExtensions` / `openBrowserDownloadPage` only. A table row id (an enumeration,
+   * never a path or URL). `setup`: remembered as the browser the user last chose.
+   * `openBrowserExtensions`: omitted means the remembered browser, then the recommended one; the main
+   * process still locates and validates the executable itself. `openBrowserDownloadPage`: the row
+   * whose constant download URL main opens (omitted: nothing is opened).
    */
   readonly browser?: CollectorBrowserId;
 }
@@ -82,7 +85,7 @@ export function isCollectorIntegrationRequest(value: unknown): value is Collecto
   if (record.proceedWithoutSupportedBrowser !== undefined && record.intent !== "setup") return false;
   if (record.browser !== undefined) {
     if (typeof record.browser !== "string" || !(COLLECTOR_BROWSER_IDS as readonly string[]).includes(record.browser)) return false;
-    if (record.intent !== "openBrowserExtensions") return false;
+    if (record.intent !== "setup" && record.intent !== "openBrowserExtensions" && record.intent !== "openBrowserDownloadPage") return false;
   }
   return true;
 }
@@ -114,6 +117,11 @@ export interface CollectorBrowserSummary {
   readonly registrationVia: CollectorRegistryTargetId | null;
   readonly policyBlocked: boolean;
   readonly extensionLoadMayBeBlocked: boolean;
+  /**
+   * The address the user types into the address bar to reach this browser's extensions page (for
+   * example `chrome://extensions`). A fixed table constant, not a path, so the renderer may show and copy it.
+   */
+  readonly extensionsAddress: string;
 }
 
 export interface CollectorBrowsersSummary {
@@ -121,6 +129,8 @@ export interface CollectorBrowsersSummary {
   readonly defaultBrowser: DefaultBrowserKind;
   readonly recommended: CollectorBrowserId | null;
   readonly recommendationReason: CollectorRecommendationReason;
+  /** The browser the user last chose (setup or an explicit open), or `null`. Never decides the recommendation. */
+  readonly preferred: CollectorBrowserId | null;
   /** Table order. */
   readonly entries: readonly CollectorBrowserSummary[];
 }
@@ -188,6 +198,8 @@ export type CollectorIntegrationResponse =
   | { readonly kind: "browser-required"; readonly status: CollectorIntegrationStatus }
   /** `browser` is the row that was tried (`null`: there was none to try). */
   | { readonly kind: "browser-extensions"; readonly browser: CollectorBrowserId | null; readonly result: "opened" | "browser-not-found" | "failed" }
+  /** `openBrowserDownloadPage`: `not-offered` = no browser given, or the row has no (https) download URL; nothing was opened. */
+  | { readonly kind: "browser-download"; readonly result: "opened" | "failed" | "not-offered" }
   | { readonly kind: "extension-folder"; readonly intent: "copyExtensionPath" | "revealExtensionFolder"; readonly result: "done" | "unavailable" | "failed" }
   | { readonly kind: "connection"; readonly state: CollectorIntegrationState; readonly applyInProgress: boolean; readonly connection: CollectorConnectionSummary };
 

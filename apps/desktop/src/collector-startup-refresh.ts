@@ -29,6 +29,7 @@
  *    Other states (foreign-registration etc.) never raise it; the repair notice owns those.
  *  - Under E2E isolation the orchestrator does nothing at all.
  */
+import type { CollectorBrowserId } from "./collector-browser-table.js";
 import { compareCollectorVersions } from "./collector-version.js";
 import type { CollectorApplyRequest, CollectorApplyResult } from "./collector-integration-apply-types.js";
 import type { CollectorInspectOptions, CollectorIntegrationInspection } from "./collector-integration-types.js";
@@ -89,6 +90,16 @@ export interface CollectorStartupRefresh {
   markNoticeSurfaceReady(): Promise<readonly CollectorNotice[]>;
   /** Tells the orchestrator about an apply a user started (setup / repair / remove). Never throws. */
   recordApplyResult(result: CollectorApplyResult): Promise<void>;
+  /**
+   * Q9: the user confirmed a `remove`. Records `removeRequested` BEFORE anything is deleted, so a crash
+   * midway does not look like a damaged installation at the next start. If the apply is then `refused`
+   * (nothing changed), `recordApplyResult` puts the previous value back. Never throws.
+   */
+  beginRemove(): Promise<void>;
+  /** The browser the user last chose (multi-browser design 7.4), or `null`. Never throws. */
+  preferredBrowser(): Promise<CollectorBrowserId | null>;
+  /** Remembers the user's browser choice (same serialized state chain as every other write). Never throws. */
+  setPreferredBrowser(browser: CollectorBrowserId): Promise<void>;
   currentNotices(): readonly CollectorNotice[];
 }
 
@@ -102,6 +113,8 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
   let surfaceReady = false;
   /** The alpha1 notice is due but was held back until a surface exists. */
   let alpha1Pending = false;
+  /** `removeRequested` as it was when `beginRemove` ran; restored if the remove turns out `refused`. */
+  let removeBeganFrom: boolean | undefined;
 
   const snapshot = (): readonly CollectorNotice[] => Object.freeze([...active.values()]);
 
@@ -315,8 +328,17 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
 
     async recordApplyResult(result: CollectorApplyResult): Promise<void> {
       try {
+        if (deps.e2eIsolationActive) return;
         // `refused` changed nothing (`busy` is a transient snapshot): it is not a completed user request.
-        if (deps.e2eIsolationActive || result.outcome === "refused") return;
+        if (result.outcome === "refused") {
+          if (result.action === "remove" && removeBeganFrom !== undefined) {
+            const previous = removeBeganFrom;
+            removeBeganFrom = undefined;
+            await mutate((state) => state.removeRequested !== previous ? { ...state, removeRequested: previous } : undefined);
+          }
+          return;
+        }
+        if (result.action === "remove") removeBeganFrom = undefined;
         if (result.action === "remove") {
           // Whatever else happened, the user asked for it: stay quiet (a `partial` removal still looks damaged).
           active.delete(COLLECTOR_NOTICE_IDS.repair);
@@ -333,6 +355,37 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
         }
       } catch {
         // best effort
+      }
+    },
+
+    async beginRemove(): Promise<void> {
+      try {
+        if (deps.e2eIsolationActive) return;
+        // The gate runs one apply at a time, so there is no concurrent remove to overwrite this marker.
+        await mutate((state) => {
+          removeBeganFrom = state.removeRequested;
+          return state.removeRequested ? undefined : { ...state, removeRequested: true };
+        });
+        active.delete(COLLECTOR_NOTICE_IDS.repair);
+      } catch {
+        // best effort
+      }
+    },
+
+    async preferredBrowser(): Promise<CollectorBrowserId | null> {
+      try {
+        return (await mutate(() => undefined)).state.browser;
+      } catch {
+        return null;
+      }
+    },
+
+    async setPreferredBrowser(browser: CollectorBrowserId): Promise<void> {
+      try {
+        if (deps.e2eIsolationActive) return;
+        await mutate((state) => state.browser !== browser ? { ...state, browser } : undefined);
+      } catch {
+        // a preference that could not be saved is only forgotten
       }
     },
 

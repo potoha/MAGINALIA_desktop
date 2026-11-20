@@ -95,6 +95,13 @@ interface Rig {
   readonly located: CollectorBrowserId[];
   launchResult: boolean;
   startup: CollectorStartupRefresh;
+  /** What `startupRefresh.preferredBrowser()` answers; `setPreferredBrowser` writes it. */
+  preferred: CollectorBrowserId | null;
+  readonly rememberCalls: CollectorBrowserId[];
+  /** Order of orchestrator / apply calls, to prove `beginRemove` precedes the apply. */
+  readonly events: string[];
+  readonly externalOpened: string[];
+  externalResult: boolean;
 }
 
 function rig(overrides: Partial<CollectorIntegrationServiceDependencies> = {}): Rig {
@@ -114,6 +121,11 @@ function rig(overrides: Partial<CollectorIntegrationServiceDependencies> = {}): 
     locations: { chrome: { status: "found", source: "app-paths-hkcu", executablePath: SECRET_CHROME, rejected: [] } },
     located: [],
     launchResult: true,
+    preferred: null,
+    rememberCalls: [],
+    events: [],
+    externalOpened: [],
+    externalResult: true,
     startup: undefined as unknown as CollectorStartupRefresh,
     get deps(): CollectorIntegrationServiceDependencies {
       return {
@@ -121,6 +133,7 @@ function rig(overrides: Partial<CollectorIntegrationServiceDependencies> = {}): 
         startupRefresh: r.startup,
         inspect: async () => r.current,
         apply: async (request) => {
+          r.events.push(`apply:${request.action}`);
           r.applies.push(request);
           return r.applyImpl(request);
         },
@@ -128,6 +141,7 @@ function rig(overrides: Partial<CollectorIntegrationServiceDependencies> = {}): 
         gate: gate,
         launchBrowser: async (executable, args) => { r.launches.push({ executable, args }); return r.launchResult; },
         writeClipboardText: (text) => { r.clipboard.push(text); },
+        openExternal: async (url) => { r.externalOpened.push(url); return r.externalResult; },
         openFolder: async (folder) => { r.opened.push(folder); return true; },
         confirmRemove: async () => r.confirmation,
         clearSaveDestination: async () => { r.clearCalls += 1; return { kind: "cleared" }; },
@@ -143,7 +157,10 @@ function rig(overrides: Partial<CollectorIntegrationServiceDependencies> = {}): 
     reconcile: async () => r.notices,
     dismiss: async (noticeId) => { r.notices = r.notices.filter((notice) => notice.id !== noticeId); return r.notices; },
     markNoticeSurfaceReady: async () => r.notices,
-    recordApplyResult: async (result) => { r.recorded.push(result); },
+    recordApplyResult: async (result) => { r.events.push(`record:${result.action}:${result.outcome}`); r.recorded.push(result); },
+    beginRemove: async () => { r.events.push("beginRemove"); },
+    preferredBrowser: async () => r.preferred,
+    setPreferredBrowser: async (browser) => { r.rememberCalls.push(browser); r.preferred = browser; },
     currentNotices: () => r.notices,
   };
   return r;
@@ -252,7 +269,11 @@ describe("collector integration service", () => {
       { intent: "openChromeExtensions" }, { intent: "setup", proceedWithoutChrome: true },
       { intent: "openBrowserExtensions", url: "https://example.test" }, { intent: "openBrowserExtensions", path: "C:\\x\\chrome.exe" },
       { intent: "openBrowserExtensions", browser: "brave" }, { intent: "openBrowserExtensions", browser: "C:\\x\\chrome.exe" },
-      { intent: "openBrowserExtensions", browser: 1 }, { intent: "setup", browser: "chrome" }, { intent: "inspect", browser: "edge" },
+      { intent: "openBrowserExtensions", browser: 1 }, { intent: "setup", browser: "brave" }, { intent: "setup", browser: "C:\\x\\chrome.exe" },
+      { intent: "inspect", browser: "edge" }, { intent: "repair", browser: "chrome" }, { intent: "remove", browser: "chrome" },
+      { intent: "openBrowserDownloadPage", browser: "brave" }, { intent: "openBrowserDownloadPage", url: "https://example.test" },
+      { intent: "openBrowserDownloadPage", browser: "chrome", url: "https://example.test" }, { intent: "openBrowserDownloadPage", browser: 7 },
+      { intent: "openBrowserDownloadPage", confirmReplaceForeign: true }, { intent: "checkConnection", browser: "chrome" },
     ];
     for (const request of bad) expect(await service.handle(request)).toEqual({ kind: "invalid-request" });
     expect(r.applies).toHaveLength(0);
@@ -360,8 +381,11 @@ describe("collector integration service", () => {
       },
     });
     expect(Object.keys(response.status.browsers.entries[0]!).sort()).toEqual(
-      ["extensionLoadMayBeBlocked", "id", "installed", "policyBlocked", "registration", "registrationVia", "verification"],
+      ["extensionLoadMayBeBlocked", "extensionsAddress", "id", "installed", "policyBlocked", "registration", "registrationVia", "verification"],
     );
+    // fixed table constants, in table order; none of them is a file system path
+    expect(response.status.browsers.entries.map((entry) => entry.extensionsAddress)).toEqual(["edge://extensions", "chrome://extensions", "vivaldi://extensions"]);
+    expect(response.status.browsers.preferred).toBeNull();
     noAbsolutePath(response);
     expect(JSON.stringify(response)).not.toContain("source");
     expect(response.status).not.toHaveProperty("chrome");
@@ -431,7 +455,7 @@ describe("collector integration service", () => {
         launchBrowser: async () => { calls.push("launch"); return true; },
         writeClipboardText: () => { calls.push("clipboard"); },
       });
-      for (const intent of ["inspect", "setup", "repair", "remove", "openBrowserExtensions", "copyExtensionPath", "revealExtensionFolder", "checkConnection"] as const) {
+      for (const intent of ["inspect", "setup", "repair", "remove", "openBrowserExtensions", "openBrowserDownloadPage", "copyExtensionPath", "revealExtensionFolder", "checkConnection"] as const) {
         expect(await service.handle({ intent })).toEqual({ kind: "unavailable", reason });
       }
       service.startPeriodicReconcile(1);
@@ -513,6 +537,145 @@ describe("collector integration service", () => {
     expect(await service.handle({ intent: "openBrowserExtensions", browser: "vivaldi" })).toEqual({ kind: "browser-extensions", browser: "vivaldi", result: "browser-not-found" });
     expect(r.located).toEqual(["vivaldi"]);
     expect(r.launches).toEqual([]);
+  });
+
+  it("openBrowserExtensions targets request.browser, then the remembered browser, then the recommended one", async () => {
+    const r = rig();
+    const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+    r.locations = { ...r.locations, edge: { status: "found", source: "known-program-files-x86", executablePath: EDGE, rejected: [] } };
+    const service = createCollectorIntegrationService(r.deps);
+    // nothing remembered: recommended (chrome)
+    expect(await service.handle({ intent: "openBrowserExtensions" })).toMatchObject({ browser: "chrome", result: "opened" });
+    expect(r.rememberCalls).toEqual([]); // a recommendation is not remembered
+    // remembered: wins over the recommendation
+    r.preferred = "edge";
+    expect(await service.handle({ intent: "openBrowserExtensions" })).toMatchObject({ browser: "edge", result: "opened" });
+    expect(r.launches.at(-1)).toEqual({ executable: EDGE, args: ["edge://extensions/"] });
+    // an explicit row wins over the remembered one, and is remembered once it opened
+    expect(await service.handle({ intent: "openBrowserExtensions", browser: "chrome" })).toMatchObject({ browser: "chrome", result: "opened" });
+    expect(r.rememberCalls).toEqual(["chrome"]);
+    expect(r.preferred).toBe("chrome");
+    // a failed launch or a missing browser does not change the remembered one
+    r.launchResult = false;
+    await service.handle({ intent: "openBrowserExtensions", browser: "edge" });
+    r.launchResult = true;
+    await service.handle({ intent: "openBrowserExtensions", browser: "vivaldi" });
+    expect(r.rememberCalls).toEqual(["chrome"]);
+  });
+
+  it("a remembered browser that is gone is reported as not found (no silent fallback)", async () => {
+    const r = rig();
+    r.preferred = "vivaldi";
+    const service = createCollectorIntegrationService(r.deps);
+    expect(await service.handle({ intent: "openBrowserExtensions" })).toEqual({ kind: "browser-extensions", browser: "vivaldi", result: "browser-not-found" });
+    expect(r.launches).toEqual([]);
+  });
+
+  it("status.browsers.preferred shows the remembered browser in inspect, apply and browser-required answers", async () => {
+    const r = rig();
+    r.preferred = "edge";
+    const service = createCollectorIntegrationService(r.deps);
+    const status = await service.handle({ intent: "inspect" });
+    expect(status).toMatchObject({ kind: "status", status: { browsers: { preferred: "edge" } } });
+    expect(await service.handle({ intent: "repair" })).toMatchObject({ kind: "apply", status: { browsers: { preferred: "edge" } } });
+    r.current = inspection("not-set-up", { browsers: browsers({ recommended: null, recommendationReason: "none-installed", entries: [browserStatus("edge"), browserStatus("chrome"), browserStatus("vivaldi")] }) });
+    expect(await service.handle({ intent: "setup" })).toMatchObject({ kind: "browser-required", status: { browsers: { preferred: "edge" } } });
+  });
+
+  it("an unreadable remembered browser reads as none and is logged by code", async () => {
+    const r = rig();
+    const service = createCollectorIntegrationService({ ...r.deps, startupRefresh: { ...r.startup, preferredBrowser: async () => { throw new Error("C:\\x"); } } });
+    expect(await service.handle({ intent: "inspect" })).toMatchObject({ kind: "status", status: { browsers: { preferred: null } } });
+    expect(r.logs).toEqual(["MAGINALIA_COLLECTOR_PREFERRED_BROWSER_READ_FAILED"]);
+  });
+
+  it("setup with a browser remembers it once the apply ran; the returned status already shows it", async () => {
+    const r = rig();
+    const service = createCollectorIntegrationService(r.deps);
+    const response = await service.handle({ intent: "setup", browser: "edge" });
+    expect(response).toMatchObject({ kind: "apply", status: { browsers: { preferred: "edge" } } });
+    expect(r.rememberCalls).toEqual(["edge"]);
+    expect(r.applies).toEqual([{ action: "setup" }]); // the browser never reaches the apply request
+    // without a browser nothing is remembered and nothing is cleared
+    await service.handle({ intent: "setup" });
+    expect(r.rememberCalls).toEqual(["edge"]);
+    expect(r.preferred).toBe("edge");
+  });
+
+  it("setup does not remember a browser when it was refused as browser-required, busy, or threw", async () => {
+    const r = rig();
+    r.current = inspection("not-set-up", { browsers: browsers({ recommended: null, recommendationReason: "none-installed", entries: [browserStatus("edge"), browserStatus("chrome"), browserStatus("vivaldi")] }) });
+    const service = createCollectorIntegrationService(r.deps);
+    expect((await service.handle({ intent: "setup", browser: "edge" })).kind).toBe("browser-required");
+    // busy
+    const gate = deferred<CollectorApplyResult>();
+    r.applyImpl = () => gate.promise;
+    const first = service.handle({ intent: "setup", proceedWithoutSupportedBrowser: true, browser: "chrome" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect((await service.handle({ intent: "setup", proceedWithoutSupportedBrowser: true, browser: "vivaldi" })).kind).toBe("busy");
+    expect(r.rememberCalls).toEqual([]);
+    gate.reject(new Error("boom"));
+    expect(await first).toEqual({ kind: "error" });
+    expect(r.rememberCalls).toEqual([]);
+  });
+
+  it("a failing preference write does not fail the setup and is logged by code", async () => {
+    const r = rig();
+    const service = createCollectorIntegrationService({ ...r.deps, startupRefresh: { ...r.startup, setPreferredBrowser: async () => { throw new Error("D:\\x"); } } });
+    expect((await service.handle({ intent: "setup", browser: "chrome" })).kind).toBe("apply");
+    expect(r.logs).toEqual(["MAGINALIA_COLLECTOR_PREFERRED_BROWSER_WRITE_FAILED"]);
+  });
+
+  it("remove records the request before the apply starts (Q9), and not at all when declined", async () => {
+    const r = rig();
+    const service = createCollectorIntegrationService(r.deps);
+    expect((await service.handle({ intent: "remove" })).kind).toBe("apply");
+    expect(r.events).toEqual(["beginRemove", "apply:remove", "record:remove:applied"]);
+    // the other applies never call beginRemove
+    r.events.length = 0;
+    await service.handle({ intent: "setup" });
+    await service.handle({ intent: "repair" });
+    expect(r.events.filter((event) => event === "beginRemove")).toEqual([]);
+    // declined: nothing recorded
+    r.events.length = 0;
+    r.confirmation = { confirmed: false, clearSaveDestination: false };
+    expect(await service.handle({ intent: "remove" })).toEqual({ kind: "cancelled" });
+    expect(r.events).toEqual([]);
+  });
+
+  it("remove still runs when beginRemove fails, logging only a code", async () => {
+    const r = rig();
+    const service = createCollectorIntegrationService({ ...r.deps, startupRefresh: { ...r.startup, beginRemove: async () => { throw new Error("D:\\x"); } } });
+    expect((await service.handle({ intent: "remove" })).kind).toBe("apply");
+    expect(r.applies).toEqual([{ action: "remove" }]);
+    expect(r.logs).toEqual(["MAGINALIA_COLLECTOR_BEGIN_REMOVE_FAILED"]);
+  });
+
+  it("openBrowserDownloadPage opens only the row's constant https URL, with the main-process opener", async () => {
+    const r = rig();
+    const service = createCollectorIntegrationService(r.deps);
+    expect(await service.handle({ intent: "openBrowserDownloadPage", browser: "chrome" })).toEqual({ kind: "browser-download", result: "opened" });
+    expect(await service.handle({ intent: "openBrowserDownloadPage", browser: "edge" })).toEqual({ kind: "browser-download", result: "opened" });
+    expect(r.externalOpened).toEqual(["https://www.google.com/chrome/", "https://www.microsoft.com/edge/download"]);
+    expect(r.externalOpened.every((url) => url.startsWith("https://"))).toBe(true);
+    // nothing else was touched
+    expect(r.launches).toEqual([]);
+    expect(r.located).toEqual([]);
+    expect(r.applies).toEqual([]);
+    expect(r.rememberCalls).toEqual([]);
+  });
+
+  it("openBrowserDownloadPage is not-offered for a row without a download URL or without a browser, and failed when the opener fails", async () => {
+    const r = rig();
+    const service = createCollectorIntegrationService(r.deps);
+    expect(await service.handle({ intent: "openBrowserDownloadPage", browser: "vivaldi" })).toEqual({ kind: "browser-download", result: "not-offered" });
+    expect(await service.handle({ intent: "openBrowserDownloadPage" })).toEqual({ kind: "browser-download", result: "not-offered" });
+    expect(r.externalOpened).toEqual([]);
+    r.externalResult = false;
+    expect(await service.handle({ intent: "openBrowserDownloadPage", browser: "chrome" })).toEqual({ kind: "browser-download", result: "failed" });
+    // an opener that throws is a generic error (the service never throws), logged by code
+    const throwing = createCollectorIntegrationService({ ...r.deps, openExternal: async () => { throw new Error("x"); } });
+    expect(await throwing.handle({ intent: "openBrowserDownloadPage", browser: "chrome" })).toEqual({ kind: "error" });
   });
 
   it("coalesces concurrent read-only inspections", async () => {

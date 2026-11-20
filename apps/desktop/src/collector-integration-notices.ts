@@ -11,6 +11,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import * as path from "node:path";
+import { COLLECTOR_BROWSER_IDS, type CollectorBrowserId } from "./collector-browser-table.js";
 import { parseCollectorVersion } from "./collector-version.js";
 
 /** Commands already named by design 5. Registered by WP-7 together with the panel. */
@@ -118,22 +119,27 @@ export function buildAlpha1MigrationNotice(): CollectorNotice {
 export type CollectorAlpha1NoticeState = "unseen" | "shown" | "dismissed";
 
 export interface CollectorNoticeState {
-  readonly version: 1;
+  /** 2 since the multi-browser design (7.4). Version 1 files are still read (`browser` = null); every write is version 2. */
+  readonly version: 2;
   /** The user asked for `remove`: no repair notice and no automatic refresh until a setup/repair is applied. */
   readonly removeRequested: boolean;
   readonly alpha1: CollectorAlpha1NoticeState;
   /** The pending "updated" notice (until a matching contact or dismissal). */
   readonly updated: { readonly extensionVersion: string; readonly createdAt: string } | null;
+  /** The browser the user last chose (a UI preference, never an installation fact), or `null`. */
+  readonly browser: CollectorBrowserId | null;
 }
 
 export const DEFAULT_COLLECTOR_NOTICE_STATE: CollectorNoticeState = Object.freeze({
-  version: 1 as const,
+  version: 2 as const,
   removeRequested: false,
   alpha1: "unseen" as const,
   updated: null,
+  browser: null,
 });
 
-const STATE_FIELDS = ["version", "removeRequested", "alpha1", "updated"] as const;
+const STATE_FIELDS_V1 = ["version", "removeRequested", "alpha1", "updated"] as const;
+const STATE_FIELDS_V2 = [...STATE_FIELDS_V1, "browser"] as const;
 const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u;
 const MAX_STATE_BYTES = 2048;
 
@@ -148,19 +154,25 @@ export function parseCollectorNoticeState(text: string): CollectorNoticeState | 
   }
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
-  if (Object.keys(record).length !== STATE_FIELDS.length || !STATE_FIELDS.every((field) => Object.hasOwn(record, field))) return undefined;
-  if (record.version !== 1 || typeof record.removeRequested !== "boolean") return undefined;
+  const fields = record.version === 1 ? STATE_FIELDS_V1 : record.version === 2 ? STATE_FIELDS_V2 : undefined;
+  if (fields === undefined) return undefined;
+  if (Object.keys(record).length !== fields.length || !fields.every((field) => Object.hasOwn(record, field))) return undefined;
+  if (typeof record.removeRequested !== "boolean") return undefined;
   if (record.alpha1 !== "unseen" && record.alpha1 !== "shown" && record.alpha1 !== "dismissed") return undefined;
   let updated: CollectorNoticeState["updated"] = null;
   if (record.updated !== null) {
     const pending = record.updated;
     if (pending === undefined || typeof pending !== "object" || Array.isArray(pending)) return undefined;
-    const fields = pending as Record<string, unknown>;
-    if (Object.keys(fields).length !== 2 || typeof fields.extensionVersion !== "string" || typeof fields.createdAt !== "string") return undefined;
-    if (parseCollectorVersion(fields.extensionVersion) === undefined || !TIMESTAMP_PATTERN.test(fields.createdAt)) return undefined;
-    updated = Object.freeze({ extensionVersion: fields.extensionVersion, createdAt: fields.createdAt });
+    const pendingFields = pending as Record<string, unknown>;
+    if (Object.keys(pendingFields).length !== 2 || typeof pendingFields.extensionVersion !== "string" || typeof pendingFields.createdAt !== "string") return undefined;
+    if (parseCollectorVersion(pendingFields.extensionVersion) === undefined || !TIMESTAMP_PATTERN.test(pendingFields.createdAt)) return undefined;
+    updated = Object.freeze({ extensionVersion: pendingFields.extensionVersion, createdAt: pendingFields.createdAt });
   }
-  return Object.freeze({ version: 1 as const, removeRequested: record.removeRequested, alpha1: record.alpha1, updated });
+  // A damaged or unknown saved browser is only a lost preference: ignore it, keep the rest of the state.
+  const browser: CollectorBrowserId | null = typeof record.browser === "string" && (COLLECTOR_BROWSER_IDS as readonly string[]).includes(record.browser)
+    ? (record.browser as CollectorBrowserId)
+    : null;
+  return Object.freeze({ version: 2 as const, removeRequested: record.removeRequested, alpha1: record.alpha1, updated, browser });
 }
 
 export interface CollectorNoticeStore {
