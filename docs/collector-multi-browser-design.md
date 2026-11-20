@@ -3,6 +3,11 @@
 - **Status:** design proposal for review. No product code is changed by this
   document. Nothing here is DONE; every acceptance item is NOT VERIFIED until the
   slices in §9 and the spike in §10 produce evidence.
+- **Spike (2026-11-20):** measured results are in
+  [`collector-multi-browser-spike-results.md`](collector-multi-browser-spike-results.md).
+  Where this document says `[未検証]` for an item the spike measured, the 2026-11-20 write-back
+  blocks (§3.2, §3.4–§3.6, §7.2, §12.3) give the measured outcome. Rows below the table in §1 are
+  not rewritten; the write-back blocks win.
 - **Base:** `codex/alpha2-rc3` at `a7fc509` (RC2 + WP-5c + WP-8). WP-7 slice A
   (`codex/wp7a-main-wiring` at `f81fd8b`, on top of RC3) was read as well.
 - **Parent design:** [`collector-wizard-integration-design.md`](collector-wizard-integration-design.md)
@@ -367,6 +372,9 @@ listCollectorHostTargets()                                 -> [{id, subkey, writ
 - `vivaldi` は spike で Vivaldi が独自キーを読むと確定するまで **C++ 表に入れない**
   （`listCollectorHostTargets` にも出ない）。TS 表の `vivaldi` target は `writable: false` のまま
   とし、unit test は「TS 表の writable target 集合 == addon 表の writable 集合」を要求する。
+  > **spike 結果（2026-11-20）:** Vivaldi は独自キーを読まないと実測された（§3.4）。したがって
+  > `vivaldi` は C++ 表に入らない。TS 表の `vivaldi` target も削除する（読まれないキーに
+  > 誤って書く経路を作らないため）。
 - test seam（`MAGINALIA_WI_TEST_SEAM`）は target ごとに `HKCU\Software\MAGINALIA-Tests\<root>\<id>\NativeMessagingHosts\org.maginalia.collector`
   へ写す。product target にはこのコードが無いことを現行の export/strings test で確認する。
 - wrapper（`windows-integration.ts`）は引数を `COLLECTOR_REGISTRY_TARGET_IDS` で検証し、
@@ -405,6 +413,27 @@ spike の結果で 3 通りに分かれる。どの場合も行の `lookupOrder`
 | Vivaldi は自キーだけを読む | `lookupOrder: ["vivaldi"]`, `ownTargets: ["vivaldi"]`, `registration: "when-present"` | C++ 表に `vivaldi` を追加。NSIS も。 |
 | 自キー → Chrome キーの順（Edge と同型） | `lookupOrder: ["vivaldi", "chrome"]`, `ownTargets: ["vivaldi"]`（推奨: 他者の自キー登録に割り込まれないよう自分で持つ） | 同上 |
 
+> **spike 結果（2026-11-20）— 上の表の 1 行目に確定。** テスト機（Windows 11、Vivaldi 8.3、
+> PC 全体版と個人用版の両方）で K1/K3/K4/K6/K7 を実測した。
+>
+> | 登録したキー | Vivaldi が読んだもの |
+> | --- | --- |
+> | Vivaldi のみ（K4） | **読まない**（host not found） |
+> | Chrome のみ（K1） | Chrome キー |
+> | Chrome + Vivaldi（K6） | Chrome キー（Vivaldi キーは無視） |
+> | Chromium のみ（K3） | Chromium キー |
+> | Chrome + Chromium（K7） | **Chromium キー**（Chromium が優先） |
+>
+> 結論:
+> - 行の値は `lookupOrder: ["chromium", "chrome"]`, `ownTargets: []`。Vivaldi 専用の登録は
+>   **しない**（`registration: "when-present"` の議論は不要になる）。C++ 表・NSIS・TS 表の
+>   `vivaldi` target は追加しない。
+> - Vivaldi は Chrome キーの登録で動く。つまり Chrome target を常に登録する現行方針で
+>   カバーされる。ただし **Edge と同じく、他者の `Software\Chromium\NativeMessagingHosts\org.maginalia.collector` が
+>   あると Chrome キーより優先される**（決定 (d) の foreign-Chromium-key 分岐が Vivaldi にも必要）。
+> - Vivaldi を `verified` にするには、この結果に加えて S8（wizard）の文言と実 Collector の動作確認が
+>   要る（本 spike は probe 拡張）。
+
 `when-present` を推奨する理由（オーナー判断 Q1）: Vivaldi を入れていない利用者の HKCU に
 `Software\Vivaldi\...` という他社の名前空間を作らないため。NSIS は葉のキーしか消さないので、
 作ると親キーが残る。Chrome と Edge はオーナー決定で常に登録する（Edge は Windows 標準）。
@@ -418,7 +447,18 @@ spike の結果で 3 通りに分かれる。どの場合も行の `lookupOrder`
   自分で持つので、Chromium キーが Edge に効くのは Edge キーが無いときだけ。ブラウザー別の
   「有効な登録」（§4.2）を正しく出すために読むだけにする。
 
+> **spike 結果（2026-11-20）— §3.5 の Edge の探索順を実測で確認:** Edge は Edge キー → Chromium キー →
+> Chrome キーの順（K1: Chrome キーに fallback、K2: Edge キーで応答、K5: Edge キーが優先、K7:
+> Chromium キーが Chrome キーより優先）。Chrome は Chrome キーだけを読む（K2: Edge キーのみでは
+> host not found、K7: Chromium キーは無視）。Chrome の HKCU と HKLM の優先は未検証のまま。
+
 ### 3.6 拡張機能 ID と `allowed_origins`
+
+> **spike 結果（2026-11-20）:** probe 拡張（固定 `key`）の ID は Chrome・Edge・Vivaldi で同一
+> （V-ID）。Host 第 1 引数は 3 ブラウザーとも `chrome-extension://<id>/` と `--parent-window=<n>`
+> （V-ORIGIN）。実 Collector 0.3.0 の ID（`blgmoddncpknfnikdfnjelmdmphfgknf`）は Chrome でのみ確認。
+> Edge・Vivaldi では実 Collector の確認が未実施。manifest の `path` は `subdir`（相対）・`flat`・
+> `abs`（日本語フォルダー）とも Chrome と Edge で解決した（V-REL。Vivaldi の `flat`/`abs` は未実施）。
 
 - unpacked の拡張機能 ID は manifest の `key` から決まる（SHA-256 → a–p）[コード]。同じ
   Chromium のアルゴリズムなので 3 ブラウザーで同じ ID になる見込みだが [未検証]（spike 項目
@@ -825,6 +865,18 @@ export interface CollectorIntegrationRequest {
   `launchArguments`** で detached spawn（現行 `launchDetachedProcess` を流用）。成功したら
   その id を保存。`shell.openExternal` は `chrome:`/`edge:` 等のスキームには使わない
   （ハンドラーが無い・利用者が差し替え可能なため）。`microsoft-edge:` プロトコルも使わない。
+> **spike 結果（2026-11-20、V-LAUNCH）— 上の `openBrowserExtensions` は修正が要る。**
+> - 使い捨てプロファイル（`--user-data-dir` 付き）では、Chrome・Edge とも exe に
+>   `chrome://extensions/` / `edge://extensions/` を渡すと拡張機能ページが開く。
+> - **利用者の通常プロファイルでは、Chrome・Edge とも新しいウィンドウが開くだけで、拡張機能ページは
+>   開かない**（Chrome は未起動、Edge は起動中で確認）。Vivaldi は通常プロファイル・起動中で、既存
+>   ウィンドウに `vivaldi://extensions/` が開く。
+> - したがって Chrome・Edge では「exe に URL を渡す」だけを成功の前提にしない。wizard は
+>   ブラウザーを前面に出した上で、アドレスバーに入力するアドレス（`chrome://extensions` /
+>   `edge://extensions`）を **文言で案内し、コピーボタンを置く**（アドレス文字列はブラウザー表の
+>   定数。絶対パスではないので renderer へ渡してよい）。Vivaldi は従来どおり引数で開く。
+> - 起動後に拡張機能ページが開いたかを Desktop は検知できない。完了判定は接続確認（§4.6）だけに置く。
+
 - `openBrowserDownloadPage`: main の定数 `downloadUrl`（https）を `shell.openExternal` で開く
   （既定ブラウザーで開いてよい）。
 - 依存の改名: `locateChrome` → `locateBrowser(id)`、`launchChrome` → `launchBrowser`。
@@ -1231,6 +1283,18 @@ IDE リポジトリは本作業では編集しない。以下は S12 で適用�
 | §10 | 本書 Q1〜Q11 を追加。 |
 
 ### 12.3 spike で確定すべき未検証項目（一覧）
+
+> **2026-11-20 の spike 結果（詳細は [spike results](collector-multi-browser-spike-results.md)）:**
+> 1 = Vivaldi は独自キーを読まず Chromium → Chrome の順（§3.4）。3 = Edge は実測で一致（§3.5）。
+> 4 = Chrome・Edge で解決（Vivaldi 未実施）。5 = probe では同一、実 Collector は Chrome のみ。
+> 6 = `chrome-extension://`（3 ブラウザー）。7 = 使い捨てプロファイルでは開くが、**通常プロファイルの
+> Chrome・Edge では開かない**（§7.2）。8 = Edge `MSEdgeHTM`、Vivaldi（個人用）`VivaldiHTM.<hash>`、
+> `UserChoiceLatest\ProgId` が正で `UserChoice` は古い値が残る。**Chrome の ProgId は未実測**。
+> 9 = PC 全体版が既定の open command の指し先だった（その後、旧い PC 全体版はアンインストール済み）。
+> 10 = Chrome・Edge は §1 の UI 実測（Edge は起動時に 「開発者モードをオフにしますか？」→
+> 「今は実行しない」）、Vivaldi は Chrome と同じ。11 = Vivaldi で OK（`runtime.reload()` 後に popup が
+> 固まった観察が 1 回あり、再現未確認）。Edge は未実施。13 = Vivaldi のプロファイル A/B で同じ登録に
+> 接続できた。2・12・14 は未実施。
 
 1. Vivaldi の Native Messaging 探索順（自キー・Chrome キー・Chromium キーのどれを、どの順で読むか）。
 2. Chrome の HKCU と HKLM の優先（親設計 WP-2 の残り）。
