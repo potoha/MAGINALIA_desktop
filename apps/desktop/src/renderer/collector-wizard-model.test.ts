@@ -27,9 +27,11 @@ import {
   wizardCopy,
   wizardDestinationConfigured,
   wizardIsBusy,
+  wizardInFlightNotice,
   wizardMessage,
   wizardProgress,
   WIZARD_CONNECTION_TIMEOUT_MS,
+  WIZARD_INFLIGHT_CANCEL_MS,
   WIZARD_POLL_INTERVAL_MS,
   type WizardBrowserOption,
   type WizardEffect,
@@ -208,7 +210,7 @@ describe("wizard model: start and step A", () => {
     const h = start();
     const effects = send(h, { type: "opened" });
     expect(requestsOf(effects)).toEqual([{ intent: "inspect" }]);
-    expect(effects.map((effect) => effect.type)).toEqual(["request", "focusHeading"]);
+    expect(effects.map((effect) => effect.type)).toEqual(["request", "focusHeading", "ticker"]);
     expect(wizardIsBusy(h.state)).toBe(true);
     expect(wizardProgress(h.state)).toBe("手順 1 / 5");
     expect(send(h, { type: "opened" })).toEqual([]);
@@ -243,7 +245,7 @@ describe("wizard model: start and step A", () => {
     send(h, { type: "requestFailed", requestId: h.state.inFlight!.requestId });
     expect(h.state.statusLoad).toBe("failed");
     expect(wizardMessage(h.state)).toMatchObject({ id: "inspect-failed", role: "alert" });
-    expect(send(h, { type: "recheckBrowsers" }).map((effect) => effect.type)).toEqual(["request"]);
+    expect(send(h, { type: "recheckBrowsers" }).map((effect) => effect.type)).toEqual(["request", "ticker"]);
   });
 
   it("every reason keeps the right buttons (default-supported and the other selectable reasons)", () => {
@@ -500,7 +502,7 @@ describe("wizard model: step B", () => {
       status: status({ browsers: { recommended: null, recommendationReason: "none-installed", entries: [entry("chrome", { installed: "not-found" })] } }),
     });
     expect(h.state.step).toBe("A");
-    expect(effects.map((effect) => effect.type)).toEqual(["focusHeading"]);
+    expect(effects.map((effect) => effect.type)).toEqual(["focusHeading", "ticker"]);
     expect(h.state.selectedBrowser).toBeNull();
     expect(h.state.proceedWithoutBrowser).toBe(false);
     expect(actionLabels(h)).toContain("ブラウザーは入っています（このまま続ける）");
@@ -526,7 +528,7 @@ describe("wizard model: one operation at a time", () => {
     expect(send(h, { type: "recheckBrowsers" })).toEqual([]);
     expect(send(h, { type: "next" })).toEqual([]);
     const effects = send(h, { type: "later" });
-    expect(effects).toEqual([{ type: "close", outcome: "later" }]);
+    expect(effects).toEqual([{ type: "ticker", active: false, intervalMs: expect.any(Number) }, { type: "close", outcome: "later" }]);
     expect(h.state.closed).toBe("later");
   });
 
@@ -588,10 +590,10 @@ describe("wizard model: step C (design 4.4)", () => {
     [{ kind: "configured", writesEnabled: false }, "destination-writes-disabled", ["次へ（保存は無効のまま）", "戻る", "あとで設定"]],
     [{ kind: "already-configured", writesEnabled: false }, "destination-writes-disabled", ["次へ（保存は無効のまま）", "戻る", "あとで設定"]],
     [{ kind: "cancelled" }, "destination-cancelled", ["もう一度確認する", "次へ", "戻る", "あとで設定"]],
-    [{ kind: "error" }, "destination-error", ["もう一度確認する", "戻る", "あとで設定"]],
-    [{ kind: "busy" }, "destination-busy", ["もう一度確認する", "戻る", "あとで設定"]],
-    [{ kind: "not-configured" }, "destination-error", ["もう一度確認する", "戻る", "あとで設定"]],
-    [{ kind: "cleared" }, "destination-error", ["もう一度確認する", "戻る", "あとで設定"]],
+    [{ kind: "error" }, "destination-error", ["もう一度試す", "保存先を選び直す", "Collector のセットアップをキャンセル"]],
+    [{ kind: "busy" }, "destination-busy", ["もう一度試す", "保存先を選び直す", "Collector のセットアップをキャンセル"]],
+    [{ kind: "not-configured" }, "destination-error", ["もう一度試す", "保存先を選び直す", "Collector のセットアップをキャンセル"]],
+    [{ kind: "cleared" }, "destination-error", ["もう一度試す", "保存先を選び直す", "Collector のセットアップをキャンセル"]],
   ];
 
   it("starts with 保存先を確認する and dispatches the existing command once", () => {
@@ -599,7 +601,7 @@ describe("wizard model: step C (design 4.4)", () => {
     expect(actionLabels(h)).toEqual(["保存先を確認する", "戻る", "あとで設定"]);
     expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
     const effects = send(h, { type: "confirmDestination" });
-    expect(effects).toEqual([{ type: "configureSaveDestination", requestId: h.state.inFlight!.requestId }]);
+    expect(effects[0]).toEqual({ type: "configureSaveDestination", requestId: h.state.inFlight!.requestId });
     expect(send(h, { type: "confirmDestination" })).toEqual([]);
   });
 
@@ -639,7 +641,7 @@ describe("wizard model: step D", () => {
     send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "configured", writesEnabled: true } });
     const effects = send(h, { type: "next" });
     expect(requestsOf(effects)).toEqual([{ intent: "inspect" }]);
-    expect(effects.map((effect) => effect.type)).toEqual(["request", "focusHeading"]);
+    expect(effects.map((effect) => effect.type)).toEqual(["request", "focusHeading", "ticker"]);
     expect(h.state.placement).toBe("checking");
     expect(actionLabels(h)).toEqual(["戻る", "あとで設定"]);
     respond(h, statusResponse({ state: "ready", extensionFolderPlaced: true }));
@@ -1018,7 +1020,7 @@ describe("wizard model: outdated installation (no refresh intent for the rendere
     expect(h.state.inFlight).toBeNull();
     expect(requestsOf(h.log).length).toBe(requestsBefore);
     expect(wizardMessage(h.state)).toMatchObject({ id: "outdated-pending", role: "status" });
-    expect(wizardMessage(h.state)?.copy.detail).toContain("次回起動時");
+    expect(wizardMessage(h.state)?.copy.detail).toContain("次回起動時に自動で更新されます");
     expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(false);
     expect(actionLabels(h)).toEqual(["次へ", "戻る", "あとで設定"]);
     send(h, { type: "next" });
@@ -1026,7 +1028,7 @@ describe("wizard model: outdated installation (no refresh intent for the rendere
   });
 });
 
-describe("wizard model: retry after a failed self-check", () => {
+describe("wizard model: failed self-check has no self-check-only retry", () => {
   function afterSelfCheckFailure(): Harness {
     const h = atStepB();
     send(h, { type: "register" });
@@ -1034,24 +1036,13 @@ describe("wizard model: retry after a failed self-check", () => {
     return h;
   }
 
-  it("is labelled もう一度確認 and repairs (the status says damaged)", () => {
+  it("tells the user to close and re-open the wizard, and offers only 戻る and 閉じる", () => {
     const h = afterSelfCheckFailure();
     expect(wizardMessage(h.state)?.id).toBe("self-check-failed");
-    expect(action(h, "register").label).toBe("もう一度確認");
-    expect(requestsOf(send(h, { type: "register" }))).toEqual([{ intent: "repair" }]);
-  });
-
-  it("a noop answer after the failure is not shown as success", () => {
-    const h = afterSelfCheckFailure();
-    send(h, { type: "register" });
-    respond(h, applyResponse({ action: "repair", outcome: "noop", selfCheck: "skipped", status: status({ state: "ready" }) }));
-    expect(wizardMessage(h.state)?.id).toBe("self-check-failed");
+    expect(wizardMessage(h.state)?.copy.detail).toContain("ウィザードをいったん閉じて開き直してください");
+    expect(actionLabels(h)).toEqual(["戻る", "閉じる"]);
+    expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(false);
     expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
-    // A real success (the self-check ran and passed) is accepted.
-    send(h, { type: "register" });
-    respond(h, applyResponse({ action: "repair", outcome: "applied", selfCheck: "ok" }));
-    expect(wizardMessage(h.state)?.id).toBe("registered-verified");
-    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(true);
   });
 
   it("an unsafe program folder is terminal: only 戻る and あとで設定", () => {
@@ -1061,6 +1052,118 @@ describe("wizard model: retry after a failed self-check", () => {
     expect(wizardMessage(h.state)?.id).toBe("folder-unsafe");
     expect(actionLabels(h)).toEqual(["戻る", "あとで設定"]);
     expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(false);
+  });
+});
+
+describe("wizard model: step C failure screens and the in-flight watchdog", () => {
+  const MS = WIZARD_INFLIGHT_CANCEL_MS;
+
+  it("destination-error / destination-busy: exactly retry, re-pick and cancel; cancel closes without a request", () => {
+    for (const kind of ["error", "busy"] as const) {
+      const h = atStepC();
+      send(h, { type: "confirmDestination" });
+      send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind } });
+      expect(wizardActions(h.state).map((a) => [a.id, a.label, a.enabled])).toEqual([
+        ["confirmDestination", "もう一度試す", true],
+        ["chooseDestinationAgain", "保存先を選び直す", true],
+        ["cancelSetup", "Collector のセットアップをキャンセル", true],
+      ]);
+      const again = send(h, { type: "chooseDestinationAgain" });
+      expect(again[0]).toEqual({ type: "configureSaveDestination", requestId: h.state.inFlight!.requestId });
+      send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind } });
+      const cancel = send(h, { type: "later" });
+      expect(cancel.map((e) => e.type)).toEqual(["close"]);
+      expect(h.state.closed).toBe("later");
+    }
+  });
+
+  it("chooseDestinationAgain is not allowed outside the two failure results", () => {
+    const h = atStepC();
+    expect(isWizardEventAllowed(h.state, { type: "chooseDestinationAgain" })).toBe(false);
+  });
+
+  it("the watchdog is not offered before 180 s and is offered from 180 s (timestamps)", () => {
+    const h = atStepB();
+    send(h, { type: "register" }, T0);
+    expect(send(h, { type: "tick" }, T0 + MS - 1)).toEqual([]);
+    expect(wizardActions(h.state).some((a) => a.id === "cancelInFlight")).toBe(false);
+    expect(wizardInFlightNotice(h.state)).toBeNull();
+    expect(isWizardEventAllowed(h.state, { type: "cancelInFlight" })).toBe(false);
+    send(h, { type: "tick" }, T0 + MS);
+    const cancel = wizardActions(h.state).find((a) => a.id === "cancelInFlight");
+    expect(cancel).toMatchObject({ label: "キャンセル", enabled: true, event: { type: "cancelInFlight" } });
+    expect(wizardInFlightNotice(h.state)).toMatchObject({ id: "inflight-slow", role: "alert" });
+  });
+
+  it("the ticker runs while a blocking request is in flight and stops afterwards", () => {
+    const h = atStepB();
+    const issued = send(h, { type: "register" }, T0);
+    expect(issued.map((e) => e.type)).toEqual(["request", "ticker"]);
+    expect(issued[1]).toMatchObject({ active: true });
+    const answered = respond(h, applyResponse());
+    expect(answered.at(-1)).toMatchObject({ type: "ticker", active: false });
+  });
+
+  it("a clock jump counts as elapsed wall time", () => {
+    const h = atStepB();
+    send(h, { type: "register" }, T0);
+    send(h, { type: "tick" }, T0 + 5_000);
+    expect(isWizardEventAllowed(h.state, { type: "cancelInFlight" })).toBe(false);
+    send(h, { type: "tick" }, T0 + 60 * 60_000); // sleep or minimise: the next tick comes an hour later
+    expect(isWizardEventAllowed(h.state, { type: "cancelInFlight" })).toBe(true);
+    send(h, { type: "tick" }, T0); // clock moved back: still offered
+    expect(isWizardEventAllowed(h.state, { type: "cancelInFlight" })).toBe(true);
+  });
+
+  it("cancel clears the request and a late response is discarded without changing state", () => {
+    const h = atStepB();
+    send(h, { type: "register" }, T0);
+    const requestId = h.state.inFlight!.requestId;
+    send(h, { type: "tick" }, T0 + MS);
+    const effects = send(h, { type: "cancelInFlight" });
+    expect(effects).toEqual([{ type: "ticker", active: false, intervalMs: expect.any(Number) }]);
+    expect(h.state.inFlight).toBeNull();
+    expect(h.state.results.B).toBeUndefined();
+    const after = h.state;
+    expect(send(h, { type: "response", requestId, response: applyResponse() })).toEqual([]);
+    expect(send(h, { type: "requestFailed", requestId })).toEqual([]);
+    expect(h.state).toBe(after);
+    expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(true);
+  });
+
+  it("cancel of the destination picker discards a late destinationResult and requestFailed", () => {
+    const h = atStepC();
+    send(h, { type: "confirmDestination" }, T0);
+    const requestId = h.state.inFlight!.requestId;
+    send(h, { type: "tick" }, T0 + MS);
+    send(h, { type: "cancelInFlight" });
+    const after = h.state;
+    expect(send(h, { type: "destinationResult", requestId, result: { kind: "configured", writesEnabled: true } })).toEqual([]);
+    expect(send(h, { type: "requestFailed", requestId })).toEqual([]);
+    expect(h.state).toBe(after);
+    expect(h.state.results.C).toBeUndefined();
+  });
+
+  it("cancel of a placement check leaves a retryable step D", () => {
+    const h = atStepC();
+    send(h, { type: "confirmDestination" });
+    send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "cancelled" } });
+    send(h, { type: "next" }, T0);
+    send(h, { type: "tick" }, T0 + MS);
+    send(h, { type: "cancelInFlight" });
+    expect(h.state.placement).toBe("unknown");
+    expect(wizardActions(h.state).some((a) => a.id === "retryPlacement" && a.enabled)).toBe(true);
+  });
+
+  it("the connection-check poll has no watchdog", () => {
+    const h = atStepD();
+    send(h, { type: "loaded" }, T0);
+    expect(h.state.inFlight?.operation).toBe("poll");
+    send(h, { type: "tick" }, T0 + WIZARD_CONNECTION_TIMEOUT_MS - 1);
+    expect(h.state.inFlight?.cancelOffered ?? false).toBe(false);
+    expect(wizardInFlightNotice(h.state)).toBeNull();
+    expect(wizardActions(h.state).some((a) => a.id === "cancelInFlight")).toBe(false);
+    expect(isWizardEventAllowed(h.state, { type: "cancelInFlight" })).toBe(false);
   });
 });
 
