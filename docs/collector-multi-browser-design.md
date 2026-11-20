@@ -1356,12 +1356,11 @@ IDE リポジトリは本作業では編集しない。以下は S12 で適用�
 ## 決定ログ（2026-11-20 追記）
 
 S8 実装中の決定 3〜8（決定 1・2 は本書 §2.3 の Step A / D の実装メモに記録済み）。
-親設計 `collector-wizard-integration-design.md` は本作業では編集しないため、親設計 §4.4 への追加行はここに表で置く
-（S12 で親設計へ反映する）。
+親設計 `collector-wizard-integration-design.md` の §4.4 に、決定 3 の 2 行を追加済み。
 
 ### 決定 3: `destination-error` / `destination-busy` 画面のボタン
 
-親設計 §4.4（Step C の結果表）に次の 2 行を足す。
+次の 2 行は親設計 §4.4（Step C の結果表）に追加済み（`collector-wizard-integration-design.md`）。
 
 | Command result / 画面状態 | ボタン | 備考 |
 | --- | --- | --- |
@@ -1377,7 +1376,7 @@ S8 実装中の決定 3〜8（決定 1・2 は本書 §2.3 の Step A / D の実
 
 - `removeRequested` は **残す**。失敗は通知し、再試行は通知から行う。
 - `removeRequested` が立っている間は、起動時の自動 refresh・repair が止まる
-  （`collector-startup-refresh.ts`）。失敗通知の文面でそのことを伝える。 [コード]
+  （`collector-startup-refresh.ts`）。失敗通知の文面でそのことを伝える。 [コード: `apps/desktop/src/collector-startup-refresh.ts` L216-222。`removeRequested` のとき、検査が `ready` なら旗を下ろして続行し、それ以外は `remove-requested` で終了する]
 
 ### 決定 5: `outdated` のインストール
 

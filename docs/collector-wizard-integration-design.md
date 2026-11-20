@@ -446,15 +446,17 @@ The IPC result carries no Shelf name, path or UUID.
 | `cancelled` | 「保存先は設定されていません。Collector で保存しようとした引用は、設定するまでブラウザー内に保留されます。」 | [もう一度確認する] [次へ] [あとで設定] |
 | `error` (marker invalid/conflict/missing) | the command's own dialog, then 「本棚の識別マーカーを確認できないため、保存先を設定できませんでした。マーカーの作成や修復は自動では行いません。Shelf 画面で本棚を確認してから、もう一度お試しください。」 | No binding written. |
 | `busy` | 「別の確認画面が開いています。閉じてからもう一度お試しください。」 | — |
+| `destination-error` (screen state: the confirmation could not complete) | the error copy of the command result | [もう一度試す] [保存先を選び直す] [Collector のセットアップをキャンセル]. No [次へ], no [閉じる]. Cancel only aborts the wizard; it does not roll back what is already registered. |
+| `destination-busy` (screen state: another confirmation is open) | the `busy` copy above | Same three buttons, same rules. |
 
 ### 4.5 Step D — place the extension and load it in Chrome
 
 On entering the step the app places `extension\` (if not already current) and
-shows the folder path in a read-only text field.
+shows no path (the absolute path is never passed to the renderer); the user reaches the folder with the buttons below.
 
 - Title: 「Chrome に Collector を読み込む」
 - Intro: 「拡張機能のフォルダーを用意しました。次の手順で Chrome に読み込んでください。」
-- Path field + [パスをコピー] (live region: 「パスをコピーしました」) + [フォルダーを開く]
+- [パスをコピー] (live region: 「パスをコピーしました」) + [フォルダーを開く]. There is no path field (replaced; see the multi-browser design §2.3).
 - Numbered steps (`<ol>`):
   1. 「［Chrome で拡張機能の画面を開く］を押します。Chrome に「拡張機能」の画面が開きます。」 Button: [Chrome で拡張機能の画面を開く]. Sub-note: 「開かない場合は、Chrome のアドレスバーに chrome://extensions と入力して Enter キーを押してください。」 [アドレスをコピー]
   2. 「画面の右上にある「デベロッパー モード」をオンにします。」
@@ -535,7 +537,7 @@ Done: 「MAGINALIA Collector の準備ができました。」 / 「Web ペー�
 - No automatic step advance on a timer; polling never moves focus.
 - Text labels on every button (no icon-only controls); state is not conveyed by
   colour alone; `prefers-reduced-motion` disables the progress animation.
-- The path is a read-only `<input>` so screen readers and keyboard selection work.
+- Step D has no path field (replaced by [パスをコピー] / [フォルダーを開く]); both are real buttons with text labels and visible focus.
 - Chrome's own pages are outside our control; the numbered text steps are the
   accessible alternative to screenshots.
 
