@@ -184,7 +184,7 @@ const EDGE_ROW: CollectorUnverifiedBrowserSpec = {
   extensionsPage: { displayUrl: "edge://extensions", launchArguments: ["edge://extensions/"] },
   ui: {
     developerModeLabel: "開発者モード",
-    developerModeLocation: "画面の左側",
+    developerModeLocation: "画面左のメニューの下部",
     loadUnpackedLabel: "展開して読み込み",
     reloadLabel: "再読み込み",
   },
