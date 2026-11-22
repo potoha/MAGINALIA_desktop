@@ -1,6 +1,7 @@
 node_modules/
 apps/desktop/dist/
 apps/desktop/release/
+apps/desktop/release-new/
 # node-gyp output for the Windows named-mutex addon spike. The shipped binary is
 # built in CI and copied into the installer; build/ is never committed.
 apps/desktop/native/shelf-mutex/build/
