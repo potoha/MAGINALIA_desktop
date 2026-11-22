@@ -21,7 +21,7 @@ import {
 } from "./collector-integration-apply-types.js";
 import { COLLECTOR_BROWSERS, type CollectorBrowserSpec } from "./collector-browser-table.js";
 import { FakeCollectorRegistryAdapter } from "./collector-registry-adapter.test-helper.js";
-import { FakeCollectorFileSystem, FIXTURE_NOW, fakeKey, sha256 } from "./collector-integration.test-helper.js";
+import { CHROME_ONLY_BROWSER_TABLE, FakeCollectorFileSystem, FIXTURE_NOW, fakeKey, sha256 } from "./collector-integration.test-helper.js";
 import { safeFacts } from "./collector-host-fixture.test-helper.js";
 import type { PathSecurityFacts } from "./collector-path-security.js";
 
@@ -306,7 +306,7 @@ export interface ApplyFixture {
   payload: unknown;
   now: Date;
   isolated: boolean;
-  /** Browser table the inspection and apply use; `undefined` = the product table (only Chrome verified). */
+  /** Browser table the inspection and apply use; `undefined` = the product table (Chrome and Edge verified). Default: Chrome only. */
   browserTable: readonly CollectorBrowserSpec[] | undefined;
   selfCheckResult: HostSelfCheckResult | "throw";
   suffixCounter: number;
@@ -317,7 +317,7 @@ export interface ApplyFixture {
  * A machine where the program folder does not exist yet, the packaged payload sits in
  * `C:\res`, and the user directories (`LocalAppData`, `Programs`) exist with safe ACLs.
  */
-export function createApplyFixture(options: { readonly programsExists?: boolean; readonly browserTable?: readonly CollectorBrowserSpec[] } = {}): ApplyFixture {
+export function createApplyFixture(options: { readonly programsExists?: boolean; readonly browserTable?: readonly CollectorBrowserSpec[] | undefined } = {}): ApplyFixture {
   const registry = new FakeCollectorRegistryAdapter();
   const fileSystem = new FakeApplyFileSystem();
   const userProgramFiles = registry.knownFolders.UserProgramFiles;
@@ -345,7 +345,7 @@ export function createApplyFixture(options: { readonly programsExists?: boolean;
     payload: applyDescriptor(),
     now: FIXTURE_NOW,
     isolated: false,
-    browserTable: options.browserTable,
+    browserTable: "browserTable" in options ? options.browserTable : CHROME_ONLY_BROWSER_TABLE,
     selfCheckResult: { status: "ok", protocol: COLLECTOR_PROTOCOL },
     suffixCounter: 0,
     get deps(): CollectorIntegrationApplyDependencies {

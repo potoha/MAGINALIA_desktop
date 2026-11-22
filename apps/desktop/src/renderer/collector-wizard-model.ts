@@ -1158,7 +1158,7 @@ export interface WizardAction {
 }
 
 /**
- * The buttons of the current screen, in reading order, with labels and enabled flags. Browser
+ * The buttons of the current screen, in DOM/Tab order (戻る, あとで, secondary, primary), with labels and enabled flags. Browser
  * dependent buttons (open the extensions page, copy the address) are listed only when they apply.
  */
 export function wizardActions(state: WizardState): readonly WizardAction[] {
@@ -1290,7 +1290,10 @@ export function wizardActions(state: WizardState): readonly WizardAction[] {
   if (isBlocking(state) && state.inFlight?.cancelOffered === true) {
     add("cancelInFlight", copy.common.cancelWait, { type: "cancelInFlight" });
   }
-  return actions;
+  // One shared rule for every screen: 戻る, あとで, other (secondary) actions, then the primary one last.
+  // The sort is stable, so the secondary actions keep the order they were added in.
+  const rank = (action: WizardAction): number => (action.id === "back" ? 0 : action.id === "later" ? 1 : action.primary ? 3 : 2);
+  return actions.sort((a, b) => rank(a) - rank(b));
 }
 
 // ----- Views for the panel (pure, derived) -------------------------------------------------------

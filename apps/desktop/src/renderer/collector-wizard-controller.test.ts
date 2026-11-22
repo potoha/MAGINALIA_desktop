@@ -477,7 +477,7 @@ describe("wizard controller: in-flight watchdog and cancel", () => {
     rig.panel.press("confirmDestination");
     rig.configures[0]!.resolve({ kind: "busy" });
     await settle();
-    expect(rig.panel.view.buttons.map((button) => button.id)).toEqual(["confirmDestination", "chooseDestinationAgain", "cancelSetup"]);
+    expect(rig.panel.view.buttons.map((button) => button.id)).toEqual(["chooseDestinationAgain", "cancelSetup", "confirmDestination"]);
     rig.panel.press("chooseDestinationAgain");
     expect(rig.configures).toHaveLength(2);
     expect(rig.panel.view.busy).toBe(true);

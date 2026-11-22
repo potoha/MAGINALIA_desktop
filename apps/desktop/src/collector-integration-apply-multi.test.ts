@@ -1,6 +1,7 @@
 /**
  * Multi-browser apply (design S4: sections 3.3, 5.2, 5.4, 5.5, 5.6, 5.7 and the review findings
- * a-d of S3). The product table has only Chrome `verified`; these cases inject a table in which Edge
+ * a-d of S3). The product table has Chrome and Edge `verified`; the apply fixture defaults to a Chrome-only table
+ * (single-target mechanics) and these cases name the table they need. They inject a table in which Edge
  * is verified too (a one-field change in the real table). Nothing touches a real registry or path.
  *
  * Crash-point sweeps (design 5.7 scenarios 1, 3, 4, 5) live in `collector-integration-apply-fault.test.ts`.
@@ -68,7 +69,16 @@ describe("setup registers every target of the expected set (design 5.2)", () => 
     expect(result.inspection.expectedTargets).toEqual(["chrome", "edge"]);
   });
 
-  it("with the product table (only Chrome verified) it writes exactly one key, as before", async () => {
+  it("with the product table (Chrome and Edge verified) it registers both keys", async () => {
+    const fixture = createApplyFixture({ browserTable: undefined });
+    const result = await run(fixture, { action: "setup" });
+    expect(result).toMatchObject({ outcome: "applied", state: "ready" });
+    expect(result.targets).toEqual([{ target: "chrome", result: "registered" }, { target: "edge", result: "registered" }]);
+    expect(fixture.registry.registrations).toMatchObject({ chrome: "ours", edge: "ours" });
+    expect(registeredTargetsOf(fixture)).toEqual(["chrome", "edge"]);
+  });
+
+  it("with a Chrome-only table (Edge unverified) it writes exactly one key, as before", async () => {
     const fixture = createApplyFixture();
     const result = await run(fixture, { action: "setup" });
     expect(result.targets).toEqual([{ target: "chrome", result: "registered" }, { target: "edge", result: "not-expected" }]);
@@ -236,7 +246,7 @@ describe("registration-only refresh (design 5.4)", () => {
 
 describe("design 5.7 scenario 5 / S3 finding (b): remove over all writable targets", () => {
   it("removes our Edge key even though Edge is not verified (E = [chrome]); reverse registry order", async () => {
-    const fixture = createApplyFixture(); // product table: E = [chrome]
+    const fixture = createApplyFixture(); // Chrome-only table: E = [chrome]
     await run(fixture, { action: "setup" });
     fixture.registry.registrations.edge = "ours";
     fixture.fileSystem.registryLog.length = 0;

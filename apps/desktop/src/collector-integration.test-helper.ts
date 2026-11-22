@@ -13,6 +13,7 @@ import type {
   CollectorIntegrationFileSystem,
 } from "./collector-integration-types.js";
 import type { CollectorIntegrationInspectDependencies } from "./collector-integration.js";
+import { COLLECTOR_BROWSERS, type CollectorBrowserSpec } from "./collector-browser-table.js";
 import {
   COLLECTOR_ALLOWED_ORIGINS,
   COLLECTOR_EXTENSION_ID,
@@ -23,6 +24,15 @@ import {
 import { FakeCollectorRegistryAdapter } from "./collector-registry-adapter.test-helper.js";
 import { safeFacts } from "./collector-host-fixture.test-helper.js";
 import type { PathSecurityFacts } from "./collector-path-security.js";
+
+/**
+ * The product table with only Chrome `verified` (Edge switched back to `unverified`). The product table has had
+ * Edge verified since the Edge ProgId measurement; most integration tests exercise single-target mechanics and
+ * keep this Chrome-only world through the fixtures. Tests of the Chrome + Edge behavior inject the product table
+ * (`browserTable: undefined`) or `tableWithVerified("chrome", "edge")`.
+ */
+export const CHROME_ONLY_BROWSER_TABLE: readonly CollectorBrowserSpec[] = COLLECTOR_BROWSERS.map((row) =>
+  row.id === "edge" ? ({ ...row, verification: "unverified" } as CollectorBrowserSpec) : row);
 
 export const sha256 = (text: string | Uint8Array): string => createHash("sha256").update(text).digest("hex");
 
@@ -147,6 +157,8 @@ export interface IntegrationFixture {
   readonly integrationDirectory: string;
   payload: unknown;
   payloadFails: boolean;
+  /** Browser table the inspection reads; `undefined` = the product table (Chrome and Edge verified). Default: Chrome only. */
+  browserTable: readonly CollectorBrowserSpec[] | undefined;
   now: Date;
   isolated: boolean;
 }
@@ -191,6 +203,7 @@ export function createIntegrationFixture(options: { readonly installed?: boolean
     integrationDirectory,
     payload: payloadDescriptorFixture(),
     payloadFails: false,
+    browserTable: CHROME_ONLY_BROWSER_TABLE,
     now: FIXTURE_NOW,
     isolated: false,
     get dependencies(): CollectorIntegrationInspectDependencies {
@@ -212,6 +225,7 @@ export function createIntegrationFixture(options: { readonly installed?: boolean
         },
         now: () => fixture.now,
         e2eIsolationActive: fixture.isolated,
+        ...(fixture.browserTable === undefined ? {} : { browserTable: fixture.browserTable }),
       };
     },
   };

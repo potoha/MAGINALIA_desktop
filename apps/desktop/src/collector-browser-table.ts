@@ -164,12 +164,13 @@ const CHROME_ROW: CollectorVerifiedBrowserSpec = {
   },
 };
 
-// Edge stays "unverified" until spike Phase 1 confirms its stable ProgId (design 1.4: "verified 予定").
-// Flipping it to "verified" is a one-line change plus `progIdPattern: "measured"`; the gate enforces that.
-const EDGE_ROW: CollectorUnverifiedBrowserSpec = {
+// Edge is "verified": the stable default-browser ProgId `MSEdgeHTM` was measured on a real machine
+// (2026-11-22, UserChoiceLatest, https and http) and the extension ID matched under Edge. The
+// download URL was opened in Edge (2026-11-23). The other presentation fields stay "unverified".
+const EDGE_ROW: CollectorVerifiedBrowserSpec = {
   id: "edge",
   displayName: "Microsoft Edge",
-  verification: "unverified",
+  verification: "verified",
   progIdPattern: "^MSEdgeHTM$",
   executable: {
     fileName: "msedge.exe",
@@ -191,7 +192,7 @@ const EDGE_ROW: CollectorUnverifiedBrowserSpec = {
   store: "edge-add-ons",
   downloadUrl: "https://www.microsoft.com/edge/download",
   evidence: {
-    progIdPattern: "unverified",
+    progIdPattern: "measured",
     executable: "measured",
     knownFolders: "measured",
     lookupOrder: "vendor-doc",
@@ -201,7 +202,7 @@ const EDGE_ROW: CollectorUnverifiedBrowserSpec = {
     extensionsPage: "unverified",
     ui: "unverified",
     store: "unverified",
-    downloadUrl: "unverified",
+    downloadUrl: "measured",
   },
 };
 
@@ -322,6 +323,7 @@ export interface CollectorBrowserDetection {
 export type CollectorRecommendationReason =
   | "default-supported"
   | "default-unsupported"
+  | "default-not-chromium"
   | "default-unverified"
   | "default-not-installed"
   | "default-unknown"
@@ -377,7 +379,7 @@ function defaultReason(
   detectionOf: (id: CollectorBrowserId) => CollectorBrowserDetection,
 ): CollectorRecommendationReason {
   if (defaultBrowser === "unknown") return "default-unknown";
-  if (defaultBrowser === "other") return "default-unsupported";
+  if (defaultBrowser === "other") return "default-not-chromium"; // Firefox, IE, Safari, legacy Edge (AppX), ...
   if (defaultBrowser === "other-chromium") return "default-unverified";
   if (defaultRow === undefined) return "default-unsupported";
   if (defaultRow.verification !== "verified") return "default-unverified";

@@ -355,14 +355,13 @@ class DomWizardPanel implements WizardPanel {
     }
     this.body.replaceChildren(...blocks);
 
-    const tools = view.buttons.filter((button) => button.group === "tools");
-    const nav = view.buttons.filter((button) => button.group === "nav");
+    // One row, in view order: Tab order equals visual order (戻る, あとで, secondary, primary).
+    const nav = view.buttons.filter((button) => button.group !== "inline");
     const rows: HTMLElement[] = [];
-    for (const [name, group] of [["tools", tools], ["nav", nav]] as const) {
-      if (group.length === 0) continue;
+    if (nav.length > 0) {
       const row = this.doc.createElement("div");
-      row.className = `collector-wizard-actions-${name}`;
-      row.append(...group.map((button) => this.buildButton(button)));
+      row.className = "collector-wizard-actions-nav";
+      row.append(...nav.map((button) => this.buildButton(button)));
       rows.push(row);
     }
     this.actions.replaceChildren(...rows);

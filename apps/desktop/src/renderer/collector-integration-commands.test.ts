@@ -83,10 +83,10 @@ describe("Collector integration commands", () => {
       .toBe("ブラウザーの拡張機能の画面を開けませんでした。対応しているブラウザーが見つかりません。");
   });
 
-  it("browser-required lists the browsers a setup accepts today", () => {
+  it("browser-required lists the browsers a setup accepts today (Edge and Chrome)", () => {
     const status = { applyInProgress: false } as never;
     const line = collectorResponseProblem({ kind: "browser-required", status });
-    expect(line).toBe("対応しているブラウザー（Google Chrome）が見つからないため、Collector 連携を設定していません。");
+    expect(line).toBe("対応しているブラウザー（Microsoft Edge、Google Chrome）が見つからないため、Collector 連携を設定していません。");
   });
 
   it("dismiss needs a notice id argument", async () => {

@@ -51,6 +51,9 @@ function withVerified(ids: readonly CollectorBrowserId[]): readonly CollectorBro
   return COLLECTOR_BROWSERS.map((row) => (ids.includes(row.id) ? ({ ...row, verification: "verified" } as CollectorBrowserSpec) : row));
 }
 
+/** The product table with Edge switched back to `unverified`: the Chrome-only copy. */
+const CHROME_ONLY_TABLE: readonly CollectorBrowserSpec[] = COLLECTOR_BROWSERS.map((row) => (row.id === "edge" ? ({ ...row, verification: "unverified" } as CollectorBrowserSpec) : row));
+
 const BASE: WizardCopyContext = { browser: "chrome", recommended: "chrome", preferred: null, defaultBrowser: "chrome", loadedVersion: null, placedVersion: null };
 
 describe("wizard copy: no unresolved placeholder", () => {
@@ -86,7 +89,7 @@ describe("wizard copy: no unresolved placeholder", () => {
 
   it("has a reason entry for every recommendation reason", () => {
     expect(Object.keys(buildWizardCopy(BASE).stepA.reasons).sort()).toEqual(
-      ["default-not-installed", "default-supported", "default-unknown", "default-unsupported", "default-unverified", "detection-failed", "none-installed"],
+      ["default-not-chromium", "default-not-installed", "default-supported", "default-unknown", "default-unsupported", "default-unverified", "detection-failed", "none-installed"],
     );
   });
 });
@@ -131,13 +134,17 @@ describe("wizard copy: Japanese text is intact (UTF-8)", () => {
 
 describe("wizard copy: step A (multi-browser design 2.3)", () => {
   it("lists only verified browsers", () => {
-    expect(wizardSupportedBrowserList()).toBe("Google Chrome");
+    // The product table has Edge and Chrome verified (Vivaldi is not listed).
+    expect(wizardSupportedBrowserList()).toBe("Microsoft Edge、Google Chrome");
     expect(wizardSupportedBrowserList(withVerified(["edge", "chrome"]))).toBe("Microsoft Edge、Google Chrome");
-    expect(buildWizardCopy(BASE).stepA.body).toContain("Google Chrome で使えます");
-    const both = buildWizardCopy(BASE, withVerified(["edge", "chrome"]));
+    expect(wizardSupportedBrowserList(CHROME_ONLY_TABLE)).toBe("Google Chrome");
+    const both = buildWizardCopy(BASE);
     expect(both.stepA.body).toContain("Microsoft Edge、Google Chrome で使えます");
     expect(both.stepA.bullets[0]).toContain("Microsoft Edge と Google Chrome のどちらでも使えるように登録します。");
-    expect(buildWizardCopy(BASE).stepA.bullets[0]).not.toContain("のどちらでも");
+    const chromeOnly = buildWizardCopy(BASE, CHROME_ONLY_TABLE);
+    expect(chromeOnly.stepA.body).toContain("Google Chrome で使えます");
+    expect(chromeOnly.stepA.body).not.toContain("Microsoft Edge");
+    expect(chromeOnly.stepA.bullets[0]).not.toContain("のどちらでも");
   });
 
   it("fills the recommended and default browser names", () => {
@@ -145,6 +152,9 @@ describe("wizard copy: step A (multi-browser design 2.3)", () => {
     expect(copy.stepA.reasons["default-supported"].lead).toBe("ふだんお使いのブラウザー（Microsoft Edge）で使えます。");
     expect(copy.stepA.reasons["default-supported"].detail).toBe("Microsoft Edge に Collector を入れることをおすすめします。");
     expect(copy.stepA.reasons["default-unsupported"].detail).toContain("Microsoft Edge をおすすめします。引用を集めるときは、Microsoft Edge で Web ページを開いてください。");
+    expect(copy.stepA.reasons["default-not-chromium"].lead).toBe("ふだんお使いのブラウザーは、Collector に対応していません。");
+    expect(copy.stepA.reasons["default-not-chromium"].detail).toBe("Collector は Chromium 系のブラウザーでだけ使えます。Microsoft Edge をおすすめします。引用を集めるときは、Microsoft Edge で Web ページを開いてください。");
+    expect(copy.stepA.reasons["default-unverified"].lead).toContain("動作をまだ確認していません");
     expect(copy.stepA.reasons["default-unverified"].detail).toContain("確認済みの Microsoft Edge をおすすめします。");
     expect(copy.stepA.reasons["default-not-installed"].lead).toContain("既定のブラウザーとして Microsoft Edge が設定されています");
     expect(copy.stepA.reasons["none-installed"].lead).toBe("対応しているブラウザー（Microsoft Edge、Google Chrome）が見つかりませんでした。");
@@ -155,6 +165,7 @@ describe("wizard copy: step A (multi-browser design 2.3)", () => {
   it("falls back to neutral names when no browser is known", () => {
     const copy = buildWizardCopy({ ...BASE, browser: null, recommended: null, defaultBrowser: "other" });
     expect(copy.stepA.reasons["default-unsupported"].detail).toContain("対応しているブラウザー をおすすめします");
+    expect(copy.stepA.reasons["default-not-chromium"].detail).toContain("対応しているブラウザー をおすすめします");
     expect(copy.stepA.reasons["default-not-installed"].lead).toContain("別のブラウザー が設定");
   });
 });

@@ -441,6 +441,10 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
           lead: "ふだんお使いのブラウザーには、Collector を入れられません。",
           detail: recommendThen,
         },
+        "default-not-chromium": {
+          lead: "ふだんお使いのブラウザーは、Collector に対応していません。",
+          detail: `Collector は Chromium 系のブラウザーでだけ使えます。${recommendThen}`,
+        },
         "default-unverified": {
           lead: "ふだんお使いのブラウザーでは、Collector の動作をまだ確認していません。",
           detail: `確認済みの ${recommendThen}`,

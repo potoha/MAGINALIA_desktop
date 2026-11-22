@@ -11,20 +11,19 @@ import type { CollectorApplyRequest } from "./collector-integration-apply-types"
 import { inspectCollectorIntegration } from "./collector-integration";
 import { createCollectorStartupRefresh } from "./collector-startup-refresh";
 import { DEFAULT_COLLECTOR_NOTICE_STATE, type CollectorNoticeState } from "./collector-integration-notices";
-import { HOST_SOURCE_FILES, SOURCE_EXTENSION_FOLDER, SOURCE_HOST_FOLDER, applyDescriptor, createApplyFixture, extensionSourceFiles, tableWithVerified, type ApplyFixture } from "./collector-integration-apply.test-helper";
+import { HOST_SOURCE_FILES, SOURCE_EXTENSION_FOLDER, SOURCE_HOST_FOLDER, applyDescriptor, createApplyFixture, extensionSourceFiles, type ApplyFixture } from "./collector-integration-apply.test-helper";
 import { COLLECTOR_HOST_EXECUTABLE_NAME } from "./collector-payload";
 
-const CHROME_EDGE = tableWithVerified("chrome", "edge");
 const statePath = (fixture: ApplyFixture): string => path.win32.join(fixture.programFolder, "integration-state.json");
 
-/** An RC3-style installation (Chrome only, v1 state); the expected table then grows to Chrome + Edge. */
+/** An RC3-style installation (Chrome only, v1 state); the product table (Chrome and Edge verified) then expects Edge too. */
 async function rc3Installation(): Promise<ApplyFixture> {
   const fixture = createApplyFixture();
   expect((await applyCollectorIntegration({ action: "setup" }, fixture.deps)).outcome).toBe("applied");
   const state = JSON.parse(fixture.fileSystem.text(statePath(fixture))) as Record<string, unknown>;
   delete state.registeredTargets;
   fixture.fileSystem.setBytes(statePath(fixture), `${JSON.stringify({ ...state, version: 1 }, null, 2)}\n`);
-  fixture.browserTable = CHROME_EDGE;
+  fixture.browserTable = undefined; // the product table
   return fixture;
 }
 

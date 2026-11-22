@@ -395,10 +395,18 @@ describe("wizard panel: buttons", () => {
     rig.panel.render(buildWizardView(atStepD().state));
     const copy = buttonOf(rig, "copyAddress");
     expect(copy.parent?.tagName).toBe("li");
-    expect(buttonOf(rig, "copyPath").parent?.className).toBe("collector-wizard-actions-tools");
+    expect(buttonOf(rig, "copyPath").parent?.className).toBe("collector-wizard-actions-nav");
     expect(buttonOf(rig, "loaded").parent?.className).toBe("collector-wizard-actions-nav");
     copy.dispatch(makeEvent("click"));
     expect(rig.events).toEqual([{ type: "copyAddress" }]);
+  });
+
+  it("step D: Tab order (DOM order) is 戻る, あとで, the tools, then the primary 読み込みました", () => {
+    const rig = setup();
+    rig.panel.render(buildWizardView(atStepD().state));
+    const nav = rig.dialog.findAll((element) => element.tagName === "button" && element.parent?.className === "collector-wizard-actions-nav").map((button) => button.dataset.action);
+    expect(nav.slice(0, 2)).toEqual(["back", "later"]);
+    expect(nav[nav.length - 1]).toBe("loaded");
   });
 
   it("the disclosure summary is focusable and the checklist renders as a list", () => {
@@ -426,12 +434,12 @@ describe("wizard panel: failure screens and the in-flight watchdog", () => {
     for (const kind of ["error", "busy"] as const) {
       const rig = setup();
       rig.panel.render(buildWizardView(destinationError(kind).state));
-      expect(actionIds(rig)).toEqual(["confirmDestination", "chooseDestinationAgain", "cancelSetup"]);
+      expect(actionIds(rig)).toEqual(["chooseDestinationAgain", "cancelSetup", "confirmDestination"]);
       expect(buttonOf(rig, "confirmDestination").textContent).toBe("もう一度試す");
       expect(buttonOf(rig, "chooseDestinationAgain").textContent).toBe("保存先を選び直す");
       expect(buttonOf(rig, "cancelSetup").textContent).toBe("Collector のセットアップをキャンセル");
-      for (const id of ["confirmDestination", "chooseDestinationAgain", "cancelSetup"]) buttonOf(rig, id).dispatch(makeEvent("click"));
-      expect(rig.events).toEqual([{ type: "confirmDestination" }, { type: "chooseDestinationAgain" }, { type: "later" }]);
+      for (const id of ["chooseDestinationAgain", "cancelSetup", "confirmDestination"]) buttonOf(rig, id).dispatch(makeEvent("click"));
+      expect(rig.events).toEqual([{ type: "chooseDestinationAgain" }, { type: "later" }, { type: "confirmDestination" }]);
       expect(rig.dialog.find((element) => element.tagName === "button" && ["閉じる", "次へ"].includes(element.textContent))).toBeUndefined();
     }
   });

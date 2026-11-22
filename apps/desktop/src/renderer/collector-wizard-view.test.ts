@@ -445,8 +445,8 @@ describe("wizard view: steps D and E and the done screen", () => {
       send(h, { type: "confirmDestination" });
       send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: result as never });
       const v = view(h);
-      expect(labels(v)).toEqual(["もう一度試す", "保存先を選び直す", "Collector のセットアップをキャンセル"]);
-      expect(v.buttons.map((button) => button.event.type)).toEqual(["confirmDestination", "chooseDestinationAgain", "later"]);
+      expect(labels(v)).toEqual(["保存先を選び直す", "Collector のセットアップをキャンセル", "もう一度試す"]);
+      expect(v.buttons.map((button) => button.event.type)).toEqual(["chooseDestinationAgain", "later", "confirmDestination"]);
       expect(v.buttons.every((button) => button.enabled)).toBe(true);
       expect(v.live.alert).toHaveLength(1);
       expectClean(v);
@@ -486,5 +486,90 @@ describe("wizard view: steps D and E and the done screen", () => {
     const closed: WizardState = reduceWizard(h.state, { type: "later", now: T0 }).state;
     expect(closed.closed).toBe("later");
     expectClean(buildWizardView(closed));
+  });
+});
+
+describe("wizard view: button order (戻る → あとで → その他 → 主操作)", () => {
+  // Shared rule: rank 0 = back, 1 = later, 2 = secondary, 3 = primary. DOM order is Tab order.
+  const rankOf = (button: WizardView["buttons"][number]): number => (button.id === "back" ? 0 : button.id === "later" ? 1 : button.primary ? 3 : 2);
+  const ids = (v: WizardView): string[] => v.buttons.filter((button) => button.group !== "inline").map((button) => button.id);
+  const expectOrdered = (v: WizardView): void => {
+    const ranks = v.buttons.filter((button) => button.group !== "inline").map(rankOf);
+    expect(ranks).toEqual([...ranks].sort((a, b) => a - b));
+  };
+
+  it("A: あとで before the primary 次へ", () => {
+    const v = view(atStepA());
+    expect(ids(v)).toEqual(["later", "next"]);
+    expectOrdered(v);
+  });
+
+  it("A without any installed browser: あとで, the download/recheck/continue side actions, no primary", () => {
+    const h = atStepA({ browsers: { recommended: null, recommendationReason: "none-installed", entries: [entry("chrome", { installed: "not-found" })] } });
+    const v = view(h);
+    expect(ids(v)[0]).toBe("later");
+    expectOrdered(v);
+  });
+
+  it("B: 戻る, あとで, then the primary register", () => {
+    const v = view(atStepB());
+    expect(ids(v)).toEqual(["back", "later", "register"]);
+    expectOrdered(v);
+  });
+
+  it("C before confirming: 戻る, あとで, then the primary confirm", () => {
+    const v = view(atStepC());
+    expect(ids(v)).toEqual(["back", "later", "confirmDestination"]);
+    expectOrdered(v);
+  });
+
+  it("C configured: 戻る, あとで, then the primary 次へ", () => {
+    const h = atStepC();
+    send(h, { type: "confirmDestination" });
+    send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "configured", writesEnabled: true } });
+    const v = view(h);
+    expect(ids(v)).toEqual(["back", "later", "next"]);
+    expectOrdered(v);
+  });
+
+  it("C destination-error / destination-busy: no 戻る / あとで, the primary retry is last", () => {
+    for (const kind of ["error", "busy"] as const) {
+      const h = atStepC();
+      send(h, { type: "confirmDestination" });
+      send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind } as never });
+      expect(ids(view(h))).toEqual(["chooseDestinationAgain", "cancelSetup", "confirmDestination"]);
+    }
+  });
+
+  it("D placed: 戻る, あとで, the tools (secondary), then the primary 読み込んだ", () => {
+    const v = view(atStepD());
+    const order = ids(v);
+    expect(order.slice(0, 2)).toEqual(["back", "later"]);
+    expect(order[order.length - 1]).toBe("loaded");
+    expect(order).toContain("copyPath");
+    expectOrdered(v);
+  });
+
+  it("D folder missing: 戻る, あとで, then the primary retry", () => {
+    const v = view(atStepD(false));
+    expect(ids(v)).toEqual(["back", "later", "retryPlacement"]);
+  });
+
+  it("E waiting: 戻る, あとで", () => {
+    const v = view(atStepE());
+    expect(ids(v)).toEqual(["back", "later"]);
+  });
+
+  it("E timed out: 戻る, あとで, the confirmation (secondary), then the primary wait-again", () => {
+    const h = atStepE();
+    send(h, { type: "tick" }, T0 + 10_000 + 180_000);
+    expect(ids(view(h))).toEqual(["back", "later", "userConfirmed", "waitAgain"]);
+  });
+
+  it("E connected: 戻る, then the primary finish", () => {
+    const h = atStepE();
+    respond(h, connection(CONNECTED));
+    const v = view(h);
+    expect(ids(v)).toEqual(["back", "finish"]);
   });
 });

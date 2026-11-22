@@ -24,6 +24,7 @@ import {
   createIntegrationFixture,
   payloadDescriptorFixture,
   stateFileText,
+  CHROME_ONLY_BROWSER_TABLE,
   type IntegrationFixture,
 } from "./collector-integration.test-helper";
 
@@ -38,9 +39,13 @@ function tableWithVerified(...ids: readonly string[]): readonly CollectorBrowser
 }
 
 const CHROME_EDGE = tableWithVerified("chrome", "edge");
+/** Edge switched back to `unverified`: exercises the unverified-row paths and the single-target world. */
+const CHROME_ONLY = CHROME_ONLY_BROWSER_TABLE;
 
 function inspectWith(fixture: IntegrationFixture, table?: readonly CollectorBrowserSpec[], options?: { verifyFileHashes?: boolean }): Promise<CollectorIntegrationInspection> {
-  return inspectCollectorIntegration(table === undefined ? fixture.dependencies : { ...fixture.dependencies, browserTable: table }, options);
+  // `undefined` = the product table (Chrome and Edge verified); the fixture's own default is Chrome only.
+  fixture.browserTable = table;
+  return inspectCollectorIntegration(fixture.dependencies, options);
 }
 
 const p = (fixture: IntegrationFixture, ...parts: string[]): string => path.win32.join(fixture.programFolder, ...parts);
@@ -229,14 +234,14 @@ describe("inspection with Chrome and Edge verified (design 4.4)", () => {
     expect(result.registrations.edge).toBe("unknown");
   });
 
-  it("an unreadable target OUTSIDE E (Edge is unverified in the product table) does not make the inspection incomplete", async () => {
+  it("an unreadable target OUTSIDE E (Edge is unverified in a Chrome-only table) does not make the inspection incomplete", async () => {
     const fixture = readyBoth(["chrome"]);
     const original = fixture.registry.readCollectorHostRegistration.bind(fixture.registry);
     fixture.registry.readCollectorHostRegistration = (target) => {
       if (target === "edge") throw new Error("denied");
       return original(target);
     };
-    const result = await inspectWith(fixture);
+    const result = await inspectWith(fixture, CHROME_ONLY);
     expect(result).toMatchObject({ state: "ready", inspectionComplete: true });
     expect(result.registrations.edge).toBe("unknown");
   });
@@ -245,7 +250,9 @@ describe("inspection with Chrome and Edge verified (design 4.4)", () => {
 describe("policy-blocked scope (E_all) and an empty E", () => {
   it("policy-blocked with our Chrome key: registration is ours, state policy-blocked, expectedTargets stays empty", async () => {
     const fixture = readyBoth(["chrome"]);
+    // Edge is verified in the product table: policy-blocked needs every verified browser blocked, so block Edge's root too.
     fixture.registry.policies = policies({ nativeMessagingUserLevelHosts: 0 });
+    fixture.registry.edgePolicies = policies({ nativeMessagingUserLevelHosts: 0 });
     const result = await inspectWith(fixture);
     expect(result).toMatchObject({ state: "policy-blocked", registration: "ours", inspectionComplete: true, expectedTargets: [] });
   });
@@ -253,6 +260,7 @@ describe("policy-blocked scope (E_all) and an empty E", () => {
   it("policy-blocked with an unreadable Chrome key: inspection is incomplete (registry-read-failed) and registration unknown", async () => {
     const fixture = readyBoth(["chrome"]);
     fixture.registry.policies = policies({ nativeMessagingUserLevelHosts: 0 });
+    fixture.registry.edgePolicies = policies({ nativeMessagingUserLevelHosts: 0 });
     const original = fixture.registry.readCollectorHostRegistration.bind(fixture.registry);
     fixture.registry.readCollectorHostRegistration = (target) => {
       if (target === "chrome") throw new Error("denied");
@@ -272,20 +280,42 @@ describe("policy-blocked scope (E_all) and an empty E", () => {
   });
 });
 
-// ----- the product table: only Chrome counts today -------------------------------------------
+// ----- the product table: Chrome and Edge are verified ---------------------------------------
 
-describe("inspection with the product table (Chrome verified, Edge unverified)", () => {
+describe("inspection with the product table (Chrome and Edge verified)", () => {
+  it("E is [chrome, edge]; a ready installation registers both and Chromium is read for display only", async () => {
+    const fixture = readyBoth();
+    fixture.registry.registrations.chromium = "foreign";
+    const result = await inspectWith(fixture);
+    expect(result).toMatchObject({ state: "ready", expectedTargets: ["chrome", "edge"], registration: "ours", reasons: [] });
+    expect(result.registrations).toMatchObject({ chrome: "ours", edge: "ours", chromium: "foreign" });
+  });
+
+  it("a v1 state file with Chrome only is outdated: Edge was added to the expected set (registration-target-added)", async () => {
+    const result = await inspectWith(createIntegrationFixture());
+    expect(result).toMatchObject({ state: "outdated", registeredTargets: ["chrome"], expectedTargets: ["chrome", "edge"] });
+    expect(result.reasons).toContain("registration-target-added");
+  });
+
+  it("a foreign Edge key is a foreign-registration now that Edge is verified", async () => {
+    const fixture = readyBoth();
+    fixture.registry.registrations.edge = "foreign";
+    expect(await inspectWith(fixture)).toMatchObject({ state: "foreign-registration", reasons: ["registration-foreign"] });
+  });
+});
+
+describe("inspection with a Chrome-only table (Edge unverified)", () => {
   it("E is [chrome]; Edge and Chromium are read for display and never change the state", async () => {
     const fixture = createIntegrationFixture();
     fixture.registry.registrations.edge = "foreign";
     fixture.registry.registrations.chromium = "foreign";
-    const result = await inspectWith(fixture);
+    const result = await inspectWith(fixture, CHROME_ONLY);
     expect(result).toMatchObject({ state: "ready", expectedTargets: ["chrome"], registration: "ours" });
     expect(result.registrations).toMatchObject({ chrome: "ours", edge: "foreign", chromium: "foreign" });
   });
 
-  it("a v1 state file with Chrome only is ready: nothing was added (S3 does not change today's behaviour)", async () => {
-    const result = await inspectWith(createIntegrationFixture());
+  it("a v1 state file with Chrome only is ready: nothing was added", async () => {
+    const result = await inspectWith(createIntegrationFixture(), CHROME_ONLY);
     expect(result).toMatchObject({ state: "ready", registeredTargets: ["chrome"], reasons: [] });
   });
 
@@ -302,9 +332,10 @@ describe("inspection with the product table (Chrome verified, Edge unverified)",
     expect((await inspectWith(garbled)).registeredTargets).toBeNull();
   });
 
-  it("flipping Edge to verified is the only change that adds it (registry order, no duplicates)", async () => {
+  it("Edge's verification is the only difference that adds it (registry order, no duplicates)", async () => {
     const fixture = readyBoth();
-    expect((await inspectWith(fixture)).expectedTargets).toEqual(["chrome"]);
+    expect((await inspectWith(fixture, CHROME_ONLY)).expectedTargets).toEqual(["chrome"]);
+    expect((await inspectWith(fixture)).expectedTargets).toEqual(["chrome", "edge"]);
     expect((await inspectWith(fixture, CHROME_EDGE)).expectedTargets).toEqual(["chrome", "edge"]);
   });
 
@@ -348,15 +379,15 @@ describe("effective registration per browser", () => {
       if (target === "chromium") throw new Error("denied");
       return original(target);
     };
-    const result = await inspectWith(fixture);
+    const result = await inspectWith(fixture, CHROME_ONLY);
     expect(edgeEntry(result)?.effective).toEqual({ target: null, ownership: "unknown" });
     expect(result.state).toBe("ready"); // Chromium is outside E
   });
 
-  it("a foreign Edge key is reported for Edge but is not an aggregate problem while Edge is unverified", async () => {
+  it("a foreign Edge key is reported for Edge but is not an aggregate problem while Edge is unverified (Chrome-only table)", async () => {
     const fixture = createIntegrationFixture();
     fixture.registry.registrations.edge = "foreign";
-    const result = await inspectWith(fixture);
+    const result = await inspectWith(fixture, CHROME_ONLY);
     expect(edgeEntry(result)?.effective).toEqual({ target: "edge", ownership: "foreign" });
     expect(result.state).toBe("ready");
   });
@@ -430,7 +461,8 @@ describe("computeExpectedTargets", () => {
   const withVivaldi = [...tableWithVerified("chrome", "edge").filter((row) => row.id !== "vivaldi"), vivaldiWhenPresent];
 
   it("always-rows count regardless of installation; unverified rows never count", () => {
-    expect(computeExpectedTargets(COLLECTOR_BROWSERS, detected({ chrome: missing, edge: missing, vivaldi: missing }), null)).toEqual(["chrome"]);
+    expect(computeExpectedTargets(CHROME_ONLY, detected({ chrome: missing, edge: missing, vivaldi: missing }), null)).toEqual(["chrome"]);
+    expect(computeExpectedTargets(COLLECTOR_BROWSERS, detected({ chrome: missing, edge: missing, vivaldi: missing }), null)).toEqual(["chrome", "edge"]);
     expect(computeExpectedTargets(CHROME_EDGE, detected({ chrome: missing, edge: missing, vivaldi: missing }), null)).toEqual(["chrome", "edge"]);
   });
 
@@ -454,7 +486,7 @@ describe("inspection of a verified when-present browser", () => {
     ...(tableWithVerified("vivaldi").find((row) => row.id === "vivaldi") as CollectorBrowserSpec),
     nativeMessaging: { lookupOrder: ["vivaldi", "chrome"], ownTargets: ["vivaldi"], registration: "when-present" },
   };
-  const table = [...COLLECTOR_BROWSERS.filter((row) => row.id !== "vivaldi"), vivaldi];
+  const table = [...CHROME_ONLY.filter((row) => row.id !== "vivaldi"), vivaldi];
 
   function withAddon(fixture: IntegrationFixture): IntegrationFixture {
     fixture.registry.inspectableTargets = ["chrome", "edge", "chromium", "vivaldi"];
@@ -543,14 +575,14 @@ describe("browsers: default browser, detection and recommendation", () => {
     installEdge(fixture);
     installChrome(fixture);
     const result = await inspectWith(fixture);
-    expect(edgeEntry(result)).toMatchObject({ verification: "unverified", installed: "found", source: "app-paths-hklm-32" });
+    expect(edgeEntry(result)).toMatchObject({ verification: "verified", installed: "found", source: "app-paths-hklm-32" });
     expect(chromeEntry(result)).toMatchObject({ verification: "verified", installed: "found", source: "known-program-files" });
     expect(result.browsers.entries.find((entry) => entry.id === "vivaldi")).toMatchObject({ installed: "not-found", source: null });
     expect(result.browsers.entries.map((entry) => entry.id)).toEqual(["edge", "chrome", "vivaldi"]);
     expect(JSON.stringify(result.browsers)).not.toMatch(/[A-Za-z]:\\|tester|AppData|Program Files|\.exe|\\\\/iu);
   });
 
-  it("default Vivaldi (unverified) with Chrome installed recommends Chrome, the only verified row", async () => {
+  it("default Vivaldi (unverified) with only Chrome installed recommends Chrome, the only installed verified row", async () => {
     const fixture = createIntegrationFixture();
     installChrome(fixture);
     fixture.registry.defaultBrowserProgId = "VivaldiHTM";
@@ -578,7 +610,7 @@ describe("browsers: default browser, detection and recommendation", () => {
   });
 
   it("nothing installed: no recommendation; a failing default read is unknown and never blocks", async () => {
-    const fixture = createIntegrationFixture();
+    const fixture = readyBoth(); // both verified targets registered, so the state is ready under the product table
     fixture.registry.failNext.readDefaultBrowserProgId = new Error("denied");
     const result = await inspectWith(fixture);
     expect(result.browsers).toMatchObject({ defaultBrowser: "unknown", recommended: null, recommendationReason: "none-installed" });
