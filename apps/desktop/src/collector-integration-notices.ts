@@ -85,12 +85,12 @@ export function buildUpdatedNotice(extensionVersion: string, createdAt: string):
     id: COLLECTOR_NOTICE_IDS.updated,
     kind: "updated" as const,
     title: `MAGINALIA Collector を新しい版（${extensionVersion}）に更新しました。`,
-    detail: "Chrome の拡張機能の画面で MAGINALIA Collector の［更新］（↻）を押すか、Chrome を再起動すると反映されます。",
+    detail: "ブラウザーの拡張機能の画面で MAGINALIA Collector の［更新］（↻）を押すか、ブラウザーを再起動すると反映されます。",
     extensionVersion,
     createdAt,
     clearsWhen: "contact-reports-extension-version" as const,
     actions: Object.freeze([
-      { commandId: COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND_ID, label: "Chrome で拡張機能の画面を開く" },
+      { commandId: COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND_ID, label: "ブラウザーで拡張機能の画面を開く" },
       { commandId: COLLECTOR_DISMISS_NOTICE_COMMAND_ID, label: "閉じる", argument: { noticeId: COLLECTOR_NOTICE_IDS.updated } },
     ]),
   });
@@ -102,7 +102,7 @@ export function buildRepairNotice(state: CollectorRepairNoticeState): CollectorN
     id: COLLECTOR_NOTICE_IDS.repair,
     kind: "repair" as const,
     title: "Collector 連携の確認が必要です。",
-    detail: "Chrome から本棚へ引用を保存する連携が、この MAGINALIA の設定と一致していません。自動では変更していません。",
+    detail: "ブラウザーから本棚へ引用を保存する連携が、この MAGINALIA の設定と一致していません。自動では変更していません。",
     state,
     clearsWhen: "state-recovers-or-dismissed" as const,
     actions: Object.freeze([
