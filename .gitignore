@@ -19,3 +19,8 @@ sidecars/reviewer/.venv/
 sidecars/reviewer/.pytest-tmp/
 sidecars/reviewer/.pytest_cache/
 
+
+# Session handoffs, reports and human-task kits (kept locally, not committed)
+docs/handoff-*.md
+docs/report-*.md
+docs/human-tasks-*/
