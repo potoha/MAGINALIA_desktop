@@ -302,7 +302,19 @@ describe("wizard panel: radiogroup", () => {
     expect(chrome.getAttribute("aria-checked")).toBe("true");
     expect(chrome.getAttribute("tabindex")).toBe("0");
     const labelId = chrome.getAttribute("aria-labelledby")!;
-    expect(byId(rig, labelId).textContent).toContain("Google Chrome");
+    expect(byId(rig, labelId).textContent).toBe("Chrome で登録（おすすめ）");
+  });
+
+  it("with a Vivaldi default the radios read 通常のブラウザーで登録（Vivaldi）, Chrome, Edge, and only the recommended one is checked and tabbable", () => {
+    const rig = setup();
+    const verified = { verification: "verified" } as const;
+    const h = atStepA({ browsers: { defaultBrowser: "vivaldi", recommended: "vivaldi", recommendationReason: "default-supported", entries: [entry("edge", verified), entry("chrome", verified), entry("vivaldi", verified)] } });
+    rig.panel.render(buildWizardView(h.state));
+    const list = radios(rig);
+    expect(list.map((radio) => radio.dataset.browser)).toEqual(["vivaldi", "chrome", "edge"]);
+    expect(list.map((radio) => byId(rig, radio.getAttribute("aria-labelledby")!).textContent)).toEqual(["通常のブラウザーで登録（Vivaldi）（おすすめ）", "Chrome で登録", "Edge で登録"]);
+    expect(list.map((radio) => radio.getAttribute("aria-checked"))).toEqual(["true", "false", "false"]);
+    expect(list.map((radio) => radio.getAttribute("tabindex"))).toEqual(["0", "-1", "-1"]);
   });
 
   it("a policy-blocked option is aria-disabled and not tabbable; its note is the description", () => {

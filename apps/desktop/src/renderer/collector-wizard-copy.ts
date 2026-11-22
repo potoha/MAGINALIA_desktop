@@ -26,6 +26,14 @@ export const WIZARD_EXTENSION_ID = "blgmoddncpknfnikdfnjelmdmphfgknf";
 
 export const WIZARD_STEP_COUNT = 5;
 
+/**
+ * The browsers the step A radiogroup always offers by name, in display order (owner decision
+ * 2026-11-23: 「Chrome で登録」 then 「Edge で登録」). Any other verified browser appears only as
+ * the single 「通常のブラウザーで登録」 choice, and only when it is the OS default browser.
+ */
+export const WIZARD_NAMED_BROWSER_IDS = ["chrome", "edge"] as const;
+export type WizardNamedBrowserId = (typeof WIZARD_NAMED_BROWSER_IDS)[number];
+
 /** 「手順 n / 5」 as text (not colour only). */
 export function wizardProgressLabel(stepNumber: number): string {
   return `手順 ${stepNumber} / ${WIZARD_STEP_COUNT}`;
@@ -135,8 +143,6 @@ export const WIZARD_MESSAGE_ROLE: Readonly<Record<WizardMessageId, WizardMessage
 export interface WizardCopyContext {
   /** The browser the user selected, or `null` (continuing without a detected browser: generic wording). */
   readonly browser: CollectorBrowserId | null;
-  /** The recommended browser of the latest inspection, or `null`. */
-  readonly recommended: CollectorBrowserId | null;
   /** Verified browsers an organization policy blocks (names for the all-blocked message). Default: none. */
   readonly blocked?: readonly CollectorBrowserId[];
   /** The browser the user chose last time (remembered by the main process), or `null`. */
@@ -174,7 +180,7 @@ function verifiedRows(table: Table): Table {
   return table.filter((row) => row.verification === "verified");
 }
 
-/** 「Microsoft Edge、Google Chrome」: verified rows in table order. */
+/** 「Microsoft Edge、Google Chrome、Vivaldi」: verified rows in table order. */
 export function wizardSupportedBrowserList(table: Table = COLLECTOR_BROWSERS): string {
   const names = verifiedRows(table).map((row) => row.displayName);
   return names.length === 0 ? "対応しているブラウザー" : names.join("、");
@@ -197,10 +203,6 @@ function addressPhrase(table: Table, id: CollectorBrowserId | null): string {
 
 function defaultBrowserName(table: Table, kind: CollectorDefaultBrowserKind): string {
   return rowOf(table, kind as CollectorBrowserId)?.displayName ?? "別のブラウザー";
-}
-
-function recommendedName(table: Table, id: CollectorBrowserId | null): string {
-  return rowOf(table, id)?.displayName ?? "対応しているブラウザー";
 }
 
 /** `{name}` style templates. Unknown keys are left in place so the placeholder test can see them. */
@@ -299,6 +301,10 @@ export interface WizardCopy {
     /** Shown beside a disabled 「次へ」 while no browser is selected (B3 addition: the reason a button is disabled). */
     readonly selectBrowserFirst: string;
     readonly optionRecommendedSuffix: string;
+    /** Radio labels of the two browsers that are always offered by name. */
+    readonly optionRegisterNamed: Readonly<Record<WizardNamedBrowserId, string>>;
+    /** Radio label of 「通常のブラウザー」: the OS default browser, named (only offered when it is neither Chrome nor Edge). */
+    readonly optionRegisterDefault: string;
     readonly optionPolicyBlocked: string;
     readonly optionDetectionUnknown: string;
     readonly previouslyChosen: string;
@@ -375,7 +381,6 @@ export interface WizardCopy {
 export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLECTOR_BROWSERS): WizardCopy {
   const name = browserName(table, context.browser);
   const address = addressPhrase(table, context.browser);
-  const rec = recommendedName(table, context.recommended);
   const defaultName = defaultBrowserName(table, context.defaultBrowser);
   const supported = wizardSupportedBrowserList(table);
   const verifiedNames = verifiedRows(table).map((row) => row.displayName);
@@ -389,8 +394,6 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
   const blockedNames = (context.blocked ?? []).map((id) => browserName(table, id));
   const blockedList = blockedNames.length === 0 ? GENERIC_BROWSER : blockedNames.join("、");
   const dragOk = selectedRow !== undefined && DRAG_LOAD_MEASURED[selectedRow.id];
-
-  const recommendThen = `${rec} をおすすめします。引用を集めるときは、${rec} で Web ページを開いてください。`;
 
   const downloadButtons = Object.fromEntries(
     table.map((row) => [row.id, `${row.displayName} のダウンロードページを開く`] as const),
@@ -417,7 +420,7 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
       ),
       bullets: [
         verifiedNames.length >= 2
-          ? `このパソコンのあなたのユーザーだけに、MAGINALIA 連携プログラムを登録します（管理者権限は不要です）。${verifiedNames.join(" と ")} のどちらでも使えるように登録します。`
+          ? `このパソコンのあなたのユーザーだけに、MAGINALIA 連携プログラムを登録します（管理者権限は不要です）。${verifiedNames.join("、")} のいずれでも使えるように登録します。`
           : "このパソコンのあなたのユーザーだけに、MAGINALIA 連携プログラムを登録します（管理者権限は不要です）。",
         "拡張機能のフォルダーを用意し、ブラウザーに読み込む手順をご案内します。",
         "保存先の本棚を確認していただきます。本棚のファイルは変更しません。",
@@ -426,6 +429,8 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
       radiogroupLabel: "Collector を使うブラウザー",
       selectBrowserFirst: "ブラウザーを選ぶと、次へ進めます。",
       optionRecommendedSuffix: "（おすすめ）",
+      optionRegisterNamed: { chrome: "Chrome で登録", edge: "Edge で登録" },
+      optionRegisterDefault: fill("通常のブラウザーで登録（{name}）", { name: defaultName }),
       optionPolicyBlocked: "組織の管理設定により使えません",
       optionDetectionUnknown: "確認できませんでした",
       previouslyChosen: fill("前回は {name} を選びました。", { name: browserName(table, context.preferred) }),
@@ -439,23 +444,23 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
         },
         "default-unsupported": {
           lead: "ふだんお使いのブラウザーには、Collector を入れられません。",
-          detail: recommendThen,
+          detail: "下の選択肢から、Collector を使うブラウザーを選んでください。",
         },
         "default-not-chromium": {
           lead: "ふだんお使いのブラウザーは、Collector に対応していません。",
-          detail: `Collector は Chromium 系のブラウザーでだけ使えます。${recommendThen}`,
+          detail: "Collector は Chromium 系のブラウザーでだけ使えます。下の選択肢から、Collector を使うブラウザーを選んでください。",
         },
         "default-unverified": {
           lead: "ふだんお使いのブラウザーでは、Collector の動作をまだ確認していません。",
-          detail: `確認済みの ${recommendThen}`,
+          detail: "下の選択肢から、Chrome か Edge を選んでください。",
         },
         "default-not-installed": {
           lead: fill("既定のブラウザーとして {name} が設定されていますが、プログラムが見つかりませんでした。", { name: defaultName }),
-          detail: fill("{name} をおすすめします。", { name: rec }),
+          detail: "下の選択肢から、Collector を使うブラウザーを選んでください。",
         },
         "default-unknown": {
           lead: "ふだんお使いのブラウザーを確認できませんでした。",
-          detail: fill("{name} をおすすめします。", { name: rec }),
+          detail: "下の選択肢から、Collector を使うブラウザーを選んでください。",
         },
         "none-installed": {
           lead: fill("対応しているブラウザー（{supported}）が見つかりませんでした。", { supported }),

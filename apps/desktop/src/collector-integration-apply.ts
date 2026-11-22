@@ -370,14 +370,16 @@ interface TargetPlan {
 
 const WRITABLE_TARGET_IDS: readonly CollectorRegistryTargetId[] = COLLECTOR_REGISTRY_TARGET_IDS.filter((id) => COLLECTOR_REGISTRY_TARGETS.some((target) => target.id === id && target.writable));
 
-/** Verified rows that a policy blocks right now. A policy that cannot be read never blocks (design 8.4). */
+/**
+ * Verified rows that a policy blocks right now. A policy that cannot be read never blocks (design 8.4).
+ * A row without a policy root is not evaluated and does not count in `verified` (see `aggregatePolicy`).
+ */
 function readBlockedBrowsers(deps: CollectorIntegrationApplyDependencies, table: readonly CollectorBrowserSpec[]): { readonly blocked: readonly CollectorBrowserId[]; readonly verified: number } {
   const blocked: CollectorBrowserId[] = [];
   let verified = 0;
   for (const row of table) {
-    if (row.verification !== "verified") continue;
+    if (row.verification !== "verified" || row.policyRoot === null) continue;
     verified += 1;
-    if (row.policyRoot === null) continue;
     try {
       if (evaluateChromePolicies(deps.registry.readBrowserPolicies(row.policyRoot)).blocked) blocked.push(row.id);
     } catch {

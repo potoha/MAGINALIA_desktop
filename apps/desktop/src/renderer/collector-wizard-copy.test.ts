@@ -15,6 +15,7 @@ import {
   WIZARD_EXTENSION_ID,
   WIZARD_MESSAGE_IDS,
   WIZARD_MESSAGE_ROLE,
+  WIZARD_NAMED_BROWSER_IDS,
   type WizardCopyContext,
 } from "./collector-wizard-copy";
 
@@ -35,11 +36,11 @@ function contexts(): WizardCopyContext[] {
   const browsers: Array<CollectorBrowserId | null> = [null, ...COLLECTOR_BROWSER_IDS];
   const list: WizardCopyContext[] = [];
   for (const browser of browsers) {
-    for (const recommended of browsers) {
+    for (const preferred of browsers) {
       for (const defaultBrowser of DEFAULT_KINDS) {
         for (const [loadedVersion, placedVersion] of VERSIONS) {
-          list.push({ browser, recommended, preferred: browser, defaultBrowser, loadedVersion, placedVersion });
-          list.push({ browser, recommended, preferred: null, blocked: [...COLLECTOR_BROWSER_IDS], defaultBrowser, loadedVersion, placedVersion });
+          list.push({ browser, preferred, defaultBrowser, loadedVersion, placedVersion });
+          list.push({ browser, preferred: null, blocked: [...COLLECTOR_BROWSER_IDS], defaultBrowser, loadedVersion, placedVersion });
         }
       }
     }
@@ -51,10 +52,15 @@ function withVerified(ids: readonly CollectorBrowserId[]): readonly CollectorBro
   return COLLECTOR_BROWSERS.map((row) => (ids.includes(row.id) ? ({ ...row, verification: "verified" } as CollectorBrowserSpec) : row));
 }
 
-/** The product table with Edge switched back to `unverified`: the Chrome-only copy. */
-const CHROME_ONLY_TABLE: readonly CollectorBrowserSpec[] = COLLECTOR_BROWSERS.map((row) => (row.id === "edge" ? ({ ...row, verification: "unverified" } as CollectorBrowserSpec) : row));
+/** The product table with only the named rows `verified` (the others switched back to `unverified`). */
+function onlyVerified(ids: readonly CollectorBrowserId[]): readonly CollectorBrowserSpec[] {
+  return COLLECTOR_BROWSERS.map((row) => ({ ...row, verification: ids.includes(row.id) ? "verified" : "unverified" }) as CollectorBrowserSpec);
+}
 
-const BASE: WizardCopyContext = { browser: "chrome", recommended: "chrome", preferred: null, defaultBrowser: "chrome", loadedVersion: null, placedVersion: null };
+/** Edge and Vivaldi switched back to `unverified`: the Chrome-only copy. */
+const CHROME_ONLY_TABLE: readonly CollectorBrowserSpec[] = onlyVerified(["chrome"]);
+
+const BASE: WizardCopyContext = { browser: "chrome", preferred: null, defaultBrowser: "chrome", loadedVersion: null, placedVersion: null };
 
 describe("wizard copy: no unresolved placeholder", () => {
   it("leaves no {placeholder}, undefined or empty string for any key x browser x context (current table)", () => {
@@ -134,39 +140,64 @@ describe("wizard copy: Japanese text is intact (UTF-8)", () => {
 
 describe("wizard copy: step A (multi-browser design 2.3)", () => {
   it("lists only verified browsers", () => {
-    // The product table has Edge and Chrome verified (Vivaldi is not listed).
-    expect(wizardSupportedBrowserList()).toBe("Microsoft Edge、Google Chrome");
-    expect(wizardSupportedBrowserList(withVerified(["edge", "chrome"]))).toBe("Microsoft Edge、Google Chrome");
+    // The product table has Edge, Chrome and Vivaldi verified.
+    expect(wizardSupportedBrowserList()).toBe("Microsoft Edge、Google Chrome、Vivaldi");
+    expect(wizardSupportedBrowserList(onlyVerified(["edge", "chrome"]))).toBe("Microsoft Edge、Google Chrome");
     expect(wizardSupportedBrowserList(CHROME_ONLY_TABLE)).toBe("Google Chrome");
-    const both = buildWizardCopy(BASE);
-    expect(both.stepA.body).toContain("Microsoft Edge、Google Chrome で使えます");
-    expect(both.stepA.bullets[0]).toContain("Microsoft Edge と Google Chrome のどちらでも使えるように登録します。");
+    const all = buildWizardCopy(BASE);
+    expect(all.stepA.body).toContain("Microsoft Edge、Google Chrome、Vivaldi で使えます");
+    expect(all.stepA.bullets[0]).toContain("Microsoft Edge、Google Chrome、Vivaldi のいずれでも使えるように登録します。");
+    expect(buildWizardCopy(BASE, onlyVerified(["edge", "chrome"])).stepA.bullets[0]).toContain("Microsoft Edge、Google Chrome のいずれでも使えるように登録します。");
     const chromeOnly = buildWizardCopy(BASE, CHROME_ONLY_TABLE);
     expect(chromeOnly.stepA.body).toContain("Google Chrome で使えます");
     expect(chromeOnly.stepA.body).not.toContain("Microsoft Edge");
-    expect(chromeOnly.stepA.bullets[0]).not.toContain("のどちらでも");
+    expect(chromeOnly.stepA.bullets[0]).not.toContain("のいずれでも");
   });
 
-  it("fills the recommended and default browser names", () => {
-    const copy = buildWizardCopy({ ...BASE, browser: "edge", recommended: "edge", preferred: "edge", defaultBrowser: "edge" }, withVerified(["edge", "chrome"]));
+  it("fills the default browser name; no reason text recommends a particular browser (owner decision 2026-11-23)", () => {
+    const copy = buildWizardCopy({ ...BASE, browser: "edge", preferred: "edge", defaultBrowser: "edge" });
     expect(copy.stepA.reasons["default-supported"].lead).toBe("ふだんお使いのブラウザー（Microsoft Edge）で使えます。");
     expect(copy.stepA.reasons["default-supported"].detail).toBe("Microsoft Edge に Collector を入れることをおすすめします。");
-    expect(copy.stepA.reasons["default-unsupported"].detail).toContain("Microsoft Edge をおすすめします。引用を集めるときは、Microsoft Edge で Web ページを開いてください。");
-    expect(copy.stepA.reasons["default-not-chromium"].lead).toBe("ふだんお使いのブラウザーは、Collector に対応していません。");
-    expect(copy.stepA.reasons["default-not-chromium"].detail).toBe("Collector は Chromium 系のブラウザーでだけ使えます。Microsoft Edge をおすすめします。引用を集めるときは、Microsoft Edge で Web ページを開いてください。");
-    expect(copy.stepA.reasons["default-unverified"].lead).toContain("動作をまだ確認していません");
-    expect(copy.stepA.reasons["default-unverified"].detail).toContain("確認済みの Microsoft Edge をおすすめします。");
     expect(copy.stepA.reasons["default-not-installed"].lead).toContain("既定のブラウザーとして Microsoft Edge が設定されています");
-    expect(copy.stepA.reasons["none-installed"].lead).toBe("対応しているブラウザー（Microsoft Edge、Google Chrome）が見つかりませんでした。");
+    expect(copy.stepA.reasons["none-installed"].lead).toBe("対応しているブラウザー（Microsoft Edge、Google Chrome、Vivaldi）が見つかりませんでした。");
     expect(copy.stepA.downloadButtons.chrome).toBe("Google Chrome のダウンロードページを開く");
     expect(copy.stepA.previouslyChosen).toBe("前回は Microsoft Edge を選びました。");
   });
 
-  it("falls back to neutral names when no browser is known", () => {
-    const copy = buildWizardCopy({ ...BASE, browser: null, recommended: null, defaultBrowser: "other" });
-    expect(copy.stepA.reasons["default-unsupported"].detail).toContain("対応しているブラウザー をおすすめします");
-    expect(copy.stepA.reasons["default-not-chromium"].detail).toContain("対応しているブラウザー をおすすめします");
-    expect(copy.stepA.reasons["default-not-installed"].lead).toContain("別のブラウザー が設定");
+  it("the reasons that have no recommendation ask the user to choose, and name no browser as the recommended one", () => {
+    const copy = buildWizardCopy({ ...BASE, browser: null, preferred: null, defaultBrowser: "other" });
+    const reasons = copy.stepA.reasons;
+    expect(reasons["default-unsupported"]).toEqual({
+      lead: "ふだんお使いのブラウザーには、Collector を入れられません。",
+      detail: "下の選択肢から、Collector を使うブラウザーを選んでください。",
+    });
+    expect(reasons["default-not-chromium"]).toEqual({
+      lead: "ふだんお使いのブラウザーは、Collector に対応していません。",
+      detail: "Collector は Chromium 系のブラウザーでだけ使えます。下の選択肢から、Collector を使うブラウザーを選んでください。",
+    });
+    expect(reasons["default-unverified"]).toEqual({
+      lead: "ふだんお使いのブラウザーでは、Collector の動作をまだ確認していません。",
+      detail: "下の選択肢から、Chrome か Edge を選んでください。",
+    });
+    expect(reasons["default-not-installed"].detail).toBe("下の選択肢から、Collector を使うブラウザーを選んでください。");
+    expect(reasons["default-unknown"]).toEqual({
+      lead: "ふだんお使いのブラウザーを確認できませんでした。",
+      detail: "下の選択肢から、Collector を使うブラウザーを選んでください。",
+    });
+    // Only default-supported may say "おすすめ" (it is about the default browser itself).
+    for (const [reason, text] of Object.entries(reasons)) {
+      if (reason === "default-supported") continue;
+      expect(`${text.lead}${text.detail ?? ""}`, reason).not.toContain("おすすめ");
+    }
+    // The wording no longer depends on the table: a Chrome-only table gives the same sentences.
+    expect(buildWizardCopy({ ...BASE, defaultBrowser: "other" }, CHROME_ONLY_TABLE).stepA.reasons["default-not-chromium"]).toEqual(reasons["default-not-chromium"]);
+  });
+
+  it("option labels: 「Chrome で登録」, 「Edge で登録」 and 「通常のブラウザーで登録（name）」 with the default browser's name", () => {
+    expect(buildWizardCopy(BASE).stepA.optionRegisterNamed).toEqual({ chrome: "Chrome で登録", edge: "Edge で登録" });
+    expect(buildWizardCopy({ ...BASE, defaultBrowser: "vivaldi" }).stepA.optionRegisterDefault).toBe("通常のブラウザーで登録（Vivaldi）");
+    expect(buildWizardCopy(BASE).stepA.optionRecommendedSuffix).toBe("（おすすめ）");
+    expect(WIZARD_NAMED_BROWSER_IDS).toEqual(["chrome", "edge"]);
   });
 });
 
@@ -189,7 +220,7 @@ describe("wizard copy: step D per browser (multi-browser design 2.4, spike resul
   });
 
   it("Edge: bottom-left developer mode, icon under the developer options, and the startup question", () => {
-    const d = buildWizardCopy({ ...BASE, browser: "edge", recommended: "edge" }, table).stepD;
+    const d = buildWizardCopy({ ...BASE, browser: "edge" }, table).stepD;
     expect(d.title).toBe("Microsoft Edge に Collector を読み込む");
     expect(d.steps[1]).toBe("画面左のメニューの下部にある「開発者モード」をオンにします。");
     expect(d.steps[2]).toBe("「開発者向けオプション」の下にある、一番左のアイコンを押します（ポインターを合わせると「展開して読み込み」と表示されます）。");

@@ -78,6 +78,21 @@ describe("setup registers every target of the expected set (design 5.2)", () => 
     expect(registeredTargetsOf(fixture)).toEqual(["chrome", "edge"]);
   });
 
+  it("Vivaldi verified (product table) with Vivaldi installed: it adds no write, no target and no key (it uses the Chrome key)", async () => {
+    const fixture = createApplyFixture({ browserTable: undefined });
+    const exe = "C:\\Program Files\\Vivaldi\\Application\\vivaldi.exe";
+    fixture.fileSystem.addFile(exe, "x");
+    fixture.registry.appPathsByName["vivaldi.exe"] = [{ source: "hklm-64", value: exe }];
+    const result = await run(fixture, { action: "setup" });
+    expect(result).toMatchObject({ outcome: "applied", state: "ready" });
+    expect(result.inspection.browsers.entries.find((entry) => entry.id === "vivaldi")).toMatchObject({ verification: "verified", installed: "found" });
+    expect(result.targets).toEqual([{ target: "chrome", result: "registered" }, { target: "edge", result: "registered" }]);
+    expect(fixture.fileSystem.registryLog).toEqual(["register chrome", "register edge"]);
+    expect(fixture.registry.registrations).toMatchObject({ chrome: "ours", edge: "ours", chromium: "absent", vivaldi: "absent" });
+    expect(registeredTargetsOf(fixture)).toEqual(["chrome", "edge"]);
+    expect(result.inspection.browsers.entries.find((entry) => entry.id === "vivaldi")?.effective).toEqual({ target: "chrome", ownership: "ours" });
+  });
+
   it("with a Chrome-only table (Edge unverified) it writes exactly one key, as before", async () => {
     const fixture = createApplyFixture();
     const result = await run(fixture, { action: "setup" });

@@ -49,11 +49,13 @@ import {
   buildWizardCopy,
   wizardProgressLabel,
   WIZARD_MESSAGE_ROLE,
+  WIZARD_NAMED_BROWSER_IDS,
   type WizardCopy,
   type WizardCopyContext,
   type WizardMessageCopy,
   type WizardMessageId,
   type WizardMessageRole,
+  type WizardNamedBrowserId,
   type WizardReasonCopy,
 } from "./collector-wizard-copy";
 
@@ -244,10 +246,28 @@ export interface WizardBrowserOption {
   readonly note: "policy-blocked" | "detection-unknown" | null;
 }
 
+function isNamedBrowserId(id: CollectorBrowserId): id is WizardNamedBrowserId {
+  return (WIZARD_NAMED_BROWSER_IDS as readonly string[]).includes(id);
+}
+
 /**
- * The radiogroup of design 2.3: verified rows that were found (organization-blocked ones are shown
- * but cannot be chosen), plus, only when detection failed altogether, every verified row marked
- * 「確認できませんでした」. Table order.
+ * The row offered as 「通常のブラウザー」: the OS default browser, only when its row is verified and it
+ * is neither Chrome nor Edge (those two are always offered by name, so offering the default too would
+ * list one browser twice). A non-Chromium, unknown, undetected or unverified default offers none.
+ */
+function wizardDefaultOptionId(status: CollectorIntegrationStatus, table: readonly CollectorBrowserSpec[]): CollectorBrowserId | null {
+  const kind = status.browsers.defaultBrowser;
+  const row = table.find((candidate) => candidate.id === kind);
+  return row !== undefined && row.verification === "verified" && !isNamedBrowserId(row.id) ? row.id : null;
+}
+
+/**
+ * The radiogroup (owner decision 2026-11-23): 「通常のブラウザーで登録」 (only when the default
+ * browser is a verified one that is neither Chrome nor Edge), then 「Chrome で登録」, then
+ * 「Edge で登録」. Each is listed when found (organization-blocked ones are shown but cannot be
+ * chosen); only when detection failed altogether, each verified one is listed marked
+ * 「確認できませんでした」. The order is fixed here, not the table order. Only the default browser
+ * carries the recommendation (`status.browsers.recommended`).
  */
 export function wizardBrowserOptions(
   status: CollectorIntegrationStatus | null,
@@ -255,10 +275,13 @@ export function wizardBrowserOptions(
 ): readonly WizardBrowserOption[] {
   if (status === null) return [];
   const detectionFailed = status.browsers.recommendationReason === "detection-failed";
+  const defaultId = wizardDefaultOptionId(status, table);
+  const candidates: readonly CollectorBrowserId[] = [...(defaultId === null ? [] : [defaultId]), ...WIZARD_NAMED_BROWSER_IDS];
   const options: WizardBrowserOption[] = [];
-  for (const row of table) {
-    if (row.verification !== "verified") continue;
-    const entry = status.browsers.entries.find((candidate) => candidate.id === row.id);
+  for (const candidate of candidates) {
+    const row = table.find((entry) => entry.id === candidate);
+    if (row === undefined || row.verification !== "verified") continue;
+    const entry = status.browsers.entries.find((other) => other.id === row.id);
     if (entry === undefined || entry.verification !== "verified") continue;
     const recommended = status.browsers.recommended === row.id;
     if (entry.installed === "found") {
@@ -268,6 +291,21 @@ export function wizardBrowserOptions(
     }
   }
   return options;
+}
+
+/**
+ * The reason the wizard acts on. It is the inspection's reason, except when that reason says a
+ * browser is usable but the radiogroup offers nothing (a verified browser that is installed but is
+ * not the default is not offered): then there is nothing to choose, which is `none-installed`.
+ */
+export function wizardRecommendationReason(
+  status: CollectorIntegrationStatus | null,
+  table: readonly CollectorBrowserSpec[] = COLLECTOR_BROWSERS,
+): CollectorRecommendationReason | null {
+  if (status === null) return null;
+  const reason = status.browsers.recommendationReason;
+  if (reason === "none-installed" || reason === "detection-failed" || reason === "default-supported") return reason;
+  return wizardBrowserOptions(status, table).length === 0 ? "none-installed" : reason;
 }
 
 /**
@@ -488,7 +526,7 @@ function addressOf(browser: CollectorBrowserId): string | null {
 }
 
 function recommendationReason(state: WizardState) {
-  return state.status?.browsers.recommendationReason ?? null;
+  return wizardRecommendationReason(state.status);
 }
 
 // ----- Which events are allowed now (shared by the reducer and `wizardActions`) --------------------
@@ -1095,7 +1133,6 @@ export function wizardProgress(state: WizardState): string | null {
 export function wizardCopyContext(state: WizardState): WizardCopyContext {
   return {
     browser: state.selectedBrowser,
-    recommended: state.status?.browsers.recommended ?? null,
     preferred: state.status?.browsers.preferred ?? null,
     blocked: wizardBlockedBrowsers(state.status),
     defaultBrowser: state.status?.browsers.defaultBrowser ?? "unknown",
@@ -1301,7 +1338,7 @@ export function wizardActions(state: WizardState): readonly WizardAction[] {
 export interface WizardAOption {
   readonly id: CollectorBrowserId;
   readonly displayName: string;
-  /** Radio label: the name plus 「（おすすめ）」 when recommended. */
+  /** Radio label (「通常のブラウザーで登録（name）」, 「Chrome で登録」 or 「Edge で登録」) plus 「（おすすめ）」 when recommended. */
   readonly label: string;
   readonly recommended: boolean;
   readonly selectable: boolean;
@@ -1334,16 +1371,17 @@ export interface WizardAView {
 export function wizardAView(state: WizardState): WizardAView {
   const copy = wizardCopy(state);
   const status = state.status;
-  const reason = status?.browsers.recommendationReason ?? null;
+  const reason = wizardRecommendationReason(status);
   const allBlocked = wizardAllBrowsersBlocked(status);
   const preferred = status?.browsers.preferred ?? null;
   const recommended = status?.browsers.recommended ?? null;
   const options = wizardBrowserOptions(status).map((option): WizardAOption => {
     const displayName = COLLECTOR_BROWSERS.find((row) => row.id === option.id)?.displayName ?? option.id;
+    const registerLabel = isNamedBrowserId(option.id) ? copy.stepA.optionRegisterNamed[option.id] : copy.stepA.optionRegisterDefault;
     return {
       id: option.id,
       displayName,
-      label: option.recommended ? `${displayName}${copy.stepA.optionRecommendedSuffix}` : displayName,
+      label: option.recommended ? `${registerLabel}${copy.stepA.optionRecommendedSuffix}` : registerLabel,
       recommended: option.recommended,
       selectable: option.selectable,
       selected: state.selectedBrowser === option.id,

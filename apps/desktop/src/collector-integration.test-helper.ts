@@ -26,13 +26,14 @@ import { safeFacts } from "./collector-host-fixture.test-helper.js";
 import type { PathSecurityFacts } from "./collector-path-security.js";
 
 /**
- * The product table with only Chrome `verified` (Edge switched back to `unverified`). The product table has had
- * Edge verified since the Edge ProgId measurement; most integration tests exercise single-target mechanics and
- * keep this Chrome-only world through the fixtures. Tests of the Chrome + Edge behavior inject the product table
- * (`browserTable: undefined`) or `tableWithVerified("chrome", "edge")`.
+ * The product table with only Chrome `verified` (Edge and Vivaldi switched back to `unverified`). The product table
+ * has Edge verified (since the Edge ProgId measurement) and Vivaldi verified (owner decision 2026-11-23); most
+ * integration tests exercise single-target mechanics and keep this Chrome-only world through the fixtures. Tests of
+ * the Chrome + Edge + Vivaldi behavior inject the product table (`browserTable: undefined`) or
+ * `tableWithVerified("chrome", "edge")` (which keeps Vivaldi verified as the product table has it).
  */
 export const CHROME_ONLY_BROWSER_TABLE: readonly CollectorBrowserSpec[] = COLLECTOR_BROWSERS.map((row) =>
-  row.id === "edge" ? ({ ...row, verification: "unverified" } as CollectorBrowserSpec) : row);
+  row.id === "edge" || row.id === "vivaldi" ? ({ ...row, verification: "unverified" } as CollectorBrowserSpec) : row);
 
 export const sha256 = (text: string | Uint8Array): string => createHash("sha256").update(text).digest("hex");
 

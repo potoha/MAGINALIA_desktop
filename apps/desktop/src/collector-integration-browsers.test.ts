@@ -16,6 +16,7 @@ import {
   inspectCollectorIntegration,
   locateBrowserExecutable,
   parseIntegrationStateFile,
+  registrationWouldShadowForeign,
 } from "./collector-integration";
 import type { CollectorIntegrationInspection, CollectorIntegrationState } from "./collector-integration-types";
 import { EMPTY_CHROME_POLICIES_FOR_HIVE } from "./collector-registry-adapter.test-helper";
@@ -339,12 +340,12 @@ describe("inspection with a Chrome-only table (Edge unverified)", () => {
     expect((await inspectWith(fixture, CHROME_EDGE)).expectedTargets).toEqual(["chrome", "edge"]);
   });
 
-  it("Vivaldi is never inspected as a registration target (the addon table has no such target)", async () => {
+  it("Vivaldi is never inspected as a registration target (the addon table has no such target); its own entry follows Chromium, then Chrome", async () => {
     const fixture = readyBoth();
     const result = await inspectWith(fixture);
     expect(fixture.registry.targetCalls.some((call) => call.target === "vivaldi")).toBe(false);
     expect(result.registrations.vivaldi).toBe("unknown");
-    expect(result.browsers.entries.find((entry) => entry.id === "vivaldi")?.effective).toEqual({ target: null, ownership: "absent" });
+    expect(result.browsers.entries.find((entry) => entry.id === "vivaldi")?.effective).toEqual({ target: "chrome", ownership: "ours" });
     // The same under a table that verifies Chrome and Edge.
     const again = readyBoth();
     await inspectWith(again, CHROME_EDGE);
@@ -582,31 +583,43 @@ describe("browsers: default browser, detection and recommendation", () => {
     expect(JSON.stringify(result.browsers)).not.toMatch(/[A-Za-z]:\\|tester|AppData|Program Files|\.exe|\\\\/iu);
   });
 
-  it("default Vivaldi (unverified) with only Chrome installed recommends Chrome, the only installed verified row", async () => {
+  it("a default Vivaldi that is not installed, with only Chrome installed, recommends nothing (no fallback to another browser)", async () => {
     const fixture = createIntegrationFixture();
     installChrome(fixture);
     fixture.registry.defaultBrowserProgId = "VivaldiHTM";
     const result = await inspectWith(fixture);
-    expect(result.browsers).toMatchObject({ defaultBrowser: "vivaldi", recommended: "chrome", recommendationReason: "default-unverified" });
+    expect(result.browsers).toMatchObject({ defaultBrowser: "vivaldi", recommended: null, recommendationReason: "default-not-installed" });
   });
 
-  it("with Edge verified and installed, a Vivaldi default recommends Edge (owner decision 2)", async () => {
+  it("a default that is not a supported browser (Firefox, Brave, unreadable) recommends nothing, however many are installed", async () => {
     const fixture = createIntegrationFixture();
     installEdge(fixture);
     installChrome(fixture);
-    fixture.registry.defaultBrowserProgId = "VivaldiHTM";
-    expect((await inspectWith(fixture, CHROME_EDGE)).browsers).toMatchObject({ defaultBrowser: "vivaldi", recommended: "edge", recommendationReason: "default-unverified" });
+    fixture.registry.defaultBrowserProgId = "FirefoxURL-308046B0AF4A39CB";
+    expect((await inspectWith(fixture, CHROME_EDGE)).browsers).toMatchObject({ defaultBrowser: "other", recommended: null, recommendationReason: "default-not-chromium" });
+    fixture.registry.defaultBrowserProgId = "BraveHTML";
+    expect((await inspectWith(fixture, CHROME_EDGE)).browsers).toMatchObject({ defaultBrowser: "other-chromium", recommended: null, recommendationReason: "default-unverified" });
+    fixture.registry.defaultBrowserProgId = null;
+    expect((await inspectWith(fixture, CHROME_EDGE)).browsers).toMatchObject({ defaultBrowser: "unknown", recommended: null, recommendationReason: "default-unknown" });
+  });
+
+  it("only the default browser is recommended, whichever of Edge and Chrome it is", async () => {
+    const fixture = createIntegrationFixture();
+    installEdge(fixture);
+    installChrome(fixture);
+    fixture.registry.defaultBrowserProgId = "MSEdgeHTM";
+    expect((await inspectWith(fixture, CHROME_EDGE)).browsers).toMatchObject({ defaultBrowser: "edge", recommended: "edge", recommendationReason: "default-supported" });
     fixture.registry.defaultBrowserProgId = "ChromeHTML";
     expect((await inspectWith(fixture, CHROME_EDGE)).browsers).toMatchObject({ defaultBrowser: "chrome", recommended: "chrome", recommendationReason: "default-supported" });
   });
 
-  it("a policy-blocked default is not recommended", async () => {
+  it("a policy-blocked default is not recommended, and nothing else is recommended in its place", async () => {
     const fixture = readyBoth();
     installEdge(fixture);
     installChrome(fixture);
     fixture.registry.defaultBrowserProgId = "MSEdgeHTM";
     fixture.registry.edgePolicies = policies({ nativeMessagingUserLevelHosts: 0 });
-    expect((await inspectWith(fixture, CHROME_EDGE)).browsers).toMatchObject({ defaultBrowser: "edge", recommended: "chrome" });
+    expect((await inspectWith(fixture, CHROME_EDGE)).browsers).toMatchObject({ defaultBrowser: "edge", recommended: null, recommendationReason: "default-unsupported" });
   });
 
   it("nothing installed: no recommendation; a failing default read is unknown and never blocks", async () => {
@@ -763,5 +776,105 @@ describe("privacy of the per-browser result", () => {
     const { extensionFolderDisplay, ...rest } = result;
     expect(extensionFolderDisplay).toBe(path.win32.join(fixture.programFolder, "extension"));
     expect(JSON.stringify(rest)).not.toMatch(/[A-Za-z]:\\|tester|AppData|Program Files|\.exe|\\\\/iu);
+  });
+});
+
+
+// ----- Vivaldi: verified, no registration of its own (owner decision 2026-11-23, design 3.4) ----------
+
+describe("Vivaldi is verified and registers nothing of its own", () => {
+  function installVivaldi(fixture: IntegrationFixture): void {
+    fixture.fileSystem.addFile("C:\\Program Files\\Vivaldi\\Application\\vivaldi.exe", "x");
+  }
+  function installChrome(fixture: IntegrationFixture): void {
+    fixture.fileSystem.addFile("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "x");
+  }
+  const vivaldiEntry = (result: CollectorIntegrationInspection) => result.browsers.entries.find((entry) => entry.id === "vivaldi");
+
+  it("is detected, and a Vivaldi default that is installed is the recommendation", async () => {
+    const fixture = readyBoth();
+    installVivaldi(fixture);
+    installChrome(fixture);
+    fixture.registry.defaultBrowserProgId = "VivaldiHTM.ABC123";
+    const result = await inspectWith(fixture);
+    expect(vivaldiEntry(result)).toMatchObject({ verification: "verified", installed: "found" });
+    expect(result.browsers).toMatchObject({ defaultBrowser: "vivaldi", recommended: "vivaldi", recommendationReason: "default-supported" });
+  });
+
+  it("is not recommended when another browser is the default, even if it is the only one installed", async () => {
+    const fixture = createIntegrationFixture();
+    installVivaldi(fixture);
+    fixture.registry.defaultBrowserProgId = "FirefoxURL-308046B0AF4A39CB";
+    const result = await inspectWith(fixture);
+    expect(result.browsers).toMatchObject({ defaultBrowser: "other", recommended: null, recommendationReason: "default-not-chromium" });
+  });
+
+  it("adds no expected target and no key is inspected for it: E stays [chrome, edge], installed or not", async () => {
+    const absent = readyBoth();
+    expect((await inspectWith(absent)).expectedTargets).toEqual(["chrome", "edge"]);
+    const present = readyBoth();
+    installVivaldi(present);
+    const result = await inspectWith(present);
+    expect(result.expectedTargets).toEqual(["chrome", "edge"]);
+    expect(result.state).toBe("ready");
+    expect(present.registry.targetCalls.some((call) => call.target === "vivaldi")).toBe(false);
+    expect(result.registrations.vivaldi).toBe("unknown");
+  });
+
+  it("a Vivaldi key, ours or foreign, is never read and changes nothing", async () => {
+    for (const ownership of ["foreign", "ours"] as const) {
+      const fixture = readyBoth();
+      installVivaldi(fixture);
+      fixture.registry.registrations.vivaldi = ownership;
+      const result = await inspectWith(fixture);
+      expect(result.state).toBe("ready");
+      expect(result.registration).toBe("ours");
+      expect(vivaldiEntry(result)?.effective).toEqual({ target: "chrome", ownership: "ours" });
+    }
+  });
+
+  it("uses the Chrome key, which MAGINALIA always registers (spike K1)", async () => {
+    const fixture = readyBoth();
+    installVivaldi(fixture);
+    const result = await inspectWith(fixture);
+    expect(vivaldiEntry(result)?.effective).toEqual({ target: "chrome", ownership: "ours" });
+  });
+
+  it("a foreign Chromium key shadows the Chrome key for Vivaldi (spike K7): shown per browser, no registration of ours can change it", async () => {
+    const fixture = readyBoth();
+    installVivaldi(fixture);
+    fixture.registry.registrations.chromium = "foreign";
+    const result = await inspectWith(fixture);
+    expect(vivaldiEntry(result)?.effective).toEqual({ target: "chromium", ownership: "foreign" });
+    // Chrome and Edge own their own keys, so neither is affected, and the aggregate over E stays ours.
+    expect(chromeEntry(result)?.effective).toEqual({ target: "chrome", ownership: "ours" });
+    expect(edgeEntry(result)?.effective).toEqual({ target: "edge", ownership: "ours" });
+    expect(result.state).toBe("ready");
+    expect(result.registration).toBe("ours");
+    // The shadowing branch is about OUR write taking over a foreign key a verified row uses today. Vivaldi owns no
+    // target, so registering Chrome or Edge never counts as shadowing for it: the Chromium key is read, never replaced.
+    const ownerships = { chrome: "ours", edge: "ours", chromium: "foreign" } as const;
+    expect(registrationWouldShadowForeign(COLLECTOR_BROWSERS, "chrome", ownerships)).toBe(false);
+    expect(registrationWouldShadowForeign(COLLECTOR_BROWSERS, "edge", ownerships)).toBe(true); // Edge's own fallback, unchanged
+  });
+
+  it("a Chrome key that is missing or foreign is what Vivaldi uses too (no Chromium key)", async () => {
+    const fixture = readyBoth();
+    installVivaldi(fixture);
+    fixture.registry.registrations.chrome = "foreign";
+    expect(vivaldiEntry(await inspectWith(fixture))?.effective).toEqual({ target: "chrome", ownership: "foreign" });
+    fixture.registry.registrations.chrome = "absent";
+    expect(vivaldiEntry(await inspectWith(fixture))?.effective).toEqual({ target: null, ownership: "absent" });
+  });
+
+  it("never counts as an unblocked browser: Chrome and Edge both blocked is still policy-blocked, with Vivaldi installed", async () => {
+    const fixture = readyBoth();
+    installVivaldi(fixture);
+    fixture.registry.policies = policies({ nativeMessagingUserLevelHosts: 0 });
+    fixture.registry.edgePolicies = policies({ nativeMessagingUserLevelHosts: 0 });
+    const result = await inspectWith(fixture);
+    expect(result.policy).toMatchObject({ blocked: true, userLevelHostsDisabled: true });
+    expect(result.state).toBe("policy-blocked");
+    expect(vivaldiEntry(result)?.policy).toMatchObject({ blocked: false, status: "not-applicable" });
   });
 });

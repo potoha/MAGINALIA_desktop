@@ -443,12 +443,16 @@ function aggregateRegistration(expected: readonly CollectorRegistryTargetId[], o
   return "absent";
 }
 
-/** `blocked` only when every verified browser is blocked (design 4.4-1); a partial block stays per browser. */
+/**
+ * `blocked` only when every verified browser is blocked (design 4.4-1); a partial block stays per browser.
+ * A verified row without a policy root (Vivaldi) is never evaluated, so it can neither block nor
+ * count as "not blocked": it stays out of the aggregate, as before it became verified.
+ */
 function aggregatePolicy(
   table: readonly CollectorBrowserSpec[],
   detected: ReadonlyMap<CollectorBrowserId, DetectedBrowser>,
 ): ChromePolicyEvaluation & { readonly status: "read" | "unavailable" } {
-  const verified = table.filter((row) => row.verification === "verified").flatMap((row) => {
+  const verified = table.filter((row) => row.verification === "verified" && row.policyRoot !== null).flatMap((row) => {
     const facts = detected.get(row.id);
     return facts === undefined ? [] : [facts];
   });

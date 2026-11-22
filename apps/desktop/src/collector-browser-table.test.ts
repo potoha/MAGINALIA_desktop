@@ -25,7 +25,7 @@ const row = (id: CollectorBrowserId): CollectorBrowserSpec => {
   return found;
 };
 
-/** Same rows with Edge and Vivaldi forced to "verified" (for logic tests; the evidence is not asserted here). */
+/** Same rows with every row forced to "verified" (for logic tests; the evidence is not asserted here). */
 function allVerifiedTable(): readonly CollectorBrowserSpec[] {
   return COLLECTOR_BROWSERS.map((entry) => ({ ...entry, verification: "verified" }) as CollectorBrowserSpec);
 }
@@ -106,14 +106,29 @@ describe("collector browser table: shape", () => {
 });
 
 describe("collector browser table: verification and release gate", () => {
-  it("Vivaldi stays unverified, registers nothing and is never offered", () => {
+  it("Vivaldi is verified (owner decision 2026-11-23, spike 2026-11-20): it reads Chromium then Chrome and registers nothing of its own", () => {
     const vivaldi = row("vivaldi");
-    expect(vivaldi.verification).toBe("unverified");
-    expect(vivaldi.nativeMessaging.lookupOrder).toEqual([]);
+    expect(vivaldi.verification).toBe("verified");
+    expect(vivaldi.nativeMessaging.lookupOrder).toEqual(["chromium", "chrome"]);
     expect(vivaldi.nativeMessaging.ownTargets).toEqual([]);
-    expect(vivaldi.evidence.lookupOrder).toBe("unverified");
-    expect(vivaldi.evidence.ownTargets).toBe("unverified");
+    expect(vivaldi.nativeMessaging.registration).toBe("when-present");
+    // No policy location was measured: the row is never blocked by policy.
+    expect(vivaldi.policyRoot).toBeNull();
+    expect(vivaldi.downloadUrl).toBeNull();
+    expect(vivaldi.evidence.lookupOrder).toBe("measured");
+    expect(vivaldi.evidence.ownTargets).toBe("measured");
+    // Presentation evidence stays unmeasured: it is not claimed.
+    expect(vivaldi.evidence.extensionsPage).toBe("unverified");
+    expect(vivaldi.evidence.ui).toBe("unverified");
+    expect(vivaldi.evidence.store).toBe("unverified");
+    expect(vivaldi.evidence.downloadUrl).toBe("unverified");
+  });
+
+  it("no writable registry target is added for Vivaldi (the Vivaldi key is inert) and no row looks it up", () => {
     expect(COLLECTOR_REGISTRY_TARGETS.find((t) => t.id === "vivaldi")?.writable).toBe(false);
+    for (const entry of COLLECTOR_BROWSERS) expect(entry.nativeMessaging.lookupOrder).not.toContain("vivaldi");
+    // Chrome and Edge are the only rows that own a (writable) key.
+    expect(COLLECTOR_BROWSERS.filter((entry) => entry.nativeMessaging.ownTargets.length > 0).map((entry) => entry.id).sort()).toEqual(["chrome", "edge"]);
   });
 
   it("Edge is verified: its stable ProgId MSEdgeHTM was measured on a real machine", () => {
@@ -134,9 +149,12 @@ describe("collector browser table: verification and release gate", () => {
   });
 
   it("the gate fires when an unverified row is switched to verified without evidence", () => {
-    const vivaldiVerified = { ...row("vivaldi"), verification: "verified" } as CollectorBrowserSpec;
+    const vivaldiNoEvidence = {
+      ...row("vivaldi"),
+      evidence: { ...row("vivaldi").evidence, lookupOrder: "unverified", ownTargets: "unverified", registration: "unverified", policyRoot: "unverified" },
+    } as unknown as CollectorBrowserSpec;
     const edgeNoProgId = { ...row("edge"), evidence: { ...row("edge").evidence, progIdPattern: "unverified" } } as unknown as CollectorBrowserSpec;
-    expect(collectorBrowserReleaseGateViolations([vivaldiVerified])).toEqual([
+    expect(collectorBrowserReleaseGateViolations([vivaldiNoEvidence])).toEqual([
       "vivaldi.lookupOrder", "vivaldi.ownTargets", "vivaldi.registration", "vivaldi.policyRoot",
     ]);
     expect(collectorBrowserReleaseGateViolations([edgeNoProgId])).toEqual(["edge.progIdPattern"]);
@@ -153,6 +171,7 @@ describe("collector browser table: verification and release gate", () => {
     expect(collectorBrowserPresentationEvidenceGaps()).toEqual([
       "edge.extensionsPage", "edge.ui", "edge.store",
       "chrome.extensionsPage", "chrome.ui", "chrome.downloadUrl",
+      "vivaldi.extensionsPage", "vivaldi.ui", "vivaldi.store", "vivaldi.downloadUrl",
     ]);
   });
 });
@@ -201,66 +220,64 @@ describe("classifyDefaultBrowser", () => {
   });
 
   it("classification does not depend on verification", () => {
+    const vivaldiUnverified = { ...row("vivaldi"), verification: "unverified" } as CollectorBrowserSpec;
+    expect(classifyDefaultBrowser("VivaldiHTM", [row("edge"), row("chrome"), vivaldiUnverified])).toBe("vivaldi");
     expect(classifyDefaultBrowser("VivaldiHTM")).toBe("vivaldi");
-    expect(row("vivaldi").verification).toBe("unverified");
   });
 });
 
 describe("recommendCollectorBrowser (all rows verified for logic tests)", () => {
-  it("default-supported: the default browser itself", () => {
+  it("default-supported: the default browser itself, and only the default browser", () => {
     expect(recommend({ defaultBrowser: "vivaldi", detections: { edge: FOUND, chrome: FOUND, vivaldi: FOUND } }))
       .toEqual({ recommended: "vivaldi", reason: "default-supported" });
     expect(recommend({ defaultBrowser: "chrome", detections: { edge: FOUND, chrome: FOUND } }))
       .toEqual({ recommended: "chrome", reason: "default-supported" });
+    expect(recommend({ defaultBrowser: "edge", detections: { edge: FOUND, chrome: FOUND, vivaldi: FOUND } }))
+      .toEqual({ recommended: "edge", reason: "default-supported" });
   });
 
-  it("default-not-chromium: Firefox or similar falls back to Edge", () => {
+  it("default-not-chromium: Firefox or similar recommends nothing, even when other browsers are usable", () => {
     expect(recommend({ defaultBrowser: "other", detections: { edge: FOUND, chrome: FOUND } }))
-      .toEqual({ recommended: "edge", reason: "default-not-chromium" });
-  });
-
-  it("default-not-chromium with Edge missing falls back to the next installed row", () => {
+      .toEqual({ recommended: null, reason: "default-not-chromium" });
     expect(recommend({ defaultBrowser: "other", detections: { edge: MISSING, chrome: FOUND } }))
-      .toEqual({ recommended: "chrome", reason: "default-not-chromium" });
+      .toEqual({ recommended: null, reason: "default-not-chromium" });
   });
 
-  it("default-not-chromium: ProgIds of non-Chromium browsers classify as other and are not supported", () => {
+  it("default-not-chromium: ProgIds of non-Chromium browsers classify as other and recommend nothing", () => {
     for (const progId of ["FirefoxURL-308046B0AF4A39CB", "IE.HTTP", "SafariHTML", "AppXq0fevzme2pys62n3e0fbqa7peapykr8v"]) {
       const kind = classifyDefaultBrowser(progId);
       expect(kind).toBe("other");
       expect(recommend({ defaultBrowser: kind, detections: { edge: FOUND, chrome: FOUND } }))
-        .toEqual({ recommended: "edge", reason: "default-not-chromium" });
+        .toEqual({ recommended: null, reason: "default-not-chromium" });
     }
   });
 
-  it("default-unverified: another Chromium (Brave etc.)", () => {
+  it("default-unverified: another Chromium (Brave etc.) recommends nothing", () => {
     expect(recommend({ defaultBrowser: "other-chromium", detections: { edge: FOUND, chrome: FOUND } }))
-      .toEqual({ recommended: "edge", reason: "default-unverified" });
+      .toEqual({ recommended: null, reason: "default-unverified" });
   });
 
-  it("default-unverified: a table row that is not verified", () => {
-    // Real table: Edge and Chrome are verified, Vivaldi is not, so a Vivaldi default is a known-but-unverified browser;
-    // the first usable row in table order (Edge) is recommended.
-    expect(recommend({ defaultBrowser: "vivaldi", detections: { edge: FOUND, chrome: FOUND, vivaldi: FOUND } }, COLLECTOR_BROWSERS))
-      .toEqual({ recommended: "edge", reason: "default-unverified" });
-    // Edge not installed: the next usable verified row.
-    expect(recommend({ defaultBrowser: "vivaldi", detections: { edge: MISSING, chrome: FOUND, vivaldi: FOUND } }, COLLECTOR_BROWSERS))
-      .toEqual({ recommended: "chrome", reason: "default-unverified" });
+  it("default-unverified: a table row that is not verified is never recommended, even when found and the default", () => {
+    const vivaldiUnverified = allVerifiedTable().map((entry) => (entry.id === "vivaldi" ? ({ ...entry, verification: "unverified" } as CollectorBrowserSpec) : entry));
+    expect(recommend({ defaultBrowser: "vivaldi", detections: { edge: FOUND, chrome: FOUND, vivaldi: FOUND } }, vivaldiUnverified))
+      .toEqual({ recommended: null, reason: "default-unverified" });
+    expect(recommend({ defaultBrowser: "vivaldi", detections: { edge: MISSING, chrome: MISSING, vivaldi: FOUND } }, vivaldiUnverified))
+      .toEqual({ recommended: null, reason: "none-installed" });
   });
 
-  it("default-not-installed: the default row's executable was not found", () => {
+  it("default-not-installed: the default row's executable was not found; nothing else is recommended", () => {
     expect(recommend({ defaultBrowser: "vivaldi", detections: { edge: FOUND, chrome: FOUND, vivaldi: MISSING } }))
-      .toEqual({ recommended: "edge", reason: "default-not-installed" });
+      .toEqual({ recommended: null, reason: "default-not-installed" });
   });
 
-  it("default-unknown: default could not be read", () => {
+  it("default-unknown: default could not be read; nothing is recommended", () => {
     expect(recommend({ defaultBrowser: "unknown", detections: { edge: FOUND, chrome: FOUND } }))
-      .toEqual({ recommended: "edge", reason: "default-unknown" });
+      .toEqual({ recommended: null, reason: "default-unknown" });
   });
 
   it("default-unknown: default row present but its detection failed while another browser is usable", () => {
     expect(recommend({ defaultBrowser: "chrome", detections: { edge: FOUND, chrome: UNKNOWN } }))
-      .toEqual({ recommended: "edge", reason: "default-unknown" });
+      .toEqual({ recommended: null, reason: "default-unknown" });
   });
 
   it("none-installed: nothing usable and detection worked", () => {
@@ -277,30 +294,36 @@ describe("recommendCollectorBrowser (all rows verified for logic tests)", () => 
       .toEqual({ recommended: null, reason: "detection-failed" });
   });
 
-  it("a policy-blocked default is skipped, the next usable row is recommended", () => {
+  it("a policy-blocked default is not recommended and nothing else is either (the reason stays default-unsupported)", () => {
     expect(recommend({ defaultBrowser: "edge", detections: { edge: BLOCKED, chrome: FOUND } }))
-      .toEqual({ recommended: "chrome", reason: "default-unsupported" });
+      .toEqual({ recommended: null, reason: "default-unsupported" });
     expect(recommend({ defaultBrowser: "other", detections: { edge: BLOCKED, chrome: BLOCKED } }))
       .toEqual({ recommended: null, reason: "none-installed" });
   });
 
-  it("an unverified row is never recommended even when found and the default", () => {
-    const real = recommend({ defaultBrowser: "vivaldi", detections: { vivaldi: FOUND, chrome: MISSING, edge: MISSING } }, COLLECTOR_BROWSERS);
-    expect(real.recommended).toBeNull();
-    expect(real.reason).toBe("none-installed");
-    const onlyVivaldi = recommend({ defaultBrowser: "other", detections: { vivaldi: FOUND, chrome: MISSING, edge: MISSING } }, COLLECTOR_BROWSERS);
-    expect(onlyVivaldi.recommended).toBeNull();
-  });
-
-  it("real table: Edge and Chrome are the recommendable rows, Edge first; Vivaldi never", () => {
-    expect(recommend({ defaultBrowser: "other", detections: { edge: FOUND, chrome: FOUND, vivaldi: FOUND } }, COLLECTOR_BROWSERS))
-      .toEqual({ recommended: "edge", reason: "default-not-chromium" });
-    expect(recommend({ defaultBrowser: "other", detections: { edge: MISSING, chrome: FOUND, vivaldi: FOUND } }, COLLECTOR_BROWSERS))
-      .toEqual({ recommended: "chrome", reason: "default-not-chromium" });
-  });
-
-  describe("real table with Edge verified: the reason for each default", () => {
+  describe("real table (Edge, Chrome and Vivaldi are all verified): the recommendation for each default", () => {
     const real = (input: CollectorRecommendationInput) => recommend(input, COLLECTOR_BROWSERS);
+
+    it("a Vivaldi default that is installed is recommended; table order plays no part", () => {
+      expect(real({ defaultBrowser: "vivaldi", detections: { edge: FOUND, chrome: FOUND, vivaldi: FOUND } }))
+        .toEqual({ recommended: "vivaldi", reason: "default-supported" });
+      expect(real({ defaultBrowser: "vivaldi", detections: { edge: MISSING, chrome: MISSING, vivaldi: FOUND } }))
+        .toEqual({ recommended: "vivaldi", reason: "default-supported" });
+    });
+
+    it("a Vivaldi default that is not installed recommends nothing (default-not-installed)", () => {
+      expect(real({ defaultBrowser: "vivaldi", detections: { edge: FOUND, chrome: FOUND, vivaldi: MISSING } }))
+        .toEqual({ recommended: null, reason: "default-not-installed" });
+    });
+
+    it("a non-Chromium or unknown default recommends nothing, even with Edge, Chrome and Vivaldi installed", () => {
+      expect(real({ defaultBrowser: "other", detections: { edge: FOUND, chrome: FOUND, vivaldi: FOUND } }))
+        .toEqual({ recommended: null, reason: "default-not-chromium" });
+      expect(real({ defaultBrowser: "unknown", detections: { edge: FOUND, chrome: FOUND, vivaldi: FOUND } }))
+        .toEqual({ recommended: null, reason: "default-unknown" });
+      expect(real({ defaultBrowser: "other-chromium", detections: { edge: FOUND, chrome: FOUND, vivaldi: FOUND } }))
+        .toEqual({ recommended: null, reason: "default-unverified" });
+    });
 
     it("Edge as the default browser, installed: recommended as default-supported", () => {
       expect(real({ defaultBrowser: "edge", detections: { edge: FOUND, chrome: FOUND } }))
@@ -314,24 +337,24 @@ describe("recommendCollectorBrowser (all rows verified for logic tests)", () => 
         .toEqual({ recommended: "chrome", reason: "default-supported" });
     });
 
-    it("Edge is the default but not installed, only Chrome is: Chrome with default-not-installed", () => {
+    it("Edge is the default but not installed, only Chrome is: nothing is recommended (default-not-installed)", () => {
       expect(real({ defaultBrowser: "edge", detections: { edge: MISSING, chrome: FOUND } }))
-        .toEqual({ recommended: "chrome", reason: "default-not-installed" });
+        .toEqual({ recommended: null, reason: "default-not-installed" });
     });
 
-    it("Edge is the default but its detection failed, Chrome is installed: Chrome with default-unknown", () => {
+    it("Edge is the default but its detection failed, Chrome is installed: nothing is recommended (default-unknown)", () => {
       expect(real({ defaultBrowser: "edge", detections: { edge: UNKNOWN, chrome: FOUND } }))
-        .toEqual({ recommended: "chrome", reason: "default-unknown" });
+        .toEqual({ recommended: null, reason: "default-unknown" });
     });
 
-    it("Edge is the default but blocked by policy: Chrome with default-unsupported", () => {
+    it("Edge is the default but blocked by policy: nothing is recommended (default-unsupported)", () => {
       expect(real({ defaultBrowser: "edge", detections: { edge: BLOCKED, chrome: FOUND } }))
-        .toEqual({ recommended: "chrome", reason: "default-unsupported" });
+        .toEqual({ recommended: null, reason: "default-unsupported" });
     });
 
-    it("only Chrome is installed and the default is unknown: Chrome with default-unknown (not Edge)", () => {
+    it("only Chrome is installed and the default is unknown: nothing is recommended (default-unknown)", () => {
       expect(real({ defaultBrowser: "unknown", detections: { edge: MISSING, chrome: FOUND } }))
-        .toEqual({ recommended: "chrome", reason: "default-unknown" });
+        .toEqual({ recommended: null, reason: "default-unknown" });
     });
 
     it("Edge is the default and neither Edge nor Chrome is installed: nothing is recommended", () => {
@@ -339,12 +362,17 @@ describe("recommendCollectorBrowser (all rows verified for logic tests)", () => 
         .toEqual({ recommended: null, reason: "none-installed" });
     });
 
-    it("every verified row's detection failed: detection-failed (Edge now counts as a verified row)", () => {
-      expect(real({ defaultBrowser: "edge", detections: { edge: UNKNOWN, chrome: UNKNOWN } }))
+    it("every verified row's detection failed: detection-failed (Edge and Vivaldi count as verified rows)", () => {
+      expect(real({ defaultBrowser: "edge", detections: { edge: UNKNOWN, chrome: UNKNOWN, vivaldi: UNKNOWN } }))
         .toEqual({ recommended: null, reason: "detection-failed" });
       // A detection that worked for Edge (missing) while Chrome failed is not "every row unknown".
       expect(real({ defaultBrowser: "edge", detections: { edge: MISSING, chrome: UNKNOWN } }))
         .toEqual({ recommended: null, reason: "none-installed" });
+    });
+
+    it("a usable Vivaldi that is not the default keeps the reason of the default (not none-installed) and recommends nothing", () => {
+      expect(real({ defaultBrowser: "other", detections: { edge: MISSING, chrome: MISSING, vivaldi: FOUND } }))
+        .toEqual({ recommended: null, reason: "default-not-chromium" });
     });
   });
 
@@ -398,8 +426,20 @@ describe("effectiveRegistration", () => {
       .toEqual({ target: "chrome", ownership: "ours" });
   });
 
-  it("an empty lookup order (Vivaldi placeholder) is absent", () => {
+  it("an empty lookup order is absent", () => {
     expect(effectiveRegistration([], { chrome: "ours" })).toEqual({ target: null, ownership: "absent" });
+  });
+
+  it("Vivaldi reads Chromium before Chrome (spike 2026-11-20: K1/K3/K6/K7) and never its own key", () => {
+    const vivaldiOrder = row("vivaldi").nativeMessaging.lookupOrder;
+    // Chrome key alone: ours (what the always-registered Chrome key gives Vivaldi).
+    expect(effectiveRegistration(vivaldiOrder, { chromium: "absent", chrome: "ours" })).toEqual({ target: "chrome", ownership: "ours" });
+    // K7: a Chromium key shadows the Chrome key, ours or not.
+    expect(effectiveRegistration(vivaldiOrder, { chromium: "foreign", chrome: "ours" })).toEqual({ target: "chromium", ownership: "foreign" });
+    // K6: a Vivaldi key is ignored.
+    expect(effectiveRegistration(vivaldiOrder, { vivaldi: "foreign", chromium: "absent", chrome: "ours" })).toEqual({ target: "chrome", ownership: "ours" });
+    expect(effectiveRegistration(vivaldiOrder, { chromium: "absent", chrome: "absent" })).toEqual({ target: null, ownership: "absent" });
+    expect(effectiveRegistration(vivaldiOrder, { chromium: "unknown", chrome: "ours" })).toEqual({ target: null, ownership: "unknown" });
   });
 
   it("results are frozen", () => {

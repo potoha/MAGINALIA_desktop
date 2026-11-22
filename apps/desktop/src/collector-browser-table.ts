@@ -30,13 +30,13 @@ export const COLLECTOR_REGISTRY_TARGETS: readonly CollectorRegistryTargetSpec[] 
   // Read-only: Edge's second lookup location (documented). Lets us tell whether a third-party
   // Chromium registration shadows Edge's fallback to the Chrome key.
   { id: "chromium", subkey: `Software\\Chromium\\NativeMessagingHosts\\${HOST_NAME}`, writable: false },
-  // Unverified: whether Vivaldi reads this key is decided by the spike (design 3.4). Never writable here.
+  // Measured (design 3.4): Vivaldi does not read this key. Kept as an inert, never-writable entry; no row looks it up.
   { id: "vivaldi", subkey: `Software\\Vivaldi\\NativeMessagingHosts\\${HOST_NAME}`, writable: false },
 ]);
 
 // ----- Browser rows (design 1.2, 1.4) ---------------------------------------------------------
 
-/** Order = fallback recommendation order (design 2.2). */
+/** Table order. It is not the order of the wizard's choices and no browser is recommended by position. */
 export const COLLECTOR_BROWSER_IDS = ["edge", "chrome", "vivaldi"] as const;
 export type CollectorBrowserId = (typeof COLLECTOR_BROWSER_IDS)[number];
 
@@ -206,12 +206,18 @@ const EDGE_ROW: CollectorVerifiedBrowserSpec = {
   },
 };
 
-// Vivaldi: where (and whether) it looks up Native Messaging hosts is unverified (spike). Empty
-// lookupOrder/ownTargets are placeholders; nothing is registered or recommended for this row.
-const VIVALDI_ROW: CollectorUnverifiedBrowserSpec = {
+// Vivaldi is "verified" on the Product Owner's say-so (2026-11-23) and the registry spike of
+// 2026-11-20 (design 3.4): Vivaldi reads only the Chromium key and then the Chrome key, never a
+// Vivaldi key. So MAGINALIA registers nothing for it (`ownTargets: []`); the always-registered
+// Chrome key is what it uses, unless somebody else's Chromium key shadows it (that key is read,
+// never written). NOT VERIFIED: the real Collector 0.3.0 in a packaged build has not been run under
+// Vivaldi. `policyRoot` is null on purpose: Vivaldi's policy location was not measured, so this row
+// never blocks (a verified row with no policy root is left out of the policy aggregates). The
+// presentation evidence (extensions page, UI labels, store, download URL) stays "unverified".
+const VIVALDI_ROW: CollectorVerifiedBrowserSpec = {
   id: "vivaldi",
   displayName: "Vivaldi",
-  verification: "unverified",
+  verification: "verified",
   progIdPattern: "^VivaldiHTM(\\.[A-Za-z0-9]+)?$",
   executable: {
     fileName: "vivaldi.exe",
@@ -221,7 +227,7 @@ const VIVALDI_ROW: CollectorUnverifiedBrowserSpec = {
       { folder: "ProgramFiles", relative: ["Vivaldi", "Application"] },
     ],
   },
-  nativeMessaging: { lookupOrder: [], ownTargets: [], registration: "when-present" },
+  nativeMessaging: { lookupOrder: ["chromium", "chrome"], ownTargets: [], registration: "when-present" },
   policyRoot: null,
   extensionsPage: { displayUrl: "vivaldi://extensions", launchArguments: ["vivaldi://extensions/"] },
   ui: {
@@ -236,10 +242,12 @@ const VIVALDI_ROW: CollectorUnverifiedBrowserSpec = {
     progIdPattern: "measured",
     executable: "measured",
     knownFolders: "measured",
-    lookupOrder: "unverified",
-    ownTargets: "unverified",
-    registration: "unverified",
-    policyRoot: "unverified",
+    lookupOrder: "measured",
+    ownTargets: "measured",
+    // No own target: nothing to register, so the value only has to be consistent (code, not a measurement).
+    registration: "code",
+    // A code decision (no policy is read for this row), not a measurement.
+    policyRoot: "code",
     extensionsPage: "unverified",
     ui: "unverified",
     store: "unverified",
@@ -343,7 +351,10 @@ export interface CollectorRecommendationInput {
 
 /**
  * Chooses the recommended browser and the reason that selects the wizard copy.
- * Only verified, found, non-blocked rows can be recommended. Pure and total.
+ * Only the default browser can be recommended, and only when its row is verified, found and not
+ * blocked (`default-supported`). Otherwise nothing is recommended: `none-installed` or
+ * `detection-failed` when no row is usable at all, else the reason the default cannot be used.
+ * Pure and total.
  */
 export function recommendCollectorBrowser(
   input: CollectorRecommendationInput,
@@ -362,15 +373,14 @@ export function recommendCollectorBrowser(
     return Object.freeze({ recommended: defaultRow.id, reason: "default-supported" as const });
   }
 
-  // Fallback: first usable row in table order (Edge -> Chrome -> Vivaldi, owner decision 2).
-  const fallback = table.find(usable);
-  if (fallback === undefined) {
+  // Only the default browser is ever recommended: there is no fallback to another usable row.
+  if (!table.some(usable)) {
     const verifiedRows = table.filter((row) => row.verification === "verified");
     const allUnknown = verifiedRows.length > 0 && verifiedRows.every((row) => detectionOf(row.id).installed === "unknown");
     return Object.freeze({ recommended: null, reason: allUnknown ? ("detection-failed" as const) : ("none-installed" as const) });
   }
 
-  return Object.freeze({ recommended: fallback.id, reason: defaultReason(input.defaultBrowser, defaultRow, detectionOf) });
+  return Object.freeze({ recommended: null, reason: defaultReason(input.defaultBrowser, defaultRow, detectionOf) });
 }
 
 function defaultReason(
