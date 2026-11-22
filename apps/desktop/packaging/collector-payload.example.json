@@ -11,13 +11,13 @@
   "extension": {
     "version": "0.3.0",
     "id": "blgmoddncpknfnikdfnjelmdmphfgknf",
-    "zipSha256": "d5190a0f02fafe59b4d1bdc14ef35f7d029f6d70551f0ee2d70857c554b3df00",
+    "zipSha256": "548b48b1423206666258db88724f11478cfa40b784fdffbd8f58c5e86027bfbf",
     "files": {
       "capture.css": "aba5e81983c43b9b6ede8a306592b4953da16c2d94aeaf3f82227c2881ea4dd3",
       "capture.html": "c04ff4f7944a3566cc0d1f1e00d9ebbc0d58db1749b4d769fbfd9202f263f3ed",
       "capture.js": "46e9157fdd7098648f96ef333f56bffa99a63da8143d17708fbbd47976ac73c0",
       "host-client.js": "3bb729912da3f0f64d324c4e878ef46b0459510427134703fa9a8fc351c39ef7",
-      "icon..png": "87854c88845046506c33765c0a2958a5744e4c7147225eecce7d2c47f48ead67",
+      "icon..png": "4466d6bf8b6dc3b7eec6fd8067e4114869649c1e8403bc475ab5330fd9c26d85",
       "manifest.json": "3335f812650a18f9e181e59eb1ce27b9a6b417002d14614e44ac3a7e79c2bbd5",
       "onboarding.css": "89ea786d13b1e8f368bb982b5ab1407e76c6f47b43a5c5b65f91aa14220e85e5",
       "onboarding.html": "b71b8298e5f3b1322293344614bf778fafbe6d9e96c255c9d8d453ad35013820",

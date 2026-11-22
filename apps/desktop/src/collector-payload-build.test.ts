@@ -249,7 +249,7 @@ describe("repository pin and build-time flag", () => {
       version: "0.3.0",
       asset: "maginalia-collector-0.3.0.zip",
       url: "https://github.com/potoha/MAGINALIA-Collector/releases/download/v0.3.0/maginalia-collector-0.3.0.zip",
-      sha256: "d5190a0f02fafe59b4d1bdc14ef35f7d029f6d70551f0ee2d70857c554b3df00",
+      sha256: "548b48b1423206666258db88724f11478cfa40b784fdffbd8f58c5e86027bfbf",
       extensionId: COLLECTOR_ID,
     });
     expect(pin.files).toHaveLength(14);
