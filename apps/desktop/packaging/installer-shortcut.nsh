@@ -110,7 +110,7 @@ FunctionEnd
   IfFileExists "$DESKTOP\${MAGINALIA_PRERELEASE_NAME}.lnk" 0 MAGINALIA_PrereleaseDesktopShortcutDone
     System::Call 'Kernel32::SetEnvironmentVariable(t "MAGINALIA_LEGACY_LNK", t "$DESKTOP\${MAGINALIA_PRERELEASE_NAME}.lnk")i'
     System::Call 'Kernel32::SetEnvironmentVariable(t "MAGINALIA_LEGACY_EXE", t "$INSTDIR\${MAGINALIA_PRERELEASE_NAME}.exe")i'
-    nsExec::Exec '"$SYSDIR\WindowsPowerShell1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$l=(New-Object -ComObject WScript.Shell).CreateShortcut($$env:MAGINALIA_LEGACY_LNK);if($$l.TargetPath -ieq $$env:MAGINALIA_LEGACY_EXE){Remove-Item -LiteralPath $$env:MAGINALIA_LEGACY_LNK;exit 0}else{exit 3}"'
+    nsExec::Exec '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$l=(New-Object -ComObject WScript.Shell).CreateShortcut($$env:MAGINALIA_LEGACY_LNK);if($$l.TargetPath -ieq $$env:MAGINALIA_LEGACY_EXE){Remove-Item -LiteralPath $$env:MAGINALIA_LEGACY_LNK;exit 0}else{exit 3}"'
     Pop $0
     ${If} $0 == 0
       StrCpy $MAGINALIA_PRERELEASE_LINK_REMOVED "1"
