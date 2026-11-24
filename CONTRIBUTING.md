@@ -13,11 +13,10 @@
 3. 1つのPRでは1つの目的に絞ってください。
 4. 新規ファイルには、SPDXヘッダ（`SPDX-License-Identifier: AGPL-3.0-or-later`）を付けてください。
 
-## ライセンスとCLA
+## ライセンスと権利
 
 - 本プロジェクトは AGPL-3.0-or-later で配布されます。貢献されたコードも同じ条件で公開されます。
-- 初めてPRを送るときに、[Contributor License Agreement（CLA）](CLA.md)への署名をお願いします。PRにbotがコメントするので、指示に従ってください。
-- CLAでは、**著作権は貢献者のまま**です。メンテナに、貢献物を別のライセンス（商用ライセンスを含む）でも提供する許諾を与えてもらいます。この仕組みで、無料の公開版を維持しながら、有償サポートなどの事業を成り立たせます。
+- 本プロジェクトの権利は、MADA 5sounds (go-on) が持ちます。貢献されたコードも、同様に扱います。
 - 他人が書いたコードや、ライセンスが不明なコードは含めないでください。
 
 ## フォークする方へ
@@ -33,6 +32,6 @@
 We welcome bug reports, proposals, documentation, refactoring, and upstream proposals of improvements made in forks. Open an issue or a pull request; for forks, pointing to the relevant commits or branch is enough. Regular contributors may be invited as collaborators.
 
 - Development branch: `dev0.2` (may change; check the README and issues).
-- The project is licensed under AGPL-3.0-or-later. Your first pull request requires signing the [CLA](CLA.md) via the bot. You keep the copyright of your contribution and grant the Maintainer the right to also offer it under other licenses, including commercial ones.
+- The project is licensed under AGPL-3.0-or-later. The rights to this project are held by MADA 5sounds (go-on); contributions are treated the same way.
 - Do not submit code you do not have the right to submit.
 - Forks are welcome under AGPL-3.0-or-later. Modified versions that are distributed or offered as a network service must make their source available. Follow [TRADEMARKS.md](TRADEMARKS.md) regarding the name and logo.
