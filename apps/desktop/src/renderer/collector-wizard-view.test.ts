@@ -266,6 +266,17 @@ describe("wizard view: steps B and C", () => {
     expectClean(v);
   });
 
+  it("B outdated with a remove requested says the update is paused, not 次回起動時 (B-3)", () => {
+    const h = atStepB({ state: "outdated", removeRequested: true });
+    send(h, { type: "register" });
+    const v = view(h);
+    const text = v.live.status.map((message) => `${message.headline}${message.detail ?? ""}`).join("");
+    expect(text).toContain("解除の途中で止まっています");
+    expect(text).not.toContain("次回起動時");
+    expect(v.buttons.find((button) => button.id === "next")?.enabled).toBe(true);
+    expectClean(v);
+  });
+
   it("B self-check-failed is an alert; only 戻る and 閉じる remain (no register, no 次へ)", () => {
     const h = atStepB();
     send(h, { type: "register" });

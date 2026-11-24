@@ -22,6 +22,8 @@ export const COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND_ID = "maginalia.collector
 export const COLLECTOR_DISMISS_NOTICE_COMMAND_ID = "maginalia.collector.dismissNotice";
 /** The remove command (design 5). The remove-failed notice's retry button dispatches it. */
 export const COLLECTOR_REMOVE_COMMAND_ID = "maginalia.collector.removeIntegration";
+/** B-2: leaves the "remove requested" state without removing anything; the integration returns to normal operation. */
+export const COLLECTOR_CANCEL_REMOVE_COMMAND_ID = "maginalia.collector.cancelRemove";
 
 export const COLLECTOR_NOTICE_IDS = Object.freeze({
   updated: "collector.notice.updated",
@@ -73,7 +75,7 @@ export type CollectorNotice =
   | (NoticeBase & {
     readonly kind: "remove-failed";
     /**
-     * Not persisted. Raised in the session where a confirmed remove threw, and again at startup while
+     * Not persisted. Raised in the session where a confirmed remove threw or ended `failed`, and again at startup while
      * `removeRequested` is set and the installation is `outdated` (the state in which the automatic refresh
      * is paused). Cleared by any remove / setup / repair result, or closed for the session by dismissal.
      */
@@ -116,7 +118,7 @@ export function buildAlpha1MigrationNotice(): CollectorNotice {
   return Object.freeze({
     id: COLLECTOR_NOTICE_IDS.alpha1Migration,
     kind: "alpha1-migration" as const,
-    title: "Chrome で読んでいる Web ページの引用を、本棚に保存できるようになりました（MAGINALIA Collector）。",
+    title: "ブラウザーで読んでいる Web ページの引用を、本棚に保存できるようになりました（MAGINALIA Collector）。",
     detail: null,
     clearsWhen: "dismissed" as const,
     actions: Object.freeze([
@@ -127,20 +129,21 @@ export function buildAlpha1MigrationNotice(): CollectorNotice {
 }
 
 /**
- * Decision 4: a remove that threw leaves `removeRequested` set, and while it is set (and the state is
- * `outdated`) the startup refresh does not run. The text therefore says that the automatic update is paused
- * and the only way to end that: retry the removal until it finishes. (A repair or setup from `outdated` does not
- * clear `removeRequested`, so no "cancel" is offered.)
+ * Decision 4: a remove that did not finish leaves `removeRequested` set, and while it is set (and the state is
+ * `outdated`) the startup refresh does not run. The text therefore says that the automatic update is paused and
+ * names the two ways to end that: retry the removal until it finishes, or cancel it (B-2,
+ * `maginalia.collector.cancelRemove`). A repair or setup from `outdated` does not clear `removeRequested`.
  */
 export function buildRemoveFailedNotice(): CollectorNotice {
   return Object.freeze({
     id: COLLECTOR_NOTICE_IDS.removeFailed,
     kind: "remove-failed" as const,
     title: "Collector 連携の解除に失敗しました",
-    detail: "解除を完了できませんでした。解除をやり直して完了するまで、Collector の自動更新は止まったままです。本棚・引用データは削除されていません。",
+    detail: "解除を完了できませんでした。解除をやり直して完了するか、解除を取りやめるまで、Collector の自動更新は止まったままです。本棚・引用データは削除されていません。",
     clearsWhen: "remove-or-setup-applied-or-dismissed" as const,
     actions: Object.freeze([
       { commandId: COLLECTOR_REMOVE_COMMAND_ID, label: "解除をやり直す…" },
+      { commandId: COLLECTOR_CANCEL_REMOVE_COMMAND_ID, label: "解除を取りやめる", closesNoticeId: COLLECTOR_NOTICE_IDS.removeFailed },
       { commandId: COLLECTOR_DISMISS_NOTICE_COMMAND_ID, label: "閉じる", argument: { noticeId: COLLECTOR_NOTICE_IDS.removeFailed } },
     ]),
   });

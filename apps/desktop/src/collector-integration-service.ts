@@ -137,9 +137,11 @@ export function summarizeInspection(
   inspection: CollectorIntegrationInspection,
   applyInProgress = false,
   preferred: CollectorBrowserId | null = null,
+  removeRequested = false,
 ): CollectorIntegrationStatus {
   return Object.freeze({
     applyInProgress,
+    removeRequested,
     state: inspection.state,
     reasons: Object.freeze([...inspection.reasons]),
     inspectionComplete: inspection.inspectionComplete,
@@ -251,6 +253,16 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
     }
   }
 
+  /** B-3: whether a remove is still requested; a failure reads as "no". */
+  async function removeRequested(): Promise<boolean> {
+    try {
+      return await deps.startupRefresh.removeRequested();
+    } catch (error: unknown) {
+      deps.logError("MAGINALIA_COLLECTOR_REMOVE_REQUESTED_READ_FAILED", error);
+      return false;
+    }
+  }
+
   async function rememberBrowser(browser: CollectorBrowserId): Promise<void> {
     try {
       await deps.startupRefresh.setPreferredBrowser(browser);
@@ -263,7 +275,7 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
   async function runApply(request: CollectorApplyRequest, chosenBrowser?: CollectorBrowserId): Promise<CollectorIntegrationResponse> {
     const outcome = await deps.gate.tryRun(runExclusive);
     if (!outcome.ran) return { kind: "busy" };
-    return toResponse(outcome.value, await preferredBrowser());
+    return toResponse(outcome.value, await preferredBrowser(), await removeRequested());
 
     async function runExclusive() {
       let extra: Partial<{ saveDestination: CollectorSaveDestinationIpcResult["kind"] }> = {};
@@ -312,7 +324,7 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
       return { kind: "result", result, extra } as const;
     }
 
-    function toResponse(value: Awaited<ReturnType<typeof runExclusive>>, preferred: CollectorBrowserId | null): CollectorIntegrationResponse {
+    function toResponse(value: Awaited<ReturnType<typeof runExclusive>>, preferred: CollectorBrowserId | null, requested: boolean): CollectorIntegrationResponse {
     if (value.kind === "cancelled") return { kind: "cancelled" };
     const { result, extra } = value;
     return {
@@ -323,7 +335,7 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
       warnings: Object.freeze([...result.warnings]),
       selfCheck: result.selfCheck,
       // A failed self-check leaves the files "ready" on disk but the integration unusable: say so (apply reports it as damaged).
-      status: result.selfCheck === "failed" ? { ...summarizeInspection(result.inspection, false, preferred), state: result.state } : summarizeInspection(result.inspection, false, preferred),
+      status: result.selfCheck === "failed" ? { ...summarizeInspection(result.inspection, false, preferred, requested), state: result.state } : summarizeInspection(result.inspection, false, preferred, requested),
       ...extra,
     };
     }
@@ -341,7 +353,7 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
   async function handleValidated(request: CollectorIntegrationRequest): Promise<CollectorIntegrationResponse> {
     switch (request.intent) {
       case "inspect":
-        return { kind: "status", status: summarizeInspection(await inspectShared(), deps.gate.busy, await preferredBrowser()) };
+        return { kind: "status", status: summarizeInspection(await inspectShared(), deps.gate.busy, await preferredBrowser(), await removeRequested()) };
       case "checkConnection": {
         const inspection = await inspectShared();
         return { kind: "connection", state: inspection.state, applyInProgress: deps.gate.busy, connection: summarizeConnection(inspection) };
@@ -351,7 +363,7 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
           const inspection = await inspectShared();
           // Design 7.2: a verified, installed browser that policy does not block must exist.
           const usable = inspection.browsers.entries.some((entry) => entry.verification === "verified" && entry.installed === "found" && !entry.policy.blocked);
-          if (!usable) return { kind: "browser-required", status: summarizeInspection(inspection, deps.gate.busy, await preferredBrowser()) };
+          if (!usable) return { kind: "browser-required", status: summarizeInspection(inspection, deps.gate.busy, await preferredBrowser(), await removeRequested()) };
         }
         return runApply({ action: "setup", ...(request.confirmReplaceForeign === true ? { confirmReplaceForeign: true } : {}) }, request.browser);
       }
@@ -359,6 +371,16 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
         return runApply({ action: "repair", ...(request.confirmReplaceForeign === true ? { confirmReplaceForeign: true } : {}) });
       case "remove":
         return runApply({ action: "remove" });
+      case "cancelRemove": {
+        // B-2. Not an apply: it removes and writes nothing but the notice state, so it needs no gate. A remove that is
+        // running right now owns the flag until it ends (`beginRemove` / `recordApplyResult`), hence `busy`.
+        if (deps.gate.busy) return { kind: "busy" };
+        // A finished removal has nothing left to cancel; the user sets the integration up again instead.
+        if ((await inspectShared()).state === "not-set-up") return { kind: "cancel-remove", result: "nothing-to-cancel" };
+        const result = await deps.startupRefresh.cancelRemove();
+        publish(deps.startupRefresh.currentNotices());
+        return { kind: "cancel-remove", result };
+      }
       case "openBrowserExtensions": {
         // The renderer names at most a table row id. The executable comes from the main-process locator
         // and the arguments from the row: nothing here is taken from the request.

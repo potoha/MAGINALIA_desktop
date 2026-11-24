@@ -37,6 +37,7 @@ export function status(over: StatusOverrides = {}): CollectorIntegrationStatus {
   const { browsers, ...rest } = over;
   return {
     applyInProgress: false,
+    removeRequested: false,
     state: "not-set-up",
     reasons: [],
     inspectionComplete: true,

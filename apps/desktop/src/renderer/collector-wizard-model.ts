@@ -447,6 +447,7 @@ export function classifyWizardResponse(response: CollectorIntegrationResponse): 
     }
     case "invalid-request":
     case "error":
+    case "cancel-remove": // the wizard never sends `cancelRemove`
       return { class: "invalid" };
     case "busy":
       return { class: "busy" };
@@ -503,8 +504,12 @@ export const APPLY_REASON_MESSAGE: Readonly<Record<CollectorApplyReason, WizardM
   "self-check-failed": "self-check-failed",
 };
 
-/** `outdated-pending`: registered, and the main process updates it itself at the next start; the user may go on. */
-const STEP_B_SUCCESS: readonly WizardMessageId[] = ["registered-not-effective", "registered", "registered-verified", "already-ready", "refreshed", "outdated-pending"];
+/**
+ * `outdated-pending`: registered, and the main process updates it itself at the next start; the user may go on.
+ * `outdated-remove-paused` (B-3): the same installation while a remove is still requested; the update is paused until
+ * that remove is cancelled (`maginalia.collector.cancelRemove`) or finished, so the "next start" promise would be false.
+ */
+const STEP_B_SUCCESS: readonly WizardMessageId[] = ["registered-not-effective", "registered", "registered-verified", "already-ready", "refreshed", "outdated-pending", "outdated-remove-paused"];
 /** After these the step B button is gone: retrying cannot help. */
 const STEP_B_TERMINAL: readonly WizardMessageId[] = [
   "folder-unsafe",
@@ -1070,7 +1075,7 @@ function reduceUserEvent(state: WizardState, event: WizardUserEvent & { readonly
       if (state.status?.state === "outdated") {
         // `apply` can only refresh an outdated installation, and no renderer intent exists for that: the main process
         // refreshes it at the next start. Registration is already in place, so let the user go on.
-        return unchanged(withResult(state, "B", "outdated-pending"));
+        return unchanged(withResult(state, "B", state.status.removeRequested ? "outdated-remove-paused" : "outdated-pending"));
       }
       const issued = issue(withResult(state, "B", null), "setup", setupRequest(state, false));
       return reduction(issued.state, issued.effect);

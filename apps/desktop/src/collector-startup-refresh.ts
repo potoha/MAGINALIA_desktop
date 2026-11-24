@@ -104,6 +104,15 @@ export interface CollectorStartupRefresh {
    * `beginRemove` could not persist it) and the "remove failed" notice is raised. Never throws.
    */
   recordRemoveFailure(): Promise<void>;
+  /** `removeRequested` as persisted now (the wizard needs it to tell a paused update from a pending one). `false` when unknown. Never throws. */
+  removeRequested(): Promise<boolean>;
+  /**
+   * B-2: the user cancels a remove that is still "requested" (`maginalia.collector.cancelRemove`). Clears
+   * `removeRequested` and the remove-failed notice, so the next start refreshes and repairs as usual. Removes
+   * nothing and changes no file. `"not-requested"`: the flag was not set. `"unchanged"`: the state could not be
+   * written (the flag may still be set). Never throws.
+   */
+  cancelRemove(): Promise<"cleared" | "not-requested" | "unchanged">;
   /** The browser the user last chose (multi-browser design 7.4), or `null`. Never throws. */
   preferredBrowser(): Promise<CollectorBrowserId | null>;
   /** Remembers the user's browser choice (same serialized state chain as every other write). Never throws. */
@@ -352,12 +361,16 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
         }
         if (result.action === "remove") removeBeganFrom = undefined;
         if (result.action === "remove") {
+          const failedWithoutThrowing = result.outcome === "failed";
           // A removal that ran to a result (even a partial one) supersedes an earlier failure notice.
           dismissedForSession.delete(COLLECTOR_NOTICE_IDS.removeFailed);
           active.delete(COLLECTOR_NOTICE_IDS.removeFailed);
           // Whatever else happened, the user asked for it: stay quiet (a `partial` removal still looks damaged).
           active.delete(COLLECTOR_NOTICE_IDS.repair);
           active.delete(COLLECTOR_NOTICE_IDS.updated);
+          // B-5: a remove that ended `failed` without throwing leaves the flag set just as a throw does. Say so now
+          // instead of waiting for the next start (where only an `outdated` installation would show it).
+          if (failedWithoutThrowing) active.set(COLLECTOR_NOTICE_IDS.removeFailed, buildRemoveFailedNotice());
           await mutate((state) => !state.removeRequested || state.updated !== null ? { ...state, removeRequested: true, updated: null } : undefined);
         } else if ((result.action === "setup" || result.action === "repair") && (result.outcome === "applied" || result.outcome === "noop")) {
           active.delete(COLLECTOR_NOTICE_IDS.repair);
@@ -400,6 +413,32 @@ export function createCollectorStartupRefresh(deps: CollectorStartupRefreshDepen
         await mutate((state) => !state.removeRequested ? { ...state, removeRequested: true } : undefined);
       } catch {
         // best effort
+      }
+    },
+
+    async removeRequested(): Promise<boolean> {
+      try {
+        return (await mutate(() => undefined)).state.removeRequested;
+      } catch {
+        return false;
+      }
+    },
+
+    async cancelRemove(): Promise<"cleared" | "not-requested" | "unchanged"> {
+      try {
+        if (deps.e2eIsolationActive) return "not-requested";
+        removeBeganFrom = undefined;
+        const result = await mutate((state) => state.removeRequested ? { ...state, removeRequested: false } : undefined);
+        // Not persisted and not changed: the flag was not set. Not persisted but changed: the write failed.
+        if (!result.persisted && result.state.removeRequested === false) {
+          const reread = (await mutate(() => undefined)).state;
+          if (reread.removeRequested) return "unchanged";
+        }
+        dismissedForSession.delete(COLLECTOR_NOTICE_IDS.removeFailed);
+        active.delete(COLLECTOR_NOTICE_IDS.removeFailed);
+        return result.persisted ? "cleared" : "not-requested";
+      } catch {
+        return "unchanged";
       }
     },
 

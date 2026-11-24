@@ -2014,7 +2014,11 @@ registerCollectorIntegrationCommands(commandRegistry, {
   run: typeof window.maginalia.runCollectorIntegration === "function" ? (request) => window.maginalia.runCollectorIntegration!(request) : null,
   dismiss: typeof window.maginalia.dismissCollectorNotice === "function" ? (noticeId) => window.maginalia.dismissCollectorNotice!(noticeId) : null,
   // Both calls are optional in the preload API: without them the commands report "unavailable" instead of opening a dead wizard.
-  openWizard: createCollectorWizardOpener(window.maginalia)
+  openWizard: createCollectorWizardOpener(window.maginalia),
+  report: (message) => {
+    documentStatus.dataset.state = "saved";
+    documentStatus.textContent = message;
+  }
 });
 // Collector notices: asked for once per renderer start; every notice button runs its command ID through the registry.
 if (!firstRunMode) {

@@ -10,6 +10,7 @@ import { COLLECTOR_BROWSER_IDS } from "./collector-browser-table.js";
 import {
   COLLECTOR_INTEGRATION_INTENTS,
   COLLECTOR_NOTICE_ID_VALUES,
+  COLLECTOR_NOTICE_KIND_BY_ID,
   isCollectorIntegrationRequest,
   isCollectorNoticeId,
   isCollectorNoticeList,
@@ -65,6 +66,36 @@ describe("Collector integration IPC contract", () => {
     expect(isCollectorNoticeId(COLLECTOR_NOTICE_IDS.repair)).toBe(true);
     expect(isCollectorNoticeId("collector.notice.other")).toBe(false);
     expect(isCollectorNoticeId(undefined)).toBe(false);
+  });
+
+  it("knows the cancelRemove intent (B-2) and gives it no extra fields", () => {
+    expect(COLLECTOR_INTEGRATION_INTENTS as readonly string[]).toContain("cancelRemove");
+    expect(isCollectorIntegrationRequest({ intent: "cancelRemove" })).toBe(true);
+    for (const extra of [{ confirmReplaceForeign: true }, { proceedWithoutSupportedBrowser: true }, { browser: "chrome" }]) {
+      expect(isCollectorIntegrationRequest({ intent: "cancelRemove", ...extra })).toBe(false);
+    }
+  });
+
+  it("keeps the id-to-kind table equal to what the notice builders produce", () => {
+    const real = [buildUpdatedNotice("0.4.0", "2026-11-16T09:00:00.000Z"), buildRepairNotice("damaged"), buildAlpha1MigrationNotice(), buildRemoveFailedNotice()];
+    expect(Object.fromEntries(real.map((notice) => [notice.id, notice.kind]))).toEqual(COLLECTOR_NOTICE_KIND_BY_ID);
+    expect(Object.keys(COLLECTOR_NOTICE_KIND_BY_ID).sort()).toEqual([...COLLECTOR_NOTICE_ID_VALUES].sort());
+  });
+
+  it("rejects a notice whose kind is unknown or does not match its id (B-5)", () => {
+    const [updated, , alpha1] = [buildUpdatedNotice("0.4.0", "2026-11-16T09:00:00.000Z"), buildRepairNotice("damaged"), buildAlpha1MigrationNotice()];
+    const failed = buildRemoveFailedNotice();
+    for (const kind of ["", "unknown", "Updated", "REPAIR", null, undefined, 1, {}, "toString", "__proto__"]) {
+      expect(isCollectorNoticeList([{ ...failed, kind }]), String(kind)).toBe(false);
+    }
+    // every known kind on every other known id
+    expect(isCollectorNoticeList([{ ...updated, kind: "repair" }])).toBe(false);
+    expect(isCollectorNoticeList([{ ...alpha1, kind: "remove-failed" }])).toBe(false);
+    expect(isCollectorNoticeList([{ ...failed, kind: "alpha1-migration" }])).toBe(false);
+    expect(isCollectorNoticeList([{ ...failed, kind: "updated" }])).toBe(false);
+    // an id that is an Object.prototype key is not a known id
+    expect(isCollectorNoticeList([{ ...failed, id: "constructor" }])).toBe(false);
+    expect(isCollectorNoticeList([failed])).toBe(true);
   });
 
   it("accepts the real notices and rejects malformed lists", () => {

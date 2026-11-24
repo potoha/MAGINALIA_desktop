@@ -74,6 +74,7 @@ export const WIZARD_MESSAGE_IDS = [
   "self-check-failed",
   "register-failed",
   "outdated-pending",
+  "outdated-remove-paused",
   // blocking request without an answer for a long time (watchdog)
   "inflight-slow",
   // step C
@@ -123,6 +124,7 @@ export const WIZARD_MESSAGE_ROLE: Readonly<Record<WizardMessageId, WizardMessage
   "self-check-failed": "alert",
   "register-failed": "alert",
   "outdated-pending": "status",
+  "outdated-remove-paused": "status",
   "inflight-slow": "alert",
   "destination-configured": "status",
   "destination-writes-disabled": "alert",
@@ -703,6 +705,10 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
       "register-failed": {
         headline: "連携プログラムを登録できませんでした。",
         detail: "もう一度お試しください。解決しない場合は、メニューの「Collector 連携を確認・修復…」をお使いください。",
+      },
+      "outdated-remove-paused": {
+        headline: "連携プログラムは登録済みですが、解除の途中で止まっています。",
+        detail: "解除を取りやめるか完了するまで、連携プログラムの自動更新は止まっています。元に戻すには、メニューの「Collector 連携の解除を取りやめる」を実行してください。このまま次へ進めます。",
       },
       "outdated-pending": {
         headline: "連携プログラムは登録済みです。",

@@ -483,6 +483,7 @@ describe("remove apply threw (decision 4)", () => {
     expect(notices[0]?.detail).toContain("自動更新は止まったまま");
     expect(notices[0]?.actions.map((action) => action.commandId)).toEqual([
       "maginalia.collector.removeIntegration",
+      "maginalia.collector.cancelRemove",
       "maginalia.collector.dismissNotice",
     ]);
   });
@@ -744,5 +745,79 @@ describe("repair notice dismissal", () => {
     await startup.runStartup();
     expect(await startup.dismiss(COLLECTOR_NOTICE_IDS.repair)).toEqual([]);
     expect(kinds((await createCollectorStartupRefresh(r.deps).runStartup()).notices)).toEqual(["repair"]);
+  });
+});
+
+describe("remove that ended failed without throwing (B-5)", () => {
+  it("raises the remove-failed notice now, keeps the flag, and a partial remove stays quiet", async () => {
+    const r = rig("damaged");
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.beginRemove();
+    await startup.recordApplyResult(applyResult("failed", "write-failed", "remove"));
+    expect(kinds(startup.currentNotices())).toEqual(["remove-failed"]);
+    expect(r.store.state.removeRequested).toBe(true);
+    await startup.recordApplyResult(applyResult("applied", null, "remove"));
+    expect(startup.currentNotices()).toEqual([]);
+    await startup.recordApplyResult(applyResult("partial", null, "remove"));
+    expect(startup.currentNotices()).toEqual([]);
+  });
+});
+
+describe("cancelRemove and removeRequested (B-2, B-3)", () => {
+  it("reports the persisted flag", async () => {
+    const r = rig("outdated");
+    const startup = createCollectorStartupRefresh(r.deps);
+    expect(await startup.removeRequested()).toBe(false);
+    await startup.beginRemove();
+    expect(await startup.removeRequested()).toBe(true);
+  });
+
+  it("clears the flag and the remove-failed notice, touches nothing else, and the next start refreshes again", async () => {
+    const r = rig("outdated");
+    r.store.state = { ...DEFAULT_COLLECTOR_NOTICE_STATE, removeRequested: true, alpha1: "shown", browser: "edge" };
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.recordRemoveFailure();
+    expect(kinds(startup.currentNotices())).toEqual(["remove-failed"]);
+    expect(await startup.cancelRemove()).toBe("cleared");
+    expect(r.store.state).toEqual({ ...DEFAULT_COLLECTOR_NOTICE_STATE, removeRequested: false, alpha1: "shown", browser: "edge" });
+    expect(startup.currentNotices()).toEqual([]);
+    expect(r.applies).toEqual([]);
+    const next = await createCollectorStartupRefresh(r.deps).runStartup();
+    expect(next.outcome).not.toBe("remove-requested");
+    expect(r.applies.length).toBe(1);
+  });
+
+  it("a notice dismissed for the session does not hide a later failure after a cancel", async () => {
+    const r = rig("outdated");
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.recordRemoveFailure();
+    await startup.dismiss("collector.notice.remove-failed");
+    expect(await startup.cancelRemove()).toBe("cleared");
+    await startup.beginRemove();
+    await startup.recordRemoveFailure();
+    expect(kinds(startup.currentNotices())).toEqual(["remove-failed"]);
+  });
+
+  it("says not-requested when nothing was requested, and writes nothing", async () => {
+    const r = rig("outdated");
+    expect(await createCollectorStartupRefresh(r.deps).cancelRemove()).toBe("not-requested");
+    expect(r.store.writes).toEqual([]);
+  });
+
+  it("says unchanged when the state cannot be written, and keeps the notice", async () => {
+    const r = rig("outdated");
+    r.store.state = { ...DEFAULT_COLLECTOR_NOTICE_STATE, removeRequested: true };
+    const startup = createCollectorStartupRefresh(r.deps);
+    await startup.recordRemoveFailure();
+    r.store.failWrites = true;
+    expect(await startup.cancelRemove()).toBe("unchanged");
+    expect(kinds(startup.currentNotices())).toEqual(["remove-failed"]);
+    expect(r.store.state.removeRequested).toBe(true);
+  });
+
+  it("does nothing under E2E isolation", async () => {
+    const r = rig("outdated");
+    r.isolated = true;
+    expect(await createCollectorStartupRefresh(r.deps).cancelRemove()).toBe("not-requested");
   });
 });

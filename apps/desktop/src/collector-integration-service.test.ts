@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CollectorApplyRequest, CollectorApplyResult } from "./collector-integration-apply-types.js";
-import { buildAlpha1MigrationNotice, COLLECTOR_NOTICE_IDS, type CollectorNotice } from "./collector-integration-notices.js";
+import { buildAlpha1MigrationNotice, buildRemoveFailedNotice, COLLECTOR_NOTICE_IDS, type CollectorNotice } from "./collector-integration-notices.js";
 import type { CollectorBrowserId, CollectorRecommendationReason } from "./collector-browser-table.js";
 import type { BrowserLocation, CollectorBrowserStatus, CollectorBrowsersInspection, CollectorIntegrationInspection, CollectorIntegrationState } from "./collector-integration-types.js";
 import { createCollectorStartupRefresh, type CollectorStartupRefresh } from "./collector-startup-refresh.js";
@@ -102,6 +102,8 @@ interface Rig {
   readonly events: string[];
   readonly externalOpened: string[];
   externalResult: boolean;
+  removeRequested: boolean;
+  cancelRemoveResult: "cleared" | "not-requested" | "unchanged";
 }
 
 function rig(overrides: Partial<CollectorIntegrationServiceDependencies> = {}): Rig {
@@ -126,6 +128,8 @@ function rig(overrides: Partial<CollectorIntegrationServiceDependencies> = {}): 
     events: [],
     externalOpened: [],
     externalResult: true,
+    removeRequested: false,
+    cancelRemoveResult: "cleared",
     startup: undefined as unknown as CollectorStartupRefresh,
     get deps(): CollectorIntegrationServiceDependencies {
       return {
@@ -160,6 +164,8 @@ function rig(overrides: Partial<CollectorIntegrationServiceDependencies> = {}): 
     recordApplyResult: async (result) => { r.events.push(`record:${result.action}:${result.outcome}`); r.recorded.push(result); },
     beginRemove: async () => { r.events.push("beginRemove"); },
     recordRemoveFailure: async () => { r.events.push("recordRemoveFailure"); },
+    removeRequested: async () => r.removeRequested,
+    cancelRemove: async () => { r.events.push("cancelRemove"); return r.cancelRemoveResult; },
     preferredBrowser: async () => r.preferred,
     setPreferredBrowser: async (browser) => { r.rememberCalls.push(browser); r.preferred = browser; },
     currentNotices: () => r.notices,
@@ -456,7 +462,7 @@ describe("collector integration service", () => {
         launchBrowser: async () => { calls.push("launch"); return true; },
         writeClipboardText: () => { calls.push("clipboard"); },
       });
-      for (const intent of ["inspect", "setup", "repair", "remove", "openBrowserExtensions", "openBrowserDownloadPage", "copyExtensionPath", "revealExtensionFolder", "checkConnection"] as const) {
+      for (const intent of ["inspect", "setup", "repair", "remove", "openBrowserExtensions", "openBrowserDownloadPage", "copyExtensionPath", "revealExtensionFolder", "checkConnection", "cancelRemove"] as const) {
         expect(await service.handle({ intent })).toEqual({ kind: "unavailable", reason });
       }
       service.startPeriodicReconcile(1);
@@ -704,6 +710,54 @@ describe("collector integration service", () => {
     expect(r.logs).toEqual(["MAGINALIA_COLLECTOR_REMOVE_APPLY_FAILED", "MAGINALIA_COLLECTOR_INTEGRATION_REQUEST_FAILED"]);
     expect(r.recorded).toEqual([]);
     expect(r.clearCalls).toBe(0);
+  });
+
+  it("status carries removeRequested (B-3), on inspect and after an apply", async () => {
+    const r = rig();
+    const service = createCollectorIntegrationService(r.deps);
+    expect(await service.handle({ intent: "inspect" })).toMatchObject({ kind: "status", status: { removeRequested: false } });
+    r.removeRequested = true;
+    expect(await service.handle({ intent: "inspect" })).toMatchObject({ kind: "status", status: { removeRequested: true } });
+    expect(await service.handle({ intent: "repair" })).toMatchObject({ kind: "apply", status: { removeRequested: true } });
+  });
+
+  it("cancelRemove (B-2) clears through the orchestrator, publishes, runs no apply and needs no confirmation", async () => {
+    const r = rig();
+    r.current = inspection("outdated");
+    r.notices = [buildRemoveFailedNotice()];
+    const service = createCollectorIntegrationService(r.deps);
+    expect(await service.handle({ intent: "cancelRemove" })).toEqual({ kind: "cancel-remove", result: "cleared" });
+    expect(r.events).toEqual(["cancelRemove"]);
+    expect(r.applies).toEqual([]);
+    expect(r.recorded).toEqual([]);
+  });
+
+  it("cancelRemove passes not-requested and unchanged through, and says nothing-to-cancel after a finished removal", async () => {
+    const r = rig();
+    r.current = inspection("outdated");
+    const service = createCollectorIntegrationService(r.deps);
+    for (const result of ["not-requested", "unchanged"] as const) {
+      r.cancelRemoveResult = result;
+      expect(await service.handle({ intent: "cancelRemove" })).toEqual({ kind: "cancel-remove", result });
+    }
+    r.events.length = 0;
+    r.current = inspection("not-set-up");
+    expect(await service.handle({ intent: "cancelRemove" })).toEqual({ kind: "cancel-remove", result: "nothing-to-cancel" });
+    expect(r.events).toEqual([]);
+  });
+
+  it("cancelRemove is busy while an apply runs and never races a remove", async () => {
+    const r = rig();
+    const started = deferred<void>();
+    const release = deferred<void>();
+    r.applyImpl = async (request) => { started.resolve(); await release.promise; return applyResult(request.action); };
+    const service = createCollectorIntegrationService(r.deps);
+    const running = service.handle({ intent: "repair" });
+    await started.promise;
+    expect(await service.handle({ intent: "cancelRemove" })).toEqual({ kind: "busy" });
+    release.resolve();
+    await running;
+    expect(r.events).not.toContain("cancelRemove");
   });
 
   it("a failing recordRemoveFailure does not hide the original remove error", async () => {

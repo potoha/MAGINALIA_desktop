@@ -23,6 +23,7 @@ import { openCollectorWizard, type CollectorWizardDeps } from "./collector-wizar
 export const COLLECTOR_SETUP_COMMAND = "maginalia.collector.setup";
 export const COLLECTOR_REPAIR_COMMAND = "maginalia.collector.repair";
 export const COLLECTOR_REMOVE_INTEGRATION_COMMAND = "maginalia.collector.removeIntegration";
+export const COLLECTOR_CANCEL_REMOVE_COMMAND = "maginalia.collector.cancelRemove";
 export const COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND = "maginalia.collector.openBrowserExtensions";
 export const COLLECTOR_DISMISS_NOTICE_COMMAND = "maginalia.collector.dismissNotice";
 
@@ -36,6 +37,11 @@ export interface CollectorIntegrationCommandDependencies {
    * `configureCollectorSaveDestination` (both are optional in the preload API).
    */
   readonly openWizard: (() => void) | null;
+  /**
+   * Shows a one-line result that is not a problem (a finished or declined remove, a cancelled remove request).
+   * Optional: without it those results stay silent, as before.
+   */
+  readonly report?: (message: string) => void;
 }
 
 const UNAVAILABLE_MESSAGE = "Collector 連携はこの環境では使えません。";
@@ -68,6 +74,33 @@ function supportedBrowserNames(): string {
 }
 
 /**
+ * The line for a result that is neither a failure nor silent: what a `remove` or `cancelRemove` ended with
+ * (B-5, B-2). `null` for every other response.
+ */
+export function collectorResponseNotice(response: CollectorIntegrationResponse): string | null {
+  switch (response.kind) {
+    case "cancelled":
+      return "Collector 連携の解除は行いませんでした。";
+    case "apply":
+      return response.action === "remove" && (response.outcome === "applied" || response.outcome === "noop")
+        ? "Collector 連携を解除しました。本棚・引用データは削除していません。"
+        : null;
+    case "cancel-remove":
+      switch (response.result) {
+        case "cleared":
+          return "解除を取りやめました。Collector 連携は、次回の起動時から自動更新を含めて通常どおり扱われます。";
+        case "not-requested":
+          return "取りやめる解除はありません。";
+        case "nothing-to-cancel":
+          return "Collector 連携はすでに解除されています。もう一度使うときは「Collector 連携を設定」を行ってください。";
+        case "unchanged":
+          return null; // reported as a problem
+      }
+  }
+  return null;
+}
+
+/**
  * The failure line for a response, or `null` when there is nothing to report. A successful setup is
  * reported by the wizard (slice B); until then only problems surface.
  */
@@ -89,6 +122,8 @@ export function collectorResponseProblem(response: CollectorIntegrationResponse)
         ? "ブラウザーの拡張機能の画面を開けませんでした。対応しているブラウザーが見つかりません。"
         : `${row.displayName} の拡張機能の画面を開けませんでした。${row.displayName} のアドレスバーに ${row.extensionsPage.displayUrl} と入力してください。`;
     }
+    case "cancel-remove":
+      return response.result === "unchanged" ? "解除の取りやめを保存できませんでした。もう一度お試しください。" : null;
     case "apply":
       return response.outcome === "failed" || response.outcome === "refused" || response.outcome === "partial"
         ? "Collector 連携の操作を完了できませんでした。「Collector 連携を確認・修復…」で状態を確認してください。"
@@ -101,8 +136,11 @@ export function collectorResponseProblem(response: CollectorIntegrationResponse)
 export function registerCollectorIntegrationCommands(registry: CommandRegistry, dependencies: CollectorIntegrationCommandDependencies): void {
   const run = async (request: CollectorIntegrationRequest): Promise<void> => {
     if (dependencies.run === null) throw new Error(UNAVAILABLE_MESSAGE);
-    const problem = collectorResponseProblem(await dependencies.run(request));
+    const response = await dependencies.run(request);
+    const problem = collectorResponseProblem(response);
     if (problem !== null) throw new Error(problem);
+    const notice = collectorResponseNotice(response);
+    if (notice !== null) dependencies.report?.(notice);
   };
 
   const openWizard = (): void => {
@@ -133,6 +171,14 @@ export function registerCollectorIntegrationCommands(registry: CommandRegistry, 
     category: "Collector",
     keywords: ["collector", "chrome", "extension", "remove", "uninstall", "解除"]
   }, () => run({ intent: "remove" }));
+
+  registry.register({
+    id: COLLECTOR_CANCEL_REMOVE_COMMAND,
+    title: "Collector 連携の解除を取りやめる",
+    description: "Withdraw an unfinished Collector integration removal so that the integration is updated and checked normally again. Removes nothing.",
+    category: "Collector",
+    keywords: ["collector", "remove", "cancel", "undo", "resume", "解除", "取りやめ", "取り消し"]
+  }, () => run({ intent: "cancelRemove" }));
 
   registry.register({
     id: COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND,

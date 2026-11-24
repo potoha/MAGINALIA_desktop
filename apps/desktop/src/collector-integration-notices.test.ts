@@ -95,7 +95,7 @@ describe("notice data", () => {
     const updated = buildUpdatedNotice("0.4.0", "2026-11-16T09:00:00.000Z");
     expect(updated.detail).toBe("ブラウザーの拡張機能の画面で MAGINALIA Collector の［更新］（↻）を押すか、ブラウザーを再起動すると反映されます。");
     expect(updated.actions.map((action) => action.label)).toEqual(["ブラウザーで拡張機能の画面を開く", "閉じる"]);
-    expect(buildAlpha1MigrationNotice().title).toBe("Chrome で読んでいる Web ページの引用を、本棚に保存できるようになりました（MAGINALIA Collector）。");
+    expect(buildAlpha1MigrationNotice().title).toBe("ブラウザーで読んでいる Web ページの引用を、本棚に保存できるようになりました（MAGINALIA Collector）。");
     expect(buildAlpha1MigrationNotice().actions.map((action) => action.label)).toEqual(["設定する", "今はしない"]);
     expect(buildRepairNotice("damaged").actions[0]?.commandId).toBe("maginalia.collector.repair");
   });
@@ -104,8 +104,12 @@ describe("notice data", () => {
     const notice = buildRemoveFailedNotice();
     expect(notice.title).toBe("Collector 連携の解除に失敗しました");
     expect(notice.detail).toContain("Collector の自動更新は止まったまま");
+    expect(notice.detail).toContain("解除を取りやめる");
+    // the cancel button closes the notice once its command succeeded
+    expect(notice.actions[1]?.closesNoticeId).toBe("collector.notice.remove-failed");
     expect(notice.actions.map((action) => [action.commandId, action.label])).toEqual([
       ["maginalia.collector.removeIntegration", "解除をやり直す…"],
+      ["maginalia.collector.cancelRemove", "解除を取りやめる"],
       ["maginalia.collector.dismissNotice", "閉じる"],
     ]);
     // nothing about it is persisted: the state schema is unchanged (still version 2, same four-plus-one fields)

@@ -128,7 +128,7 @@ describe("createCollectorNoticePresenter", () => {
     expect(card.children[0]!.textContent).toBe("Collector 連携の解除に失敗しました");
     expect(card.children[1]!.textContent).toContain("自動更新は止まったまま");
     const buttons = card.children[2]!.children;
-    expect(buttons.map((button) => button.textContent)).toEqual(["解除をやり直す…", "閉じる"]);
+    expect(buttons.map((button) => button.textContent)).toEqual(["解除をやり直す…", "解除を取りやめる", "閉じる"]);
     expect(region.attributes.get("aria-live")).toBe("polite");
     expect(card.attributes.get("role")).toBe("alert");
     buttons[0]!.listeners.get("click")!();

@@ -4,7 +4,9 @@ import { CommandRegistry } from "./command-registry";
 import { buildAlpha1MigrationNotice, buildRemoveFailedNotice, COLLECTOR_NOTICE_IDS } from "../collector-integration-notices";
 import type { CollectorIntegrationRequest, CollectorIntegrationResponse } from "../collector-integration-ipc";
 import {
+  collectorResponseNotice,
   collectorResponseProblem,
+  COLLECTOR_CANCEL_REMOVE_COMMAND,
   createCollectorWizardOpener,
   COLLECTOR_DISMISS_NOTICE_COMMAND,
   COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND,
@@ -172,6 +174,63 @@ describe("Collector integration commands", () => {
     const executed: Array<[string, unknown]> = [];
     await dispatchCollectorNoticeAction(notice.actions[0]!, async (id, args) => { executed.push([id, args]); });
     expect(executed).toEqual([[COLLECTOR_REMOVE_INTEGRATION_COMMAND, undefined]]);
+  });
+
+  it("the remove-failed notice's cancel button runs the cancel command and then closes the notice (B-2)", async () => {
+    const notice = buildRemoveFailedNotice();
+    const executed: Array<[string, unknown]> = [];
+    await dispatchCollectorNoticeAction(notice.actions[1]!, async (id, args) => { executed.push([id, args]); });
+    expect(executed).toEqual([
+      [COLLECTOR_CANCEL_REMOVE_COMMAND, undefined],
+      [COLLECTOR_DISMISS_NOTICE_COMMAND, { noticeId: COLLECTOR_NOTICE_IDS.removeFailed }],
+    ]);
+    // a failed cancel keeps the notice (and its retry button) on screen
+    const failed: string[] = [];
+    await dispatchCollectorNoticeAction(notice.actions[1]!, async (id) => { failed.push(id); return false; });
+    expect(failed).toEqual([COLLECTOR_CANCEL_REMOVE_COMMAND]);
+  });
+
+  it("cancelRemove is a registered, palette-visible command that sends exactly one cancelRemove intent and reports the result (B-2)", async () => {
+    const registry = new CommandRegistry();
+    const requests: CollectorIntegrationRequest[] = [];
+    const reported: string[] = [];
+    registerCollectorIntegrationCommands(registry, {
+      run: async (request) => { requests.push(request); return { kind: "cancel-remove", result: "cleared" }; },
+      dismiss: null,
+      openWizard: null,
+      report: (message) => { reported.push(message); },
+    });
+    const context = new ContextKeyService().snapshot();
+    expect(COLLECTOR_CANCEL_REMOVE_COMMAND).toBe("maginalia.collector.cancelRemove");
+    expect(registry.list(context).map((descriptor) => descriptor.id)).toContain(COLLECTOR_CANCEL_REMOVE_COMMAND);
+    expect((await registry.execute(COLLECTOR_CANCEL_REMOVE_COMMAND, context)).kind).toBe("executed");
+    expect(requests).toEqual([{ intent: "cancelRemove" }]);
+    expect(reported).toEqual([collectorResponseNotice({ kind: "cancel-remove", result: "cleared" })]);
+  });
+
+  it("an unsaved cancel is a failure, not a success line", async () => {
+    const { registry, context } = harness({ kind: "cancel-remove", result: "unchanged" });
+    expect((await registry.execute(COLLECTOR_CANCEL_REMOVE_COMMAND, context)).kind).toBe("failed");
+  });
+
+  it("remove success and a declined remove are reported; failures and other responses are not (B-5)", async () => {
+    const applied: CollectorIntegrationResponse = { kind: "apply", action: "remove", outcome: "applied", reason: null, warnings: [], selfCheck: "skipped", status: undefined as never };
+    expect(collectorResponseNotice(applied)).toContain("解除しました");
+    expect(collectorResponseNotice({ ...applied, outcome: "noop" } as CollectorIntegrationResponse)).toContain("解除しました");
+    expect(collectorResponseNotice({ ...applied, outcome: "failed" } as CollectorIntegrationResponse)).toBeNull();
+    expect(collectorResponseNotice({ ...applied, action: "setup" } as CollectorIntegrationResponse)).toBeNull();
+    expect(collectorResponseNotice({ kind: "cancelled" })).toBe("Collector 連携の解除は行いませんでした。");
+    expect(collectorResponseNotice({ kind: "busy" })).toBeNull();
+    for (const result of ["cleared", "not-requested", "nothing-to-cancel"] as const) expect(collectorResponseNotice({ kind: "cancel-remove", result })).not.toBeNull();
+    expect(collectorResponseNotice({ kind: "cancel-remove", result: "unchanged" })).toBeNull();
+
+    for (const [response, expected] of [[{ kind: "cancelled" }, 1], [applied, 1], [{ ...applied, outcome: "failed" }, 0]] as Array<[CollectorIntegrationResponse, number]>) {
+      const registry = new CommandRegistry();
+      const reported: string[] = [];
+      registerCollectorIntegrationCommands(registry, { run: async () => response, dismiss: null, openWizard: null, report: (message) => { reported.push(message); } });
+      await registry.execute(COLLECTOR_REMOVE_INTEGRATION_COMMAND, new ContextKeyService().snapshot());
+      expect(reported).toHaveLength(expected);
+    }
   });
 
   it("the alpha1 'set up' button runs setup and then closes the notice; the other button only dismisses", async () => {

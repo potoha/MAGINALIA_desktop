@@ -27,6 +27,7 @@ export const APPLICATION_MENU_MANIFEST = [
       { kind: "command", id: "maginalia.collector.setup", label: "Collector 連携を設定…" },
       { kind: "command", id: "maginalia.collector.repair", label: "Collector 連携の確認・修復…" },
       { kind: "command", id: "maginalia.collector.removeIntegration", label: "Collector 連携を解除…" },
+      { kind: "command", id: "maginalia.collector.cancelRemove", label: "Collector 連携の解除を取りやめる" },
       { kind: "separator" },
       { kind: "command", id: "maginalia.collector.configureSaveDestination", label: "Collector の保存先を設定…" },
       { kind: "command", id: "maginalia.collector.clearSaveDestination", label: "Collector の保存先を解除…" }

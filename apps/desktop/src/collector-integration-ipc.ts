@@ -39,6 +39,7 @@ export const COLLECTOR_INTEGRATION_INTENTS = [
   "setup",
   "repair",
   "remove",
+  "cancelRemove",
   "openBrowserExtensions",
   "openBrowserDownloadPage",
   "copyExtensionPath",
@@ -101,6 +102,14 @@ export const COLLECTOR_NOTICE_ID_VALUES: readonly string[] = Object.freeze([
   "collector.notice.remove-failed",
 ]);
 
+/** The one kind each notice id carries (a notice whose kind and id disagree is malformed). Kept in step with `COLLECTOR_NOTICE_IDS` by a unit test. */
+export const COLLECTOR_NOTICE_KIND_BY_ID: Readonly<Record<string, string>> = Object.freeze({
+  "collector.notice.updated": "updated",
+  "collector.notice.repair": "repair",
+  "collector.notice.alpha1-migration": "alpha1-migration",
+  "collector.notice.remove-failed": "remove-failed",
+});
+
 export function isCollectorNoticeId(value: unknown): value is string {
   return typeof value === "string" && COLLECTOR_NOTICE_ID_VALUES.includes(value);
 }
@@ -143,6 +152,11 @@ export interface CollectorIntegrationStatus {
    * describe a half-written installation. Do not act on or display them; ask again.
    */
   readonly applyInProgress: boolean;
+  /**
+   * The user asked for a remove that has not been completed or cancelled (B-3). While it is set and the state is
+   * `outdated`, the automatic update at start is paused; `cancelRemove` ends that.
+   */
+  readonly removeRequested: boolean;
   readonly state: CollectorIntegrationState;
   readonly reasons: readonly CollectorIntegrationReason[];
   readonly inspectionComplete: boolean;
@@ -193,6 +207,11 @@ export type CollectorIntegrationResponse =
   /** `remove`: the user declined the confirmation. Nothing changed. */
   | { readonly kind: "cancelled" }
   /**
+   * `cancelRemove` (B-2). `cleared`: the remove request was withdrawn (no file changed). `not-requested`: there was
+   * none. `nothing-to-cancel`: the integration is already removed (use setup). `unchanged`: the state could not be saved.
+   */
+  | { readonly kind: "cancel-remove"; readonly result: "cleared" | "not-requested" | "nothing-to-cancel" | "unchanged" }
+  /**
    * `setup`: no verified, installed, policy-allowed browser was found (or detection failed) and
    * `proceedWithoutSupportedBrowser` was not set. Nothing written.
    */
@@ -216,7 +235,7 @@ export function isCollectorNoticeList(value: unknown): value is readonly Collect
     if (item === null || typeof item !== "object" || Array.isArray(item)) return false;
     const notice = item as Record<string, unknown>;
     if (!isCollectorNoticeId(notice.id) || typeof notice.title !== "string" || notice.title.length > 400) return false;
-    if (notice.kind !== "updated" && notice.kind !== "repair" && notice.kind !== "alpha1-migration" && notice.kind !== "remove-failed") return false;
+    if (notice.kind !== COLLECTOR_NOTICE_KIND_BY_ID[notice.id]) return false;
     if (notice.detail !== null && (typeof notice.detail !== "string" || notice.detail.length > 800)) return false;
     if (!Array.isArray(notice.actions) || notice.actions.length > 4) return false;
     return notice.actions.every((action) => {

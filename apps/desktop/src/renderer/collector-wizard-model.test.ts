@@ -67,6 +67,7 @@ function status(over: StatusOverrides = {}): CollectorIntegrationStatus {
   const { browsers, ...rest } = over;
   return {
     applyInProgress: false,
+    removeRequested: false,
     state: "not-set-up",
     reasons: [],
     inspectionComplete: true,
@@ -1014,6 +1015,21 @@ describe("wizard model: purity and safety", () => {
 });
 
 // ----- review follow-up ---------------------------------------------------------------------------
+
+describe("wizard model: outdated installation while a remove is requested (B-3)", () => {
+  it("does not promise an update at the next start, points to the cancel command, and still lets the user go on", () => {
+    const h = atStepB({ state: "outdated", removeRequested: true });
+    const effects = send(h, { type: "register" });
+    expect(requestsOf(effects)).toEqual([]);
+    expect(wizardMessage(h.state)).toMatchObject({ id: "outdated-remove-paused", role: "status" });
+    const detail = wizardMessage(h.state)?.copy.detail ?? "";
+    expect(detail).not.toContain("次回起動時に自動で更新されます");
+    expect(detail).toContain("Collector 連携の解除を取りやめる");
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "次へ"]);
+    send(h, { type: "next" });
+    expect(h.state.step).toBe("C");
+  });
+});
 
 describe("wizard model: outdated installation (no refresh intent for the renderer)", () => {
   it("sends no request on register, shows outdated-pending and lets the user go on", () => {
