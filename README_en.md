@@ -1,4 +1,4 @@
-# MAGINALIA desktop α1 "Before Kaldi"
+# MAGINALIA desktop α2 "Wild Berry"
 
 [日本語 README](README.md)
 
@@ -8,7 +8,7 @@ It helps students, researchers, and writers organize quotations from books and o
 
 Research data is generally stored on the user's own computer. The goal is to make these workflows accessible without requiring knowledge of Git, terminals, or general-purpose programming IDEs.
 
-> **Release status:** Public release of α1 "Before Kaldi" (version 0.1.0) for Windows x64 is being prepared. This is alpha software: bugs and changes to behavior or interfaces are possible. Some interface labels remain in English.
+> **Release status:** Public release of α2 "Wild Berry" (version 0.2.0) for Windows x64 is being prepared. This is alpha software: bugs and changes to behavior or interfaces are possible. Some interface labels remain in English.
 
 ## Download and links
 
@@ -38,7 +38,7 @@ MAGINALIA does not require cloud synchronization for local writing. GitHub accou
 
 **Supported platform:** Windows x64. Installers for other operating systems are not provided with this release.
 
-After the public release, download `MAGINALIA-desktop-0.1.0-Setup.exe` from the official distribution page and follow the installation prompts. NDLOCR-Lite is optional and is unchecked by default.
+After the public release, download `MAGINALIA-desktop-0.2.0-Setup.exe` from the official distribution page and follow the installation prompts. NDLOCR-Lite is optional and is unchecked by default.
 
 **The installer is not digitally code-signed.** Windows Defender SmartScreen or other Windows security controls may display warnings or restrict execution. Check the distribution source and published SHA-256 checksum, and run the installer only if you trust its origin. A SHA-256 checksum helps detect mismatched or modified files but does not authenticate the publisher.
 
