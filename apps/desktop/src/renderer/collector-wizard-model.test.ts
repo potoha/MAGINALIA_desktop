@@ -10,7 +10,7 @@ import {
   type CollectorIntegrationStatus,
 } from "../collector-integration-ipc";
 import type { CollectorSaveDestinationIpcResult } from "../collector-save-destination-ipc";
-import { WIZARD_MESSAGE_IDS, type WizardMessageId } from "./collector-wizard-copy";
+import { WIZARD_MESSAGE_IDS, wizardSupportedBrowserList, type WizardMessageId } from "./collector-wizard-copy";
 import {
   APPLY_REASON_MESSAGE,
   classifyWizardResponse,
@@ -23,6 +23,7 @@ import {
   wizardConnectionView,
   wizardDoneView,
   wizardStepDView,
+  wizardAllBrowsersBlocked,
   wizardBrowserOptions,
   wizardCopy,
   wizardDestinationConfigured,
@@ -261,7 +262,7 @@ describe("wizard model: start and step A", () => {
       browsers: { recommended: null, recommendationReason: "none-installed", entries: [entry("edge", { installed: "not-found" }), entry("chrome", { installed: "not-found" }), entry("vivaldi", { installed: "not-found" })] },
     });
     expect(h.state.selectedBrowser).toBeNull();
-    expect(actionLabels(h)).toEqual(["あとで設定", "Microsoft Edge のダウンロードページを開く", "Google Chrome のダウンロードページを開く", "もう一度確認", "ブラウザーは入っています（このまま続ける）"]);
+    expect(actionLabels(h)).toEqual(["あとで設定", "Google Chrome のダウンロードページを開く", "Microsoft Edge のダウンロードページを開く", "もう一度確認", "ブラウザーは入っています（このまま続ける）"]);
     expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
     // The download page is requested by browser id only.
     expect(requestsOf(send(h, { type: "openDownloadPage", browser: "edge" }))).toEqual([{ intent: "openBrowserDownloadPage", browser: "edge" }]);
@@ -1362,11 +1363,12 @@ describe("wizard model: views for the panel", () => {
   it("step A view: names, recommended suffix, previously-chosen only when it differs", () => {
     const h = atStepA();
     const view = wizardAView(h.state);
-    expect(view.options).toEqual([expect.objectContaining({ id: "chrome", displayName: "Google Chrome", label: "Chrome で登録（おすすめ）", selected: true, selectable: true })]);
+    expect(view.options).toEqual([expect.objectContaining({ id: "chrome", displayName: "Google Chrome", label: "Chrome で登録 — おすすめ", selected: true, selectable: true })]);
     expect(view.reason).toBe("default-supported");
     expect(view.reasonCopy?.lead).toBe("ふだんお使いのブラウザー（Google Chrome）で使えます。");
     expect(view.previouslyChosen).toBeNull();
-    const differs = atStepA({ browsers: { preferred: "edge" } });
+    const verifiedEdge = { entries: [entry("edge", { verification: "verified" }), entry("chrome"), entry("vivaldi")] };
+    const differs = atStepA({ browsers: { ...verifiedEdge, preferred: "edge" } });
     expect(wizardAView(differs.state).previouslyChosen).toBe("前回は Microsoft Edge を選びました。");
     expect(wizardAView(atStepA({ browsers: { preferred: "chrome" } }).state).previouslyChosen).toBeNull();
     expect(wizardAView(start().state)).toMatchObject({ loading: true, reasonCopy: null, options: [] });
@@ -1441,16 +1443,16 @@ const ALL_FOUND = { edge: "found", chrome: "found", vivaldi: "found" } as const;
 describe("wizard model: step A choices (通常のブラウザー / Chrome / Edge)", () => {
   /** [name, default browser, installed, option labels in order, recommended option, reason] */
   const cases: ReadonlyArray<readonly [string, DefaultKind, Partial<Record<CollectorBrowserId, Installed>>, readonly string[], CollectorBrowserId | null, CollectorRecommendationReason]> = [
-    ["default Chrome: no 通常 choice (it would repeat Chrome), Chrome recommended", "chrome", ALL_FOUND, ["Chrome で登録（おすすめ）", "Edge で登録"], "chrome", "default-supported"],
-    ["default Edge: no 通常 choice, Edge recommended", "edge", ALL_FOUND, ["Chrome で登録", "Edge で登録（おすすめ）"], "edge", "default-supported"],
-    ["default Vivaldi: 通常 first, named Vivaldi, recommended", "vivaldi", ALL_FOUND, ["通常のブラウザーで登録（Vivaldi）（おすすめ）", "Chrome で登録", "Edge で登録"], "vivaldi", "default-supported"],
-    ["default Vivaldi, only Vivaldi installed", "vivaldi", { vivaldi: "found" }, ["通常のブラウザーで登録（Vivaldi）（おすすめ）"], "vivaldi", "default-supported"],
+    ["default Chrome: no 通常 choice (it would repeat Chrome), Chrome recommended", "chrome", ALL_FOUND, ["Chrome で登録 — おすすめ", "Edge で登録"], "chrome", "default-supported"],
+    ["default Edge: no 通常 choice, Edge recommended", "edge", ALL_FOUND, ["Chrome で登録", "Edge で登録 — おすすめ"], "edge", "default-supported"],
+    ["default Vivaldi: 通常 first, named Vivaldi, recommended", "vivaldi", ALL_FOUND, ["通常のブラウザーで登録（Vivaldi） — おすすめ", "Chrome で登録", "Edge で登録"], "vivaldi", "default-supported"],
+    ["default Vivaldi, only Vivaldi installed", "vivaldi", { vivaldi: "found" }, ["通常のブラウザーで登録（Vivaldi） — おすすめ"], "vivaldi", "default-supported"],
     ["default Vivaldi that is not installed: no 通常 choice, nothing recommended", "vivaldi", { edge: "found", chrome: "found" }, ["Chrome で登録", "Edge で登録"], null, "default-not-installed"],
     ["default Brave (unverified Chromium): Chrome and Edge only, nothing recommended", "other-chromium", ALL_FOUND, ["Chrome で登録", "Edge で登録"], null, "default-unverified"],
     ["default Firefox (not Chromium): Chrome and Edge only, nothing recommended", "other", ALL_FOUND, ["Chrome で登録", "Edge で登録"], null, "default-not-chromium"],
     ["default unknown: Chrome and Edge only, nothing recommended", "unknown", ALL_FOUND, ["Chrome で登録", "Edge で登録"], null, "default-unknown"],
     ["default Chrome that is not installed, Edge is: Edge listed, not recommended", "chrome", { edge: "found" }, ["Edge で登録"], null, "default-not-installed"],
-    ["default Edge, Chrome missing: only Edge, recommended", "edge", { edge: "found" }, ["Edge で登録（おすすめ）"], "edge", "default-supported"],
+    ["default Edge, Chrome missing: only Edge, recommended", "edge", { edge: "found" }, ["Edge で登録 — おすすめ"], "edge", "default-supported"],
     ["default Firefox, only Chrome installed: Chrome, not recommended", "other", { chrome: "found" }, ["Chrome で登録"], null, "default-not-chromium"],
   ];
 
@@ -1520,13 +1522,17 @@ describe("wizard model: step A choices (通常のブラウザー / Chrome / Edge
   });
 
   it("organization policy and unreadable detection keep their notes on Chrome and Edge", () => {
+    // Chrome blocked: Vivaldi reads the Chrome key, which setup then does not write, so it is not offered as usable.
     const blocked = atStepA(realStatus("vivaldi", ALL_FOUND, ["chrome"]));
     const view = wizardAView(blocked.state);
     expect(view.options.map((option) => [option.label, option.selectable, option.noteText])).toEqual([
-      ["通常のブラウザーで登録（Vivaldi）（おすすめ）", true, null],
+      ["通常のブラウザーで登録（Vivaldi）", false, "このブラウザーが使う登録先が、組織の管理設定により使えません"],
       ["Chrome で登録", false, "組織の管理設定により使えません"],
       ["Edge で登録", true, null],
     ]);
+    expect(view.options.some((option) => option.recommended)).toBe(false);
+    expect(view.reason).toBe("default-unsupported");
+    expect(blocked.state.selectedBrowser).toBeNull();
     const failed = atStepA(realStatus("vivaldi", { edge: "unknown", chrome: "unknown", vivaldi: "unknown" }));
     expect(wizardAView(failed.state).reason).toBe("detection-failed");
     expect(wizardAView(failed.state).options.map((option) => [option.label, option.noteText])).toEqual([
@@ -1540,20 +1546,114 @@ describe("wizard model: step A choices (通常のブラウザー / Chrome / Edge
   it("nothing installed: no choices, downloads for Edge and Chrome only (Vivaldi has no download page)", () => {
     const h = atStepA(realStatus("vivaldi", {}));
     expect(wizardAView(h.state)).toMatchObject({ reason: "none-installed", options: [] });
-    expect(actionLabels(h)).toEqual(["あとで設定", "Microsoft Edge のダウンロードページを開く", "Google Chrome のダウンロードページを開く", "もう一度確認", "ブラウザーは入っています（このまま続ける）"]);
+    expect(actionLabels(h)).toEqual(["あとで設定", "Google Chrome のダウンロードページを開く", "Microsoft Edge のダウンロードページを開く", "もう一度確認", "ブラウザーは入っています（このまま続ける）"]);
     expect(isWizardEventAllowed(h.state, { type: "openDownloadPage", browser: "vivaldi" })).toBe(false);
-    expect(wizardAView(h.state).reasonCopy?.lead).toBe("対応しているブラウザー（Microsoft Edge、Google Chrome、Vivaldi）が見つかりませんでした。");
+    expect(wizardAView(h.state).reasonCopy?.lead).toBe("対応しているブラウザー（Google Chrome、Microsoft Edge、Vivaldi）が見つかりませんでした。");
   });
 
-  it("a Vivaldi that is installed but not the default, with no Chrome or Edge: nothing to choose, so the none-installed screen (no dead end)", () => {
+  it("a Vivaldi that is installed but not the default, with no Chrome or Edge: Vivaldi is offered by name (no dead end, no false none-installed)", () => {
     const state = status(realStatus("other", { vivaldi: "found" }));
-    // The inspection's reason says a row is usable; the wizard reads "nothing is offered" as none-installed.
     expect(state.browsers.recommendationReason).toBe("default-not-chromium");
-    expect(wizardRecommendationReason(state)).toBe("none-installed");
+    expect(wizardRecommendationReason(state)).toBe("default-not-chromium");
     const h = atStepA(realStatus("other", { vivaldi: "found" }));
-    expect(wizardAView(h.state)).toMatchObject({ reason: "none-installed", options: [] });
-    expect(action(h, "continueWithoutBrowser").enabled).toBe(true);
+    const view = wizardAView(h.state);
+    expect(view.reason).toBe("default-not-chromium");
+    expect(view.options.map((option) => [option.id, option.label, option.selectable, option.recommended])).toEqual([["vivaldi", "Vivaldi で登録", true, false]]);
+    expect(wizardAllBrowsersBlocked(state)).toBe(false);
+    send(h, { type: "selectBrowser", browser: "vivaldi" });
+    expect(h.state.selectedBrowser).toBe("vivaldi");
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(true);
+  });
+
+  it("Firefox default, Chrome blocked, Edge missing, Vivaldi installed: Vivaldi is not offered as usable either (Chrome blocked), all-blocked names both", () => {
+    const h = atStepA(realStatus("other", { chrome: "found", vivaldi: "found" }, ["chrome"]));
+    const view = wizardAView(h.state);
+    expect(view.options.map((option) => [option.id, option.selectable, option.note])).toEqual([["chrome", false, "policy-blocked"], ["vivaldi", false, "borrowed-blocked"]]);
+    expect(view.allBlocked).toBe(true);
+    expect(view.notice?.copy.headline).toContain("Google Chrome、Vivaldi");
     expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
+  });
+
+  it("2b: Firefox default, Edge blocked, Chrome missing, Vivaldi installed: Vivaldi works through the Chrome key, so it is offered and the wizard is not all-blocked", () => {
+    const h = atStepA(realStatus("other", { edge: "found", vivaldi: "found" }, ["edge"]));
+    const view = wizardAView(h.state);
+    expect(view.options.map((option) => [option.id, option.label, option.selectable, option.note])).toEqual([
+      ["edge", "Edge で登録", false, "policy-blocked"],
+      ["vivaldi", "Vivaldi で登録", true, null],
+    ]);
+    expect(view.allBlocked).toBe(false);
+    send(h, { type: "selectBrowser", browser: "vivaldi" });
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(true);
+  });
+
+  it("something selectable among Chrome and Edge: Vivaldi (not the default) is not added", () => {
+    const h = atStepA(realStatus("other", { edge: "found", vivaldi: "found" }));
+    expect(wizardBrowserOptions(h.state.status).map((option) => option.id)).toEqual(["edge"]);
+  });
+
+  it("Chrome and Edge both blocked, default Vivaldi: all-blocked, Vivaldi named as unusable, not selectable and not recommended", () => {
+    const h = atStepA(realStatus("vivaldi", ALL_FOUND, ["chrome", "edge"]));
+    h.state = { ...h.state, status: { ...h.state.status!, state: "policy-blocked" } };
+    const view = wizardAView(h.state);
+    expect(view.allBlocked).toBe(true);
+    expect(view.notice?.copy.headline).toContain("Google Chrome、Microsoft Edge、Vivaldi");
+    expect(view.options.map((option) => [option.id, option.selectable, option.recommended])).toEqual([["vivaldi", false, false], ["chrome", false, false], ["edge", false, false]]);
+    expect(isWizardEventAllowed(h.state, { type: "selectBrowser", browser: "vivaldi" })).toBe(false);
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
+  });
+
+  it("a remembered browser that is not among the choices shown is not mentioned", () => {
+    // Vivaldi was chosen last time, but the default is now Chrome: no Vivaldi radio is shown.
+    const gone = atStepA({ ...realStatus("chrome", ALL_FOUND), browsers: { ...realStatus("chrome", ALL_FOUND).browsers, preferred: "vivaldi" } });
+    expect(wizardAView(gone.state).options.map((option) => option.id)).toEqual(["chrome", "edge"]);
+    expect(wizardAView(gone.state).previouslyChosen).toBeNull();
+    // Edge was chosen last time and is shown: the note stays.
+    const shown = atStepA({ ...realStatus("chrome", ALL_FOUND), browsers: { ...realStatus("chrome", ALL_FOUND).browsers, preferred: "edge" } });
+    expect(wizardAView(shown.state).previouslyChosen).toBe("前回は Microsoft Edge を選びました。");
+  });
+
+  it("browser lists and download buttons put Chrome first (Chrome, Edge, Vivaldi)", () => {
+    expect(wizardSupportedBrowserList()).toBe("Google Chrome、Microsoft Edge、Vivaldi");
+  });
+
+  describe("a Vivaldi whose effective registration is not ours gets a warning before success is shown", () => {
+    function registerVivaldi(registration: "ours" | "foreign" | "absent", over: Partial<Extract<CollectorIntegrationResponse, { kind: "apply" }>> = {}) {
+      const base = realStatus("vivaldi", ALL_FOUND);
+      const h = atStepA(base);
+      send(h, { type: "selectBrowser", browser: "vivaldi" });
+      send(h, { type: "next" });
+      send(h, { type: "register" });
+      const after = status({
+        state: "ready",
+        browsers: { ...base.browsers, entries: base.browsers!.entries!.map((e) => (e.id === "vivaldi" ? { ...e, registration, registrationVia: registration === "absent" ? null : "chromium" } : e)) },
+      });
+      respond(h, { ...applyResponse(over), status: after } as CollectorIntegrationResponse);
+      return h;
+    }
+
+    it("foreign registration (another Chromium key outranks the Chrome key): registered-not-effective, still able to go on", () => {
+      const h = registerVivaldi("foreign");
+      expect(wizardMessage(h.state)?.id).toBe("registered-not-effective");
+      expect(wizardMessage(h.state)?.role).toBe("alert");
+      expect(wizardMessage(h.state)?.copy.headline).toContain("Vivaldi");
+      expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(true);
+    });
+
+    it("absent registration: the same warning; an already-ready noop is not reported as ready either", () => {
+      expect(wizardMessage(registerVivaldi("absent").state)?.id).toBe("registered-not-effective");
+      expect(wizardMessage(registerVivaldi("absent", { outcome: "noop" }).state)?.id).toBe("registered-not-effective");
+    });
+
+    it("our own registration: the normal success message", () => {
+      expect(wizardMessage(registerVivaldi("ours").state)?.id).toBe("registered-verified");
+    });
+
+    it("Chrome and Edge keep the normal success message (they own their registration)", () => {
+      const h = atStepB();
+      send(h, { type: "register" });
+      respond(h, applyResponse());
+      expect(wizardMessage(h.state)?.id).toBe("registered-verified");
+    });
   });
 
   it("wizardRecommendationReason is the inspection's reason whenever something is offered", () => {

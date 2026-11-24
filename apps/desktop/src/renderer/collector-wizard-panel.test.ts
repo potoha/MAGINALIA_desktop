@@ -302,7 +302,7 @@ describe("wizard panel: radiogroup", () => {
     expect(chrome.getAttribute("aria-checked")).toBe("true");
     expect(chrome.getAttribute("tabindex")).toBe("0");
     const labelId = chrome.getAttribute("aria-labelledby")!;
-    expect(byId(rig, labelId).textContent).toBe("Chrome で登録（おすすめ）");
+    expect(byId(rig, labelId).textContent).toBe("Chrome で登録 — おすすめ");
   });
 
   it("with a Vivaldi default the radios read 通常のブラウザーで登録（Vivaldi）, Chrome, Edge, and only the recommended one is checked and tabbable", () => {
@@ -312,7 +312,7 @@ describe("wizard panel: radiogroup", () => {
     rig.panel.render(buildWizardView(h.state));
     const list = radios(rig);
     expect(list.map((radio) => radio.dataset.browser)).toEqual(["vivaldi", "chrome", "edge"]);
-    expect(list.map((radio) => byId(rig, radio.getAttribute("aria-labelledby")!).textContent)).toEqual(["通常のブラウザーで登録（Vivaldi）（おすすめ）", "Chrome で登録", "Edge で登録"]);
+    expect(list.map((radio) => byId(rig, radio.getAttribute("aria-labelledby")!).textContent)).toEqual(["通常のブラウザーで登録（Vivaldi） — おすすめ", "Chrome で登録", "Edge で登録"]);
     expect(list.map((radio) => radio.getAttribute("aria-checked"))).toEqual(["true", "false", "false"]);
     expect(list.map((radio) => radio.getAttribute("tabindex"))).toEqual(["0", "-1", "-1"]);
   });
@@ -322,13 +322,13 @@ describe("wizard panel: radiogroup", () => {
     const h = atStepA({ browsers: { entries: [entry("chrome", { policyBlocked: true }), entry("edge")], recommended: null, recommendationReason: "none-installed" } });
     rig.panel.render(buildWizardView(h.state));
     const blocked = radios(rig).find((radio) => radio.dataset.browser === "chrome");
-    if (blocked !== undefined) {
-      expect(blocked.getAttribute("aria-disabled")).toBe("true");
-      expect(blocked.getAttribute("tabindex")).toBe("-1");
-      expect(byId(rig, blocked.getAttribute("aria-describedby")!).textContent).toBe("組織の管理設定により使えません");
-      blocked.dispatch(makeEvent("click"));
-      expect(rig.events).toEqual([]);
-    }
+    // The radio must exist: without it the assertions below would silently not run.
+    expect(blocked).toBeDefined();
+    expect(blocked!.getAttribute("aria-disabled")).toBe("true");
+    expect(blocked!.getAttribute("tabindex")).toBe("-1");
+    expect(byId(rig, blocked!.getAttribute("aria-describedby")!).textContent).toBe("組織の管理設定により使えません");
+    blocked!.dispatch(makeEvent("click"));
+    expect(rig.events).toEqual([]);
   });
 
   it("arrow keys, Home and End dispatch radioKey; Space and Enter and a click select", () => {

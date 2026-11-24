@@ -141,13 +141,13 @@ describe("wizard copy: Japanese text is intact (UTF-8)", () => {
 describe("wizard copy: step A (multi-browser design 2.3)", () => {
   it("lists only verified browsers", () => {
     // The product table has Edge, Chrome and Vivaldi verified.
-    expect(wizardSupportedBrowserList()).toBe("Microsoft Edge、Google Chrome、Vivaldi");
-    expect(wizardSupportedBrowserList(onlyVerified(["edge", "chrome"]))).toBe("Microsoft Edge、Google Chrome");
+    expect(wizardSupportedBrowserList()).toBe("Google Chrome、Microsoft Edge、Vivaldi");
+    expect(wizardSupportedBrowserList(onlyVerified(["edge", "chrome"]))).toBe("Google Chrome、Microsoft Edge");
     expect(wizardSupportedBrowserList(CHROME_ONLY_TABLE)).toBe("Google Chrome");
     const all = buildWizardCopy(BASE);
-    expect(all.stepA.body).toContain("Microsoft Edge、Google Chrome、Vivaldi で使えます");
-    expect(all.stepA.bullets[0]).toContain("Microsoft Edge、Google Chrome、Vivaldi のいずれでも使えるように登録します。");
-    expect(buildWizardCopy(BASE, onlyVerified(["edge", "chrome"])).stepA.bullets[0]).toContain("Microsoft Edge、Google Chrome のいずれでも使えるように登録します。");
+    expect(all.stepA.body).toContain("Google Chrome、Microsoft Edge、Vivaldi で使えます");
+    expect(all.stepA.bullets[0]).toContain("Google Chrome、Microsoft Edge、Vivaldi のいずれでも使えるように登録します。");
+    expect(buildWizardCopy(BASE, onlyVerified(["edge", "chrome"])).stepA.bullets[0]).toContain("Google Chrome、Microsoft Edge のいずれでも使えるように登録します。");
     const chromeOnly = buildWizardCopy(BASE, CHROME_ONLY_TABLE);
     expect(chromeOnly.stepA.body).toContain("Google Chrome で使えます");
     expect(chromeOnly.stepA.body).not.toContain("Microsoft Edge");
@@ -159,7 +159,7 @@ describe("wizard copy: step A (multi-browser design 2.3)", () => {
     expect(copy.stepA.reasons["default-supported"].lead).toBe("ふだんお使いのブラウザー（Microsoft Edge）で使えます。");
     expect(copy.stepA.reasons["default-supported"].detail).toBe("Microsoft Edge に Collector を入れることをおすすめします。");
     expect(copy.stepA.reasons["default-not-installed"].lead).toContain("既定のブラウザーとして Microsoft Edge が設定されています");
-    expect(copy.stepA.reasons["none-installed"].lead).toBe("対応しているブラウザー（Microsoft Edge、Google Chrome、Vivaldi）が見つかりませんでした。");
+    expect(copy.stepA.reasons["none-installed"].lead).toBe("対応しているブラウザー（Google Chrome、Microsoft Edge、Vivaldi）が見つかりませんでした。");
     expect(copy.stepA.downloadButtons.chrome).toBe("Google Chrome のダウンロードページを開く");
     expect(copy.stepA.previouslyChosen).toBe("前回は Microsoft Edge を選びました。");
   });
@@ -196,7 +196,7 @@ describe("wizard copy: step A (multi-browser design 2.3)", () => {
   it("option labels: 「Chrome で登録」, 「Edge で登録」 and 「通常のブラウザーで登録（name）」 with the default browser's name", () => {
     expect(buildWizardCopy(BASE).stepA.optionRegisterNamed).toEqual({ chrome: "Chrome で登録", edge: "Edge で登録" });
     expect(buildWizardCopy({ ...BASE, defaultBrowser: "vivaldi" }).stepA.optionRegisterDefault).toBe("通常のブラウザーで登録（Vivaldi）");
-    expect(buildWizardCopy(BASE).stepA.optionRecommendedSuffix).toBe("（おすすめ）");
+    expect(buildWizardCopy(BASE).stepA.optionRecommendedSuffix).toBe(" — おすすめ");
     expect(WIZARD_NAMED_BROWSER_IDS).toEqual(["chrome", "edge"]);
   });
 });

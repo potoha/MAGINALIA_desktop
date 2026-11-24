@@ -59,6 +59,7 @@ export const WIZARD_MESSAGE_IDS = [
   "download-not-offered",
   "all-browsers-policy-blocked",
   // step B
+  "registered-not-effective",
   "registered",
   "registered-verified",
   "already-ready",
@@ -107,6 +108,7 @@ export const WIZARD_MESSAGE_ROLE: Readonly<Record<WizardMessageId, WizardMessage
   "download-failed": "alert",
   "download-not-offered": "alert",
   "all-browsers-policy-blocked": "alert",
+  "registered-not-effective": "alert",
   "registered": "status",
   "registered-verified": "status",
   "already-ready": "status",
@@ -176,11 +178,24 @@ function rowOf(table: Table, id: CollectorBrowserId | null | undefined): Collect
   return id === null || id === undefined ? undefined : table.find((row) => row.id === id);
 }
 
-function verifiedRows(table: Table): Table {
-  return table.filter((row) => row.verification === "verified");
+/** Display order of browsers in lists and buttons (owner decision 2026-11-24): Chrome, Edge, then the rest. */
+const DISPLAY_ORDER: readonly string[] = ["chrome", "edge", "vivaldi"];
+
+function displayRank(id: string): number {
+  const index = DISPLAY_ORDER.indexOf(id);
+  return index < 0 ? DISPLAY_ORDER.length : index;
 }
 
-/** 「Microsoft Edge、Google Chrome、Vivaldi」: verified rows in table order. */
+/** Rows in display order (stable: rows outside the list keep their table order, after the listed ones). */
+export function wizardDisplayOrder<T extends { readonly id: string }>(rows: readonly T[]): readonly T[] {
+  return [...rows].sort((a, b) => displayRank(a.id) - displayRank(b.id));
+}
+
+function verifiedRows(table: Table): Table {
+  return wizardDisplayOrder(table.filter((row) => row.verification === "verified"));
+}
+
+/** 「Google Chrome、Microsoft Edge、Vivaldi」: verified rows in display order. */
 export function wizardSupportedBrowserList(table: Table = COLLECTOR_BROWSERS): string {
   const names = verifiedRows(table).map((row) => row.displayName);
   return names.length === 0 ? "対応しているブラウザー" : names.join("、");
@@ -301,6 +316,10 @@ export interface WizardCopy {
     /** Shown beside a disabled 「次へ」 while no browser is selected (B3 addition: the reason a button is disabled). */
     readonly selectBrowserFirst: string;
     readonly optionRecommendedSuffix: string;
+    /** Appended to a browser's name for a browser offered only because nothing else can be chosen (not the default, not Chrome/Edge). */
+    readonly optionRegisterOtherSuffix: string;
+    /** Note under a browser that has no registration of its own and whose borrowed registration is blocked by policy. */
+    readonly optionBorrowedBlocked: string;
     /** Radio labels of the two browsers that are always offered by name. */
     readonly optionRegisterNamed: Readonly<Record<WizardNamedBrowserId, string>>;
     /** Radio label of 「通常のブラウザー」: the OS default browser, named (only offered when it is neither Chrome nor Edge). */
@@ -428,7 +447,9 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
       menuNote: "あとからでも、メニューの「ファイル」→「Collector 連携を設定…」で始められます。",
       radiogroupLabel: "Collector を使うブラウザー",
       selectBrowserFirst: "ブラウザーを選ぶと、次へ進めます。",
-      optionRecommendedSuffix: "（おすすめ）",
+      optionRecommendedSuffix: " — おすすめ",
+      optionRegisterOtherSuffix: " で登録",
+      optionBorrowedBlocked: "このブラウザーが使う登録先が、組織の管理設定により使えません",
       optionRegisterNamed: { chrome: "Chrome で登録", edge: "Edge で登録" },
       optionRegisterDefault: fill("通常のブラウザーで登録（{name}）", { name: defaultName }),
       optionPolicyBlocked: "組織の管理設定により使えません",
@@ -618,6 +639,10 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
       "all-browsers-policy-blocked": {
         headline: fill("組織の管理設定により、{names} はこの種類の連携プログラムを使えないようになっています。", { names: blockedList }),
         detail: "このパソコンでは Collector から本棚へ保存できません。設定は行っていません。管理者にお問い合わせください。",
+      },
+      "registered-not-effective": {
+        headline: fill("連携プログラムを登録しましたが、{name} がこの登録を使えない可能性があります。", { name }),
+        detail: "このブラウザーが読む登録先に、別のプログラムの登録があるか、MAGINALIA の登録がありません（Chrome が組織の管理設定で使えない場合など）。このまま進むと、Collector から本棚へ保存できないことがあります。",
       },
       "download-failed": {
         headline: "ダウンロードページを開けませんでした。",

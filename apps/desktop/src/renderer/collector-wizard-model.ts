@@ -47,6 +47,7 @@ import type {
 import type { CollectorSaveDestinationIpcResult } from "../collector-save-destination-ipc";
 import {
   buildWizardCopy,
+  wizardDisplayOrder,
   wizardProgressLabel,
   WIZARD_MESSAGE_ROLE,
   WIZARD_NAMED_BROWSER_IDS,
@@ -243,7 +244,12 @@ export interface WizardBrowserOption {
   readonly id: CollectorBrowserId;
   readonly recommended: boolean;
   readonly selectable: boolean;
-  readonly note: "policy-blocked" | "detection-unknown" | null;
+  /**
+   * `policy-blocked`: this browser's own policy blocks it. `borrowed-blocked`: the browser has no
+   * registration of its own (Vivaldi reads the Chrome key) and every browser that writes the key it
+   * reads is blocked, so it would not work either.
+   */
+  readonly note: "policy-blocked" | "borrowed-blocked" | "detection-unknown" | null;
 }
 
 function isNamedBrowserId(id: CollectorBrowserId): id is WizardNamedBrowserId {
@@ -269,6 +275,41 @@ function wizardDefaultOptionId(status: CollectorIntegrationStatus, table: readon
  * 「確認できませんでした」. The order is fixed here, not the table order. Only the default browser
  * carries the recommendation (`status.browsers.recommended`).
  */
+/**
+ * A browser with no registration of its own (`ownTargets` empty, Vivaldi) works only through a key
+ * another verified row writes. Setup writes that key only when that row is not policy-blocked (and,
+ * for a `when-present` row, found), so when no such row qualifies, nothing it reads gets registered.
+ */
+function borrowedRegistrationBlocked(row: CollectorBrowserSpec, status: CollectorIntegrationStatus, table: readonly CollectorBrowserSpec[]): boolean {
+  if (row.nativeMessaging.ownTargets.length > 0) return false;
+  const lenders = table.filter(
+    (other) => other.id !== row.id && other.verification === "verified" && other.nativeMessaging.ownTargets.some((target) => row.nativeMessaging.lookupOrder.includes(target)),
+  );
+  return !lenders.some((lender) => {
+    const entry = status.browsers.entries.find((candidate) => candidate.id === lender.id);
+    if (entry?.policyBlocked === true) return false;
+    return lender.nativeMessaging.registration === "always" || entry?.installed === "found";
+  });
+}
+
+function wizardOptionFor(
+  row: CollectorBrowserSpec,
+  status: CollectorIntegrationStatus,
+  table: readonly CollectorBrowserSpec[],
+  detectionFailed: boolean,
+): WizardBrowserOption | null {
+  if (row.verification !== "verified") return null;
+  const entry = status.browsers.entries.find((other) => other.id === row.id);
+  if (entry === undefined || entry.verification !== "verified") return null;
+  const unknown = entry.installed === "unknown" && detectionFailed;
+  if (entry.installed !== "found" && !unknown) return null;
+  const note: WizardBrowserOption["note"] = entry.policyBlocked
+    ? "policy-blocked"
+    : borrowedRegistrationBlocked(row, status, table) ? "borrowed-blocked" : unknown ? "detection-unknown" : null;
+  const selectable = note !== "policy-blocked" && note !== "borrowed-blocked";
+  return { id: row.id, recommended: selectable && status.browsers.recommended === row.id, selectable, note };
+}
+
 export function wizardBrowserOptions(
   status: CollectorIntegrationStatus | null,
   table: readonly CollectorBrowserSpec[] = COLLECTOR_BROWSERS,
@@ -276,18 +317,20 @@ export function wizardBrowserOptions(
   if (status === null) return [];
   const detectionFailed = status.browsers.recommendationReason === "detection-failed";
   const defaultId = wizardDefaultOptionId(status, table);
-  const candidates: readonly CollectorBrowserId[] = [...(defaultId === null ? [] : [defaultId]), ...WIZARD_NAMED_BROWSER_IDS];
+  const standard: readonly CollectorBrowserId[] = [...(defaultId === null ? [] : [defaultId]), ...WIZARD_NAMED_BROWSER_IDS];
   const options: WizardBrowserOption[] = [];
-  for (const candidate of candidates) {
+  for (const candidate of standard) {
     const row = table.find((entry) => entry.id === candidate);
-    if (row === undefined || row.verification !== "verified") continue;
-    const entry = status.browsers.entries.find((other) => other.id === row.id);
-    if (entry === undefined || entry.verification !== "verified") continue;
-    const recommended = status.browsers.recommended === row.id;
-    if (entry.installed === "found") {
-      options.push({ id: row.id, recommended, selectable: !entry.policyBlocked, note: entry.policyBlocked ? "policy-blocked" : null });
-    } else if (entry.installed === "unknown" && detectionFailed) {
-      options.push({ id: row.id, recommended, selectable: !entry.policyBlocked, note: entry.policyBlocked ? "policy-blocked" : "detection-unknown" });
+    const option = row === undefined ? null : wizardOptionFor(row, status, table, detectionFailed);
+    if (option !== null) options.push(option);
+  }
+  // A way out: when nothing offered can be chosen, an installed verified browser that is not the default
+  // (Vivaldi) is offered by name rather than leaving the user at a dead end (owner decision 2026-11-24).
+  if (!options.some((option) => option.selectable)) {
+    for (const row of wizardDisplayOrder(table)) {
+      if (standard.includes(row.id)) continue;
+      const option = wizardOptionFor(row, status, table, detectionFailed);
+      if (option !== null) options.push(option);
     }
   }
   return options;
@@ -304,8 +347,14 @@ export function wizardRecommendationReason(
 ): CollectorRecommendationReason | null {
   if (status === null) return null;
   const reason = status.browsers.recommendationReason;
-  if (reason === "none-installed" || reason === "detection-failed" || reason === "default-supported") return reason;
-  return wizardBrowserOptions(status, table).length === 0 ? "none-installed" : reason;
+  if (reason === "none-installed" || reason === "detection-failed") return reason;
+  const options = wizardBrowserOptions(status, table);
+  if (reason === "default-supported") {
+    // The default browser is verified but would not work (its borrowed registration is blocked): not "usable".
+    const recommended = status.browsers.recommended;
+    return recommended !== null && options.some((option) => option.id === recommended && !option.selectable) ? "default-unsupported" : reason;
+  }
+  return options.length === 0 ? "none-installed" : reason;
 }
 
 /**
@@ -339,7 +388,7 @@ function reconcileSelection(current: CollectorBrowserId | null, status: Collecto
 
 /** Verified browsers that were found but are blocked by an organization policy. */
 export function wizardBlockedBrowsers(status: CollectorIntegrationStatus | null): readonly CollectorBrowserId[] {
-  return wizardBrowserOptions(status).filter((option) => option.note === "policy-blocked").map((option) => option.id);
+  return wizardDisplayOrder(wizardBrowserOptions(status).filter((option) => option.note === "policy-blocked" || option.note === "borrowed-blocked")).map((option) => option.id);
 }
 
 /**
@@ -351,7 +400,7 @@ export function wizardAllBrowsersBlocked(status: CollectorIntegrationStatus | nu
   if (status === null) return false;
   if (status.state === "policy-blocked") return true;
   const options = wizardBrowserOptions(status);
-  return options.length > 0 && options.every((option) => !option.selectable && option.note === "policy-blocked");
+  return options.length > 0 && options.every((option) => !option.selectable && (option.note === "policy-blocked" || option.note === "borrowed-blocked"));
 }
 
 const TERMINAL_UNAVAILABLE: readonly WizardMessageId[] = ["unavailable-e2e-isolation", "unavailable-payload-unavailable", "unavailable-startup-failed"];
@@ -455,7 +504,7 @@ export const APPLY_REASON_MESSAGE: Readonly<Record<CollectorApplyReason, WizardM
 };
 
 /** `outdated-pending`: registered, and the main process updates it itself at the next start; the user may go on. */
-const STEP_B_SUCCESS: readonly WizardMessageId[] = ["registered", "registered-verified", "already-ready", "refreshed", "outdated-pending"];
+const STEP_B_SUCCESS: readonly WizardMessageId[] = ["registered-not-effective", "registered", "registered-verified", "already-ready", "refreshed", "outdated-pending"];
 /** After these the step B button is gone: retrying cannot help. */
 const STEP_B_TERMINAL: readonly WizardMessageId[] = [
   "folder-unsafe",
@@ -804,6 +853,20 @@ function handleResponse(state: WizardState, operation: WizardOperation, response
   }
 }
 
+/**
+ * The selected browser has no registration of its own (Vivaldi) and the registration it will actually
+ * read is not ours: a foreign Chromium key outranks the Chrome key, or the Chrome key was not written
+ * (Chrome blocked by policy). Registering "succeeded", but this browser would not reach MAGINALIA.
+ */
+function registrationNotEffective(state: WizardState, status: CollectorIntegrationStatus | null): boolean {
+  const selected = state.selectedBrowser;
+  if (selected === null) return false;
+  const row = COLLECTOR_BROWSERS.find((candidate) => candidate.id === selected);
+  if (row === undefined || row.nativeMessaging.ownTargets.length > 0) return false;
+  const entry = status?.browsers.entries.find((candidate) => candidate.id === selected);
+  return entry !== undefined && entry.registration !== "ours";
+}
+
 function handleSetupResponse(state: WizardState, classified: ResponseClass): WizardReduction {
   if (classified.class === "browser-required") {
     // Nothing was written. The browser situation changed since step A: show step A again, with the new facts.
@@ -829,7 +892,7 @@ function handleSetupResponse(state: WizardState, classified: ResponseClass): Wiz
       : apply.outcome === "noop"
         ? "already-ready"
         : apply.selfCheck === "ok" ? "registered-verified" : "registered";
-    return unchanged({ ...withResult(base, "B", message), selfCheckFailed: false });
+    return unchanged({ ...withResult(base, "B", registrationNotEffective(state, base.status) ? "registered-not-effective" : message), selfCheckFailed: false });
   }
 
   let message: WizardMessageId;
@@ -1221,7 +1284,7 @@ export function wizardActions(state: WizardState): readonly WizardAction[] {
       if (wizardAllBrowsersBlocked(state.status)) {
         add("recheckBrowsers", copy.common.recheck, { type: "recheckBrowsers" }, true);
       } else if (reason === "none-installed") {
-        for (const row of COLLECTOR_BROWSERS) {
+        for (const row of wizardDisplayOrder(COLLECTOR_BROWSERS)) {
           if (row.verification === "verified" && row.downloadUrl !== null) {
             add(`openDownloadPage-${row.id}`, copy.stepA.downloadButtons[row.id], { type: "openDownloadPage", browser: row.id });
           }
@@ -1375,9 +1438,12 @@ export function wizardAView(state: WizardState): WizardAView {
   const allBlocked = wizardAllBrowsersBlocked(status);
   const preferred = status?.browsers.preferred ?? null;
   const recommended = status?.browsers.recommended ?? null;
+  const defaultOptionId = status === null ? null : wizardDefaultOptionId(status, COLLECTOR_BROWSERS);
   const options = wizardBrowserOptions(status).map((option): WizardAOption => {
     const displayName = COLLECTOR_BROWSERS.find((row) => row.id === option.id)?.displayName ?? option.id;
-    const registerLabel = isNamedBrowserId(option.id) ? copy.stepA.optionRegisterNamed[option.id] : copy.stepA.optionRegisterDefault;
+    const registerLabel = isNamedBrowserId(option.id)
+      ? copy.stepA.optionRegisterNamed[option.id]
+      : option.id === defaultOptionId ? copy.stepA.optionRegisterDefault : `${displayName}${copy.stepA.optionRegisterOtherSuffix}`;
     return {
       id: option.id,
       displayName,
@@ -1386,7 +1452,9 @@ export function wizardAView(state: WizardState): WizardAView {
       selectable: option.selectable,
       selected: state.selectedBrowser === option.id,
       note: option.note,
-      noteText: option.note === "policy-blocked" ? copy.stepA.optionPolicyBlocked : option.note === "detection-unknown" ? copy.stepA.optionDetectionUnknown : null,
+      noteText: option.note === "policy-blocked"
+        ? copy.stepA.optionPolicyBlocked
+        : option.note === "borrowed-blocked" ? copy.stepA.optionBorrowedBlocked : option.note === "detection-unknown" ? copy.stepA.optionDetectionUnknown : null,
     };
   });
   return {
@@ -1400,7 +1468,8 @@ export function wizardAView(state: WizardState): WizardAView {
     notice: allBlocked ? { id: "all-browsers-policy-blocked", role: WIZARD_MESSAGE_ROLE["all-browsers-policy-blocked"], copy: copy.messages["all-browsers-policy-blocked"] } : null,
     reason,
     reasonCopy: reason === null || allBlocked ? null : copy.stepA.reasons[reason],
-    previouslyChosen: preferred !== null && preferred !== recommended ? copy.stepA.previouslyChosen : null,
+    // Only when that browser is among the choices shown; a remembered one that is not offered now would point at nothing.
+    previouslyChosen: preferred !== null && preferred !== recommended && options.some((option) => option.id === preferred) ? copy.stepA.previouslyChosen : null,
     options,
   };
 }

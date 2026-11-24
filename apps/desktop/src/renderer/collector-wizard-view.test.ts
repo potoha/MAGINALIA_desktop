@@ -113,7 +113,7 @@ describe("wizard view: step A", () => {
     expect(group.label).toBe("Collector を使うブラウザー");
     const chrome = group.options.find((option) => option.id === "chrome")!;
     expect(chrome).toMatchObject({ checked: true, tabbable: true, selectable: true });
-    expect(chrome.label).toContain("（おすすめ）");
+    expect(chrome.label).toContain("おすすめ");
     expect(group.options.filter((option) => option.tabbable)).toHaveLength(1);
     expect(chrome.event).toEqual({ type: "selectBrowser", browser: "chrome" });
     expect(v.buttons.find((button) => button.id === "next")).toMatchObject({ enabled: true, primary: true, describedBy: null });

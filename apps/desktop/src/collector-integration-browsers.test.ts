@@ -443,6 +443,18 @@ describe("per-browser policy (design 4.4-1, 8.4)", () => {
     const result = await inspectWith(fixture, table);
     expect(result.policy).toMatchObject({ blocked: false, status: "read" });
   });
+
+  it("a verified row without a policy root is left out of the aggregate: Chrome and Edge both blocked is still blocked (fails without the exclusion)", async () => {
+    const fixture = readyBoth();
+    fixture.registry.policies = policies({ nativeMessagingUserLevelHosts: 0 });
+    fixture.registry.edgePolicies = policies({ nativeMessagingUserLevelHosts: 0 });
+    // The product table: Chrome, Edge and Vivaldi are all verified, Vivaldi has no policy root.
+    const result = await inspectWith(fixture);
+    expect(COLLECTOR_BROWSERS.find((row) => row.id === "vivaldi")).toMatchObject({ verification: "verified", policyRoot: null });
+    expect(result.policy).toMatchObject({ blocked: true, userLevelHostsDisabled: true });
+    expect(result.state).toBe("policy-blocked");
+    expect(result.expectedTargets).toEqual([]);
+  });
 });
 
 // ----- expected set E (design 3.1) ----------------------------------------------------------------
