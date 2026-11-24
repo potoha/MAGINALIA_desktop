@@ -514,6 +514,72 @@ describe("wizard panel: failure screens and the in-flight watchdog", () => {
   });
 });
 
+describe("wizard panel: cancelling an unfinished remove (step B)", () => {
+  const actionIds = (rig: Rig) => rig.dialog.findAll((element) => element.tagName === "button").map((button) => button.dataset.action);
+
+  function paused() {
+    const h = atStepB({ state: "outdated", removeRequested: true });
+    send(h, { type: "register" });
+    return h;
+  }
+
+  it("renders real buttons in Tab order 戻る, あとで設定, 解除を取りやめる, 次へ; the click dispatches `cancelRemove`", () => {
+    const rig = setup();
+    rig.panel.render(buildWizardView(paused().state));
+    expect(actionIds(rig)).toEqual(["back", "later", "cancelRemove", "next"]);
+    const cancel = buttonOf(rig, "cancelRemove");
+    expect(cancel.tagName).toBe("button");
+    expect(cancel.type).toBe("button");
+    // The accessible name is the visible text; the button is neither disabled nor aria-disabled.
+    expect(cancel.textContent).toBe("解除を取りやめる");
+    expect(cancel.disabled).toBe(false);
+    expect(cancel.getAttribute("aria-disabled")).toBeNull();
+    expect(cancel.className).not.toContain("primary");
+    expect(buttonOf(rig, "next").className).toContain("primary");
+    expect(byId(rig, "collector-wizard-status").textContent).toContain("解除の途中で止まっています");
+    cancel.dispatch(makeEvent("click"));
+    expect(rig.events).toEqual([{ type: "cancelRemove" }]);
+  });
+
+  it("while the request runs the focused button stays focused (aria-disabled, ignores clicks); afterwards focus is not lost to <body>", () => {
+    const rig = setup();
+    const h = paused();
+    rig.panel.render(buildWizardView(h.state));
+    buttonOf(rig, "cancelRemove").focus();
+    send(h, { type: "cancelRemove" });
+    rig.panel.render(buildWizardView(h.state));
+    const cancel = buttonOf(rig, "cancelRemove");
+    expect(rig.doc.activeElement).toBe(cancel);
+    expect(cancel.getAttribute("aria-disabled")).toBe("true");
+    expect(cancel.getAttribute("aria-describedby")).toBe("collector-wizard-status");
+    cancel.dispatch(makeEvent("click"));
+    expect(rig.events).toEqual([]);
+    // cleared: the button is gone, so focus moves to the heading inside the dialog, never to <body>.
+    respond(h, { kind: "cancel-remove", result: "cleared" });
+    rig.panel.render(buildWizardView(h.state));
+    expect(actionIds(rig)).toEqual(["back", "later", "next"]);
+    expect(rig.doc.activeElement).toBe(byId(rig, "collector-wizard-title"));
+    expect(byId(rig, "collector-wizard-status").textContent).toContain("解除を取りやめました。");
+    expect(byId(rig, "collector-wizard-status").textContent).toContain("次回起動時");
+    expect(byId(rig, "collector-wizard-alert").textContent).toBe("");
+  });
+
+  it("a failed attempt goes to the alert region and the retry button keeps the focus", () => {
+    const rig = setup();
+    const h = paused();
+    rig.panel.render(buildWizardView(h.state));
+    buttonOf(rig, "cancelRemove").focus();
+    send(h, { type: "cancelRemove" });
+    respond(h, { kind: "cancel-remove", result: "unchanged" });
+    rig.panel.render(buildWizardView(h.state));
+    expect(byId(rig, "collector-wizard-alert").textContent).toContain("解除の取りやめを保存できませんでした。");
+    expect(byId(rig, "collector-wizard-status").textContent).toBe("");
+    expect(actionIds(rig)).toEqual(["back", "later", "cancelRemove"]);
+    expect(buttonOf(rig, "cancelRemove").textContent).toBe("もう一度試す");
+    expect(rig.doc.activeElement).toBe(buttonOf(rig, "cancelRemove"));
+  });
+});
+
 describe("wizard panel: keyboard and focus", () => {
   it("Escape is prevented and dispatched once as `escape`; the native cancel adds nothing after it", () => {
     const rig = setup();

@@ -105,6 +105,7 @@ type WizardOperation =
   | "recheck-browsers"
   | "download"
   | "setup"
+  | "cancel-remove"
   | "destination"
   | "placement"
   | "open-browser"
@@ -182,6 +183,8 @@ export type WizardUserEvent =
   | { readonly type: "openDownloadPage"; readonly browser: CollectorBrowserId }
   | { readonly type: "continueWithoutBrowser" }
   | { readonly type: "register" }
+  /** Step B, remove paused: withdraw the unfinished remove (sends the `cancelRemove` intent, the same one the menu command sends). */
+  | { readonly type: "cancelRemove" }
   | { readonly type: "confirmForeign" }
   | { readonly type: "declineForeign" }
   | { readonly type: "confirmDestination" }
@@ -418,6 +421,7 @@ type ResponseClass =
   | { readonly class: "status"; readonly status: CollectorIntegrationStatus }
   | { readonly class: "apply"; readonly response: Extract<CollectorIntegrationResponse, { kind: "apply" }> }
   | { readonly class: "cancelled" }
+  | { readonly class: "cancel-remove"; readonly result: Extract<CollectorIntegrationResponse, { kind: "cancel-remove" }>["result"] }
   | { readonly class: "browser-required"; readonly status: CollectorIntegrationStatus }
   | { readonly class: "browser-extensions"; readonly result: "opened" | "browser-not-found" | "failed" }
   | { readonly class: "browser-download"; readonly result: "opened" | "failed" | "not-offered" }
@@ -447,7 +451,6 @@ export function classifyWizardResponse(response: CollectorIntegrationResponse): 
     }
     case "invalid-request":
     case "error":
-    case "cancel-remove": // the wizard never sends `cancelRemove`
       return { class: "invalid" };
     case "busy":
       return { class: "busy" };
@@ -457,6 +460,8 @@ export function classifyWizardResponse(response: CollectorIntegrationResponse): 
       return { class: "apply", response };
     case "cancelled":
       return { class: "cancelled" };
+    case "cancel-remove":
+      return { class: "cancel-remove", result: response.result };
     case "browser-required":
       return { class: "browser-required", status: response.status };
     case "browser-extensions":
@@ -508,8 +513,9 @@ export const APPLY_REASON_MESSAGE: Readonly<Record<CollectorApplyReason, WizardM
  * `outdated-pending`: registered, and the main process updates it itself at the next start; the user may go on.
  * `outdated-remove-paused` (B-3): the same installation while a remove is still requested; the update is paused until
  * that remove is cancelled (`maginalia.collector.cancelRemove`) or finished, so the "next start" promise would be false.
+ * `remove-cancelled` / `remove-not-requested`: that cancel went through (or there was nothing to cancel); the update runs at the next start.
  */
-const STEP_B_SUCCESS: readonly WizardMessageId[] = ["registered-not-effective", "registered", "registered-verified", "already-ready", "refreshed", "outdated-pending", "outdated-remove-paused"];
+const STEP_B_SUCCESS: readonly WizardMessageId[] = ["registered-not-effective", "registered", "registered-verified", "already-ready", "refreshed", "outdated-pending", "outdated-remove-paused", "remove-cancelled", "remove-not-requested"];
 /** After these the step B button is gone: retrying cannot help. */
 const STEP_B_TERMINAL: readonly WizardMessageId[] = [
   "folder-unsafe",
@@ -546,9 +552,9 @@ function isBlocking(state: WizardState): boolean {
   return state.inFlight !== null && state.inFlight.operation !== "poll";
 }
 
-/** A running setup or a modal confirmation cannot be walked away from. */
+/** A running setup, a running cancel of a remove or a modal confirmation cannot be walked away from (the answer would be lost). */
 function isMutating(state: WizardState): boolean {
-  return state.inFlight?.operation === "setup" || state.inFlight?.operation === "destination";
+  return state.inFlight?.operation === "setup" || state.inFlight?.operation === "cancel-remove" || state.inFlight?.operation === "destination";
 }
 
 function issue(state: WizardState, operation: WizardOperation, request: CollectorIntegrationRequest | null): { state: WizardState; effect: WizardEffect } {
@@ -634,6 +640,10 @@ export function isWizardEventAllowed(state: WizardState, event: WizardUserEvent)
         case "confirmForeign":
         case "declineForeign":
           return current === "foreign-confirmation";
+        case "cancelRemove":
+          // From the paused screen, and again after a failed attempt (any alert except the ones nothing can fix).
+          return removePaused(state) && current !== undefined && !STEP_B_TERMINAL.includes(current)
+            && (current === "outdated-remove-paused" || (current !== "foreign-confirmation" && WIZARD_MESSAGE_ROLE[current] === "alert"));
         case "next":
           return current !== undefined && STEP_B_SUCCESS.includes(current);
         default:
@@ -738,6 +748,7 @@ function failed(state: WizardState, operation: WizardOperation, message: WizardM
     case "download":
       return withResult(state, "A", message);
     case "setup":
+    case "cancel-remove":
       return withResult(state, "B", message);
     case "destination":
       return withResult(state, "C", message === "request-failed" ? "destination-error" : message);
@@ -825,6 +836,10 @@ function handleResponse(state: WizardState, operation: WizardOperation, response
     }
     case "setup":
       return handleSetupResponse(state, classified);
+    case "cancel-remove": {
+      if (classified.class !== "cancel-remove") return unchanged(failed(state, operation, "request-failed"));
+      return unchanged(handleCancelRemoveResult(state, classified.result));
+    }
     case "placement": {
       if (classified.class !== "status") return unchanged(failed(state, operation, "request-failed"));
       const accepted = acceptStatus(state, classified.status);
@@ -870,6 +885,36 @@ function registrationNotEffective(state: WizardState, status: CollectorIntegrati
   if (row === undefined || row.nativeMessaging.ownTargets.length > 0) return false;
   const entry = status?.browsers.entries.find((candidate) => candidate.id === selected);
   return entry !== undefined && entry.registration !== "ours";
+}
+
+/**
+ * An `outdated` installation whose remove was requested and not finished or cancelled (B-3): the automatic update at the
+ * next start is paused. The only state in which step B offers 「解除を取りやめる」.
+ */
+function removePaused(state: WizardState): boolean {
+  return state.status?.state === "outdated" && state.status.removeRequested;
+}
+
+/**
+ * The answer of `cancelRemove` (B-2). The cached status is brought in line with what the main process just said, so the
+ * step keeps telling the truth if the user goes back and forward: no remove is requested any more, and after
+ * `nothing-to-cancel` the installation is gone (the next action is the ordinary registration).
+ */
+function handleCancelRemoveResult(state: WizardState, result: Extract<CollectorIntegrationResponse, { kind: "cancel-remove" }>["result"]): WizardState {
+  const status = state.status;
+  switch (result) {
+    case "cleared":
+      return withResult({ ...state, status: status === null ? null : { ...status, removeRequested: false } }, "B", "remove-cancelled");
+    case "not-requested":
+      return withResult({ ...state, status: status === null ? null : { ...status, removeRequested: false } }, "B", "remove-not-requested");
+    case "nothing-to-cancel":
+      return withResult({ ...state, status: status === null ? null : { ...status, removeRequested: false, state: "not-set-up", reasons: [] } }, "B", "remove-already-done");
+    case "unchanged":
+      return withResult(state, "B", "remove-cancel-failed");
+    default:
+      unreachable(result);
+      return failed(state, "cancel-remove", "request-failed");
+  }
 }
 
 function handleSetupResponse(state: WizardState, classified: ResponseClass): WizardReduction {
@@ -1086,6 +1131,11 @@ function reduceUserEvent(state: WizardState, event: WizardUserEvent & { readonly
     }
     case "declineForeign":
       return unchanged(withResult(state, "B", "foreign-declined"));
+    case "cancelRemove": {
+      // The paused (or failed) message stays while the request runs, so the screen and the focused button do not change underneath the user.
+      const issued = issue(state, "cancel-remove", { intent: "cancelRemove" });
+      return reduction(issued.state, issued.effect);
+    }
 
     case "confirmDestination":
     case "chooseDestinationAgain": {
@@ -1309,12 +1359,16 @@ export function wizardActions(state: WizardState): readonly WizardAction[] {
         add("confirmForeign", copy.stepB.switchForeign, { type: "confirmForeign" }, true);
         add("declineForeign", copy.stepB.declineForeign, { type: "declineForeign" });
       } else if (result !== undefined && STEP_B_SUCCESS.includes(result)) {
+        if (result === "outdated-remove-paused") add("cancelRemove", copy.stepB.cancelRemove, { type: "cancelRemove" });
         add("next", copy.common.next, { type: "next" }, true);
       } else if (result !== undefined && STEP_B_TERMINAL.includes(result)) {
         // Nothing to retry. 戻る comes first, as everywhere else. Policy and unavailable end in 閉じる; an unsafe folder in あとで設定 (design 4.3).
         back();
         later(result === "folder-unsafe" ? copy.common.later : copy.common.close);
         break;
+      } else if (failure && removePaused(state)) {
+        // The failed attempt was the cancel (a paused installation never sends a registration): try the same action again.
+        add("cancelRemove", copy.common.retry, { type: "cancelRemove" }, true);
       } else {
         const label = failure || result === "foreign-declined" ? copy.common.retry : copy.stepB.register;
         add("register", label, { type: "register" }, true);

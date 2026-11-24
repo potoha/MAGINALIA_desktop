@@ -75,6 +75,10 @@ export const WIZARD_MESSAGE_IDS = [
   "register-failed",
   "outdated-pending",
   "outdated-remove-paused",
+  "remove-cancelled",
+  "remove-not-requested",
+  "remove-already-done",
+  "remove-cancel-failed",
   // blocking request without an answer for a long time (watchdog)
   "inflight-slow",
   // step C
@@ -125,6 +129,10 @@ export const WIZARD_MESSAGE_ROLE: Readonly<Record<WizardMessageId, WizardMessage
   "register-failed": "alert",
   "outdated-pending": "status",
   "outdated-remove-paused": "status",
+  "remove-cancelled": "status",
+  "remove-not-requested": "status",
+  "remove-already-done": "status",
+  "remove-cancel-failed": "alert",
   "inflight-slow": "alert",
   "destination-configured": "status",
   "destination-writes-disabled": "alert",
@@ -340,6 +348,8 @@ export interface WizardCopy {
     readonly register: string;
     readonly switchForeign: string;
     readonly declineForeign: string;
+    /** Step B, remove paused: withdraws the unfinished remove (the same `cancelRemove` intent as the menu command). */
+    readonly cancelRemove: string;
   };
   readonly stepC: {
     readonly title: string;
@@ -501,6 +511,7 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
       register: "連携プログラムを登録する",
       switchForeign: "切り替える",
       declineForeign: "やめる",
+      cancelRemove: "解除を取りやめる",
     },
     stepC: {
       title: "保存先の本棚を確認する",
@@ -708,7 +719,23 @@ export function buildWizardCopy(context: WizardCopyContext, table: Table = COLLE
       },
       "outdated-remove-paused": {
         headline: "連携プログラムは登録済みですが、解除の途中で止まっています。",
-        detail: "解除を取りやめるか完了するまで、連携プログラムの自動更新は止まっています。元に戻すには、メニューの「Collector 連携の解除を取りやめる」を実行してください。このまま次へ進めます。",
+        detail: "解除を取りやめるか完了するまで、連携プログラムの自動更新は止まっています。「解除を取りやめる」を押すと、自動更新が再開されます。このまま次へ進むこともできます。",
+      },
+      "remove-cancelled": {
+        headline: "解除を取りやめました。",
+        detail: "連携プログラムの新しい版へは、次回起動時に自動で更新されます。このまま次へ進めます。",
+      },
+      "remove-not-requested": {
+        headline: "取りやめる解除はありませんでした。",
+        detail: "解除はすでに予定されていません。連携プログラムの新しい版へは、次回起動時に自動で更新されます。このまま次へ進めます。",
+      },
+      "remove-already-done": {
+        headline: "Collector 連携はすでに解除されています。",
+        detail: "もう一度使うには、連携プログラムを登録してください。",
+      },
+      "remove-cancel-failed": {
+        headline: "解除の取りやめを保存できませんでした。",
+        detail: "解除はまだ取りやめられていません。もう一度お試しください。解決しない場合は、メニューの「Collector 連携を確認・修復…」をお使いください。",
       },
       "outdated-pending": {
         headline: "連携プログラムは登録済みです。",

@@ -149,6 +149,14 @@ function atStepB(over: StatusOverrides = {}): Harness {
   return h;
 }
 
+/** Step B on an outdated installation whose remove is still requested, after pressing the register button. */
+function atStepBPaused(): Harness {
+  const h = atStepB({ state: "outdated", removeRequested: true });
+  send(h, { type: "register" });
+  expect(wizardMessage(h.state)?.id).toBe("outdated-remove-paused");
+  return h;
+}
+
 function atStepC(): Harness {
   const h = atStepB();
   send(h, { type: "register" });
@@ -186,6 +194,10 @@ const ALL_KINDS_RESPONSES: readonly CollectorIntegrationResponse[] = [
   applyResponse(),
   applyResponse({ outcome: "failed", reason: "write-failed" }),
   { kind: "cancelled" },
+  { kind: "cancel-remove", result: "cleared" },
+  { kind: "cancel-remove", result: "not-requested" },
+  { kind: "cancel-remove", result: "nothing-to-cancel" },
+  { kind: "cancel-remove", result: "unchanged" },
   { kind: "browser-required", status: status() },
   { kind: "browser-extensions", browser: "chrome", result: "opened" },
   { kind: "browser-extensions", browser: null, result: "browser-not-found" },
@@ -557,6 +569,7 @@ describe("wizard model: one operation at a time", () => {
       ["open-browser", () => { const h = atStepD(); send(h, { type: "openBrowserExtensions" }); return h; }],
       ["copy-path", () => { const h = atStepD(); send(h, { type: "copyPath" }); return h; }],
       ["reveal", () => { const h = atStepD(); send(h, { type: "revealFolder" }); return h; }],
+      ["cancel-remove", () => { const h = atStepBPaused(); send(h, { type: "cancelRemove" }); return h; }],
       ["poll", () => { const h = atStepE(); return h; }],
     ];
     for (const [name, build] of builders) {
@@ -570,10 +583,10 @@ describe("wizard model: one operation at a time", () => {
     }
   });
 
-  it("classifies all twelve response kinds", () => {
+  it("classifies all thirteen response kinds", () => {
     const kinds = new Set(ALL_KINDS_RESPONSES.map((response) => response.kind));
     expect([...kinds].sort()).toEqual([
-      "apply", "browser-download", "browser-extensions", "browser-required", "busy", "cancelled", "connection", "error",
+      "apply", "browser-download", "browser-extensions", "browser-required", "busy", "cancel-remove", "cancelled", "connection", "error",
       "extension-folder", "invalid-request", "status", "unavailable",
     ]);
     for (const response of ALL_KINDS_RESPONSES) expect(classifyWizardResponse(response)).toBeDefined();
@@ -1024,10 +1037,143 @@ describe("wizard model: outdated installation while a remove is requested (B-3)"
     expect(wizardMessage(h.state)).toMatchObject({ id: "outdated-remove-paused", role: "status" });
     const detail = wizardMessage(h.state)?.copy.detail ?? "";
     expect(detail).not.toContain("次回起動時に自動で更新されます");
-    expect(detail).toContain("Collector 連携の解除を取りやめる");
-    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "次へ"]);
+    expect(detail).toContain("「解除を取りやめる」");
+    // 戻る, あとで, the other action, then the primary one (right end).
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "解除を取りやめる", "次へ"]);
+    expect(action(h, "cancelRemove")).toMatchObject({ primary: false, enabled: true, event: { type: "cancelRemove" } });
+    expect(action(h, "next").primary).toBe(true);
     send(h, { type: "next" });
     expect(h.state.step).toBe("C");
+  });
+});
+
+describe("wizard model: cancelling an unfinished remove from step B", () => {
+  it("sends exactly the cancelRemove intent (a valid IPC request), keeps the paused screen and blocks everything while it runs", () => {
+    const h = atStepBPaused();
+    const effects = send(h, { type: "cancelRemove" });
+    expect(requestsOf(effects)).toEqual([{ intent: "cancelRemove" }]);
+    expect(h.state.inFlight?.operation).toBe("cancel-remove");
+    // The message and the buttons stay (so the focused button is not replaced); every action is disabled while the request runs.
+    expect(wizardMessage(h.state)?.id).toBe("outdated-remove-paused");
+    expect(wizardIsBusy(h.state)).toBe(true);
+    expect(wizardActions(h.state).every((candidate) => !candidate.enabled)).toBe(true);
+    // The answer must not be lost: leaving is not offered while the cancel runs.
+    const before = h.state;
+    expect(send(h, { type: "cancelRemove" })).toEqual([]);
+    expect(send(h, { type: "next" })).toEqual([]);
+    expect(send(h, { type: "later" })).toEqual([]);
+    expect(send(h, { type: "escape" })).toEqual([]);
+    expect(h.state).toBe(before);
+  });
+
+  it("cleared: says so, states that the update runs at the next start, forgets the request and lets the user go on", () => {
+    const h = atStepBPaused();
+    send(h, { type: "cancelRemove" });
+    const effects = respond(h, { kind: "cancel-remove", result: "cleared" });
+    expect(requestsOf(effects)).toEqual([]);
+    expect(h.state.inFlight).toBeNull();
+    expect(wizardMessage(h.state)).toMatchObject({ id: "remove-cancelled", role: "status" });
+    expect(wizardMessage(h.state)?.copy.headline).toBe("解除を取りやめました。");
+    expect(wizardMessage(h.state)?.copy.detail).toContain("次回起動時に自動で更新されます");
+    expect(h.state.status?.removeRequested).toBe(false);
+    // The button is gone (nothing left to cancel) and 次へ is the primary action.
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "次へ"]);
+    expect(isWizardEventAllowed(h.state, { type: "cancelRemove" })).toBe(false);
+    send(h, { type: "next" });
+    expect(h.state.step).toBe("C");
+    // Back on step B the answer is still the cleared one, not the paused text.
+    send(h, { type: "back" });
+    expect(wizardMessage(h.state)?.id).toBe("remove-cancelled");
+  });
+
+  it("not-requested: nothing was pending any more; still no false claim, and the user may go on", () => {
+    const h = atStepBPaused();
+    send(h, { type: "cancelRemove" });
+    respond(h, { kind: "cancel-remove", result: "not-requested" });
+    expect(wizardMessage(h.state)).toMatchObject({ id: "remove-not-requested", role: "status" });
+    expect(h.state.status?.removeRequested).toBe(false);
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "次へ"]);
+  });
+
+  it("nothing-to-cancel: the integration is already removed, so the screen offers the ordinary registration again", () => {
+    const h = atStepBPaused();
+    send(h, { type: "cancelRemove" });
+    respond(h, { kind: "cancel-remove", result: "nothing-to-cancel" });
+    expect(wizardMessage(h.state)).toMatchObject({ id: "remove-already-done", role: "status" });
+    expect(h.state.status).toMatchObject({ state: "not-set-up", removeRequested: false });
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "連携プログラムを登録する"]);
+    expect(action(h, "register").primary).toBe(true);
+    // Registering now sends a real setup request instead of the "paused" answer.
+    const effects = send(h, { type: "register" });
+    expect(requestsOf(effects)).toMatchObject([{ intent: "setup" }]);
+  });
+
+  it("unchanged: an alert, the request stays, and the same action is offered again as the primary one", () => {
+    const h = atStepBPaused();
+    send(h, { type: "cancelRemove" });
+    respond(h, { kind: "cancel-remove", result: "unchanged" });
+    expect(wizardMessage(h.state)).toMatchObject({ id: "remove-cancel-failed", role: "alert" });
+    expect(h.state.status?.removeRequested).toBe(true);
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "もう一度試す"]);
+    expect(action(h, "cancelRemove")).toMatchObject({ primary: true, enabled: true });
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
+    const effects = send(h, { type: "cancelRemove" });
+    expect(requestsOf(effects)).toEqual([{ intent: "cancelRemove" }]);
+    respond(h, { kind: "cancel-remove", result: "cleared" });
+    expect(wizardMessage(h.state)?.id).toBe("remove-cancelled");
+  });
+
+  it("busy, an error answer and a lost answer are alerts that offer the same cancel again", () => {
+    const answers: ReadonlyArray<readonly [string, (h: Harness) => void, WizardMessageId]> = [
+      ["busy", (h) => { respond(h, { kind: "busy" }); }, "busy"],
+      ["error", (h) => { respond(h, { kind: "error" }); }, "request-failed"],
+      ["lost", (h) => { send(h, { type: "requestFailed", requestId: h.state.inFlight!.requestId }); }, "request-failed"],
+    ];
+    for (const [name, answer, id] of answers) {
+      const h = atStepBPaused();
+      send(h, { type: "cancelRemove" });
+      answer(h);
+      expect(wizardMessage(h.state), name).toMatchObject({ id, role: "alert" });
+      expect(h.state.status?.removeRequested, name).toBe(true);
+      expect(actionLabels(h), name).toEqual(["戻る", "あとで設定", "もう一度試す"]);
+      expect(requestsOf(send(h, { type: "cancelRemove" })), name).toEqual([{ intent: "cancelRemove" }]);
+    }
+  });
+
+  it("an answer of another kind is a failed request, and an unavailable integration ends step B", () => {
+    const h = atStepBPaused();
+    send(h, { type: "cancelRemove" });
+    respond(h, statusResponse());
+    expect(wizardMessage(h.state)?.id).toBe("request-failed");
+    send(h, { type: "cancelRemove" });
+    respond(h, { kind: "unavailable", reason: "e2e-isolation" });
+    expect(wizardMessage(h.state)?.id).toBe("unavailable-e2e-isolation");
+    expect(isWizardEventAllowed(h.state, { type: "cancelRemove" })).toBe(false);
+  });
+
+  it("is not offered anywhere else: other steps, an installation without a remove request, and an unregistered step B", () => {
+    expect(isWizardEventAllowed(atStepA({ state: "outdated", removeRequested: true }).state, { type: "cancelRemove" })).toBe(false);
+    const plain = atStepB({ state: "outdated" });
+    send(plain, { type: "register" });
+    expect(wizardActions(plain.state).map((candidate) => candidate.id)).not.toContain("cancelRemove");
+    expect(isWizardEventAllowed(plain.state, { type: "cancelRemove" })).toBe(false);
+    // Before the register button is pressed nothing says a remove is in the way.
+    const before = atStepB({ state: "outdated", removeRequested: true });
+    expect(isWizardEventAllowed(before.state, { type: "cancelRemove" })).toBe(false);
+    expect(send(before, { type: "cancelRemove" })).toEqual([]);
+    const c = atStepC();
+    expect(isWizardEventAllowed(c.state, { type: "cancelRemove" })).toBe(false);
+  });
+
+  it("the watchdog offers a way out and forgets only the request; the remove request stays", () => {
+    const h = atStepBPaused();
+    send(h, { type: "cancelRemove" }, T0);
+    send(h, { type: "tick" }, T0 + WIZARD_INFLIGHT_CANCEL_MS);
+    expect(action(h, "cancelInFlight").enabled).toBe(true);
+    send(h, { type: "cancelInFlight" });
+    expect(h.state.inFlight).toBeNull();
+    expect(wizardMessage(h.state)?.id).toBe("outdated-remove-paused");
+    expect(h.state.status?.removeRequested).toBe(true);
   });
 });
 

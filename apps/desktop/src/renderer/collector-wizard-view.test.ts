@@ -277,6 +277,60 @@ describe("wizard view: steps B and C", () => {
     expectClean(v);
   });
 
+  it("B paused: the cancel button sits before the primary 次へ (戻る, あとで設定, 解除を取りやめる, 次へ) and is a plain nav button", () => {
+    const h = atStepB({ state: "outdated", removeRequested: true });
+    send(h, { type: "register" });
+    const v = view(h);
+    expect(v.buttons.map((button) => [button.id, button.label])).toEqual([
+      ["back", "戻る"],
+      ["later", "あとで設定"],
+      ["cancelRemove", "解除を取りやめる"],
+      ["next", "次へ"],
+    ]);
+    expect(v.buttons.find((button) => button.id === "cancelRemove")).toMatchObject({ primary: false, enabled: true, group: "nav", describedBy: null, event: { type: "cancelRemove" } });
+    expect(v.buttons.find((button) => button.id === "next")).toMatchObject({ primary: true, enabled: true });
+    expect(v.live.alert).toEqual([]);
+    expectClean(v);
+  });
+
+  it("B while the cancel runs: the button stays (disabled with the busy explanation) and the step is busy", () => {
+    const h = atStepB({ state: "outdated", removeRequested: true });
+    send(h, { type: "register" });
+    send(h, { type: "cancelRemove" });
+    const v = view(h);
+    expect(v.busy).toBe(true);
+    expect(v.buttons.find((button) => button.id === "cancelRemove")).toMatchObject({ enabled: false, describedBy: "busy" });
+    expect(v.buttons.find((button) => button.id === "next")).toMatchObject({ enabled: false, describedBy: "busy" });
+    expectClean(v);
+  });
+
+  it("B cancel answered: cleared is a status that names the next start; unchanged is an alert with one retry button", () => {
+    const cleared = atStepB({ state: "outdated", removeRequested: true });
+    send(cleared, { type: "register" });
+    send(cleared, { type: "cancelRemove" });
+    respond(cleared, { kind: "cancel-remove", result: "cleared" });
+    const v = view(cleared);
+    expect(v.live.status.map((message) => message.headline)).toContain("解除を取りやめました。");
+    expect(v.live.status.map((message) => message.detail ?? "").join("")).toContain("次回起動時");
+    expect(v.live.alert).toEqual([]);
+    expect(labels(v)).toEqual(["戻る", "あとで設定", "次へ"]);
+    expectClean(v);
+
+    const failed = atStepB({ state: "outdated", removeRequested: true });
+    send(failed, { type: "register" });
+    send(failed, { type: "cancelRemove" });
+    respond(failed, { kind: "cancel-remove", result: "unchanged" });
+    const w = view(failed);
+    expect(w.live.alert).toEqual([expect.objectContaining({ headline: "解除の取りやめを保存できませんでした。" })]);
+    expect(w.live.status).toEqual([]);
+    expect(w.buttons.map((button) => [button.id, button.label, button.primary])).toEqual([
+      ["back", "戻る", false],
+      ["later", "あとで設定", false],
+      ["cancelRemove", "もう一度試す", true],
+    ]);
+    expectClean(w);
+  });
+
   it("B self-check-failed is an alert; only 戻る and 閉じる remain (no register, no 次へ)", () => {
     const h = atStepB();
     send(h, { type: "register" });
