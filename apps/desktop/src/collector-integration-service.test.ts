@@ -726,7 +726,7 @@ describe("collector integration service", () => {
     r.current = inspection("outdated");
     r.notices = [buildRemoveFailedNotice()];
     const service = createCollectorIntegrationService(r.deps);
-    expect(await service.handle({ intent: "cancelRemove" })).toEqual({ kind: "cancel-remove", result: "cleared" });
+    expect(await service.handle({ intent: "cancelRemove" })).toEqual({ kind: "cancel-remove", result: "cleared", state: "outdated" });
     expect(r.events).toEqual(["cancelRemove"]);
     expect(r.applies).toEqual([]);
     expect(r.recorded).toEqual([]);
@@ -738,7 +738,7 @@ describe("collector integration service", () => {
     const service = createCollectorIntegrationService(r.deps);
     for (const result of ["not-requested", "unchanged"] as const) {
       r.cancelRemoveResult = result;
-      expect(await service.handle({ intent: "cancelRemove" })).toEqual({ kind: "cancel-remove", result });
+      expect(await service.handle({ intent: "cancelRemove" })).toEqual({ kind: "cancel-remove", result, state: "outdated" });
     }
     r.events.length = 0;
     r.current = inspection("not-set-up");
@@ -758,6 +758,24 @@ describe("collector integration service", () => {
     release.resolve();
     await running;
     expect(r.events).not.toContain("cancelRemove");
+  });
+
+  it("a remove that starts while cancelRemove is inspecting is refused as busy and keeps its flag", async () => {
+    const r = rig();
+    r.current = inspection("outdated");
+    const inspecting = deferred<void>();
+    const release = deferred<void>();
+    const service = createCollectorIntegrationService({
+      ...r.deps,
+      inspect: async () => { inspecting.resolve(); await release.promise; return r.current; },
+    });
+    const cancelling = service.handle({ intent: "cancelRemove" });
+    await inspecting.promise;
+    expect(await service.handle({ intent: "remove" })).toEqual({ kind: "busy" });
+    release.resolve();
+    expect(await cancelling).toEqual({ kind: "cancel-remove", result: "cleared", state: "outdated" });
+    expect(r.events).toEqual(["cancelRemove"]);
+    expect(r.applies).toEqual([]);
   });
 
   it("a failing recordRemoveFailure does not hide the original remove error", async () => {

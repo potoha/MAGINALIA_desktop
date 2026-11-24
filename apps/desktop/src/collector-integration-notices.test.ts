@@ -100,11 +100,11 @@ describe("notice data", () => {
     expect(buildRepairNotice("damaged").actions[0]?.commandId).toBe("maginalia.collector.repair");
   });
 
-  it("the remove-failed notice (decision 4) has the fixed title, says the automatic update is paused, and retries through the remove command", () => {
+  it("the remove-failed notice (decision 4) has the fixed title, says the automatic update may be paused, and retries through the remove command", () => {
     const notice = buildRemoveFailedNotice();
     expect(notice.title).toBe("Collector 連携の解除に失敗しました");
-    expect(notice.detail).toContain("Collector の自動更新は止まったまま");
-    expect(notice.detail).toContain("解除を取りやめる");
+    expect(notice.detail).toContain("Collector の自動更新が止まることがあります");
+    expect(notice.detail).toContain("解除を取りやめて");
     // the cancel button closes the notice once its command succeeded
     expect(notice.actions[1]?.closesNoticeId).toBe("collector.notice.remove-failed");
     expect(notice.actions.map((action) => [action.commandId, action.label])).toEqual([

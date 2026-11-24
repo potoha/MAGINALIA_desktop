@@ -153,8 +153,9 @@ export interface CollectorIntegrationStatus {
    */
   readonly applyInProgress: boolean;
   /**
-   * The user asked for a remove that has not been completed or cancelled (B-3). While it is set and the state is
-   * `outdated`, the automatic update at start is paused; `cancelRemove` ends that.
+   * A remove was requested and no setup / repair / cancel has cleared it since (B-3). It stays true after a remove
+   * succeeded, until the next setup. While it is set and the state is `outdated`, the automatic update at start is
+   * paused; `cancelRemove` (or a setup / repair, which clears it once applied) ends that.
    */
   readonly removeRequested: boolean;
   readonly state: CollectorIntegrationState;
@@ -210,7 +211,12 @@ export type CollectorIntegrationResponse =
    * `cancelRemove` (B-2). `cleared`: the remove request was withdrawn (no file changed). `not-requested`: there was
    * none. `nothing-to-cancel`: the integration is already removed (use setup). `unchanged`: the state could not be saved.
    */
-  | { readonly kind: "cancel-remove"; readonly result: "cleared" | "not-requested" | "nothing-to-cancel" | "unchanged" }
+  | {
+    readonly kind: "cancel-remove";
+    readonly result: "cleared" | "not-requested" | "nothing-to-cancel" | "unchanged";
+    /** The installation state seen by the cancel (absent for `nothing-to-cancel`); lets the UI word a cancel after a partial removal. */
+    readonly state?: CollectorIntegrationState;
+  }
   /**
    * `setup`: no verified, installed, policy-allowed browser was found (or detection failed) and
    * `proceedWithoutSupportedBrowser` was not set. Nothing written.

@@ -219,6 +219,10 @@ describe("Collector integration commands", () => {
     expect(collectorResponseNotice({ ...applied, outcome: "noop" } as CollectorIntegrationResponse)).toContain("解除しました");
     expect(collectorResponseNotice({ ...applied, outcome: "failed" } as CollectorIntegrationResponse)).toBeNull();
     expect(collectorResponseNotice({ ...applied, action: "setup" } as CollectorIntegrationResponse)).toBeNull();
+    expect(collectorResponseNotice({ ...applied, saveDestination: "error" } as CollectorIntegrationResponse)).toContain("保存先の設定は解除できませんでした");
+    expect(collectorResponseNotice({ ...applied, saveDestination: "cleared" } as CollectorIntegrationResponse)).not.toContain("保存先");
+    expect(collectorResponseNotice({ kind: "cancel-remove", result: "cleared", state: "damaged" })).toContain("戻りません");
+    expect(collectorResponseNotice({ kind: "cancel-remove", result: "cleared", state: "ready" })).toContain("通常どおり");
     expect(collectorResponseNotice({ kind: "cancelled" })).toBe("Collector 連携の解除は行いませんでした。");
     expect(collectorResponseNotice({ kind: "busy" })).toBeNull();
     for (const result of ["cleared", "not-requested", "nothing-to-cancel"] as const) expect(collectorResponseNotice({ kind: "cancel-remove", result })).not.toBeNull();

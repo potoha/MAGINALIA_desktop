@@ -480,7 +480,7 @@ describe("remove apply threw (decision 4)", () => {
     const notices = startup.currentNotices();
     expect(kinds(notices)).toEqual(["remove-failed"]);
     expect(notices[0]?.title).toBe("Collector 連携の解除に失敗しました");
-    expect(notices[0]?.detail).toContain("自動更新は止まったまま");
+    expect(notices[0]?.detail).toContain("自動更新が止まることがあります");
     expect(notices[0]?.actions.map((action) => action.commandId)).toEqual([
       "maginalia.collector.removeIntegration",
       "maginalia.collector.cancelRemove",

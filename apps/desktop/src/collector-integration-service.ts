@@ -372,14 +372,18 @@ export function createCollectorIntegrationService(deps: CollectorIntegrationServ
       case "remove":
         return runApply({ action: "remove" });
       case "cancelRemove": {
-        // B-2. Not an apply: it removes and writes nothing but the notice state, so it needs no gate. A remove that is
-        // running right now owns the flag until it ends (`beginRemove` / `recordApplyResult`), hence `busy`.
-        if (deps.gate.busy) return { kind: "busy" };
-        // A finished removal has nothing left to cancel; the user sets the integration up again instead.
-        if ((await inspectShared()).state === "not-set-up") return { kind: "cancel-remove", result: "nothing-to-cancel" };
-        const result = await deps.startupRefresh.cancelRemove();
-        publish(deps.startupRefresh.currentNotices());
-        return { kind: "cancel-remove", result };
+        // B-2. Not an apply (it removes and writes nothing but the notice state), yet it runs under the gate: a remove
+        // owns the flag from `beginRemove` to `recordApplyResult`, and the inspection below is an await in which a remove
+        // could otherwise start and have its flag rolled back. While the gate is held, a remove or apply answers `busy`.
+        const outcome = await deps.gate.tryRun(async (): Promise<CollectorIntegrationResponse> => {
+          const inspection = await inspectShared();
+          // A finished removal has nothing left to cancel; the user sets the integration up again instead.
+          if (inspection.state === "not-set-up") return { kind: "cancel-remove", result: "nothing-to-cancel" };
+          const result = await deps.startupRefresh.cancelRemove();
+          publish(deps.startupRefresh.currentNotices());
+          return { kind: "cancel-remove", result, state: inspection.state };
+        });
+        return outcome.ran ? outcome.value : { kind: "busy" };
       }
       case "openBrowserExtensions": {
         // The renderer names at most a table row id. The executable comes from the main-process locator

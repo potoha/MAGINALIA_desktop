@@ -75,9 +75,10 @@ export type CollectorNotice =
   | (NoticeBase & {
     readonly kind: "remove-failed";
     /**
-     * Not persisted. Raised in the session where a confirmed remove threw or ended `failed`, and again at startup while
-     * `removeRequested` is set and the installation is `outdated` (the state in which the automatic refresh
-     * is paused). Cleared by any remove / setup / repair result, or closed for the session by dismissal.
+     * Not persisted. Raised in the session where a confirmed remove threw or ended `failed` (B-5), and again at startup
+     * while `removeRequested` is set and the installation is `outdated` (the state in which the automatic refresh
+     * is paused). Replaced by any later remove result (raised again if that one failed too), cleared by an applied or
+     * noop setup / repair or by `cancelRemove` (B-2), or closed for the session by dismissal.
      */
     readonly clearsWhen: "remove-or-setup-applied-or-dismissed";
   });
@@ -129,17 +130,19 @@ export function buildAlpha1MigrationNotice(): CollectorNotice {
 }
 
 /**
- * Decision 4: a remove that did not finish leaves `removeRequested` set, and while it is set (and the state is
- * `outdated`) the startup refresh does not run. The text therefore says that the automatic update is paused and
- * names the two ways to end that: retry the removal until it finishes, or cancel it (B-2,
- * `maginalia.collector.cancelRemove`). A repair or setup from `outdated` does not clear `removeRequested`.
+ * Decision 4: a remove that did not finish leaves `removeRequested` set, and while it is set and the state is
+ * `outdated` the startup refresh does not run. The notice is also raised right after a remove that ended `failed`
+ * without throwing (B-5), when the state may still be `ready` (the flag is then cleared at the next start), so the
+ * text does not claim the update is stopped: it says the removal is unfinished, that the automatic update may be
+ * paused until it ends, and names the two ways to end that: retry the removal or cancel it (B-2,
+ * `maginalia.collector.cancelRemove`). An applied or noop setup / repair also clears the flag.
  */
 export function buildRemoveFailedNotice(): CollectorNotice {
   return Object.freeze({
     id: COLLECTOR_NOTICE_IDS.removeFailed,
     kind: "remove-failed" as const,
     title: "Collector 連携の解除に失敗しました",
-    detail: "解除を完了できませんでした。解除をやり直して完了するか、解除を取りやめるまで、Collector の自動更新は止まったままです。本棚・引用データは削除されていません。",
+    detail: "解除を完了できませんでした。解除をやり直して完了するか、解除を取りやめてください。解除が終わるまで、Collector の自動更新が止まることがあります。本棚・引用データは削除されていません。",
     clearsWhen: "remove-or-setup-applied-or-dismissed" as const,
     actions: Object.freeze([
       { commandId: COLLECTOR_REMOVE_COMMAND_ID, label: "解除をやり直す…" },

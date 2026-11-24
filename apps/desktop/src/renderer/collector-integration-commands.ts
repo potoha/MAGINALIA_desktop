@@ -81,14 +81,18 @@ export function collectorResponseNotice(response: CollectorIntegrationResponse):
   switch (response.kind) {
     case "cancelled":
       return "Collector 連携の解除は行いませんでした。";
-    case "apply":
-      return response.action === "remove" && (response.outcome === "applied" || response.outcome === "noop")
-        ? "Collector 連携を解除しました。本棚・引用データは削除していません。"
-        : null;
+    case "apply": {
+      if (response.action !== "remove" || (response.outcome !== "applied" && response.outcome !== "noop")) return null;
+      const base = "Collector 連携を解除しました。本棚・引用データは削除していません。";
+      return response.saveDestination === "error" ? `${base}保存先の設定は解除できませんでした。` : base;
+    }
     case "cancel-remove":
       switch (response.result) {
         case "cleared":
-          return "解除を取りやめました。Collector 連携は、次回の起動時から自動更新を含めて通常どおり扱われます。";
+          // After a partial removal (damaged and the like) the deleted files do not come back.
+          return response.state === undefined || response.state === "outdated" || response.state === "ready"
+            ? "解除を取りやめました。Collector 連携は、次回の起動時から自動更新を含めて通常どおり扱われます。"
+            : "解除を取りやめました。すでに削除されたファイルは戻りません。「Collector 連携を確認・修復…」で状態を確認してください。";
         case "not-requested":
           return "取りやめる解除はありません。";
         case "nothing-to-cancel":
