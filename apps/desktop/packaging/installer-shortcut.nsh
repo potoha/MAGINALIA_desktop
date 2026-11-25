@@ -1,8 +1,17 @@
 !include "nsDialogs.nsh"
 !include "LogicLib.nsh"
 !include "${PROJECT_DIR}\\packaging\\runtime\\ndlocr-installer-size.nsh"
+!include "${PROJECT_DIR}\\packaging\\collector-uninstall.nsh"
+
+# α1 display name. Only used to retire the α1 Desktop shortcut on upgrade.
+!define MAGINALIA_LEGACY_NAME "MAGINALIA desktop α1"
+# Name used by a pre-release build ("MAGINALIA α2 wild berry", PR #105). Only
+# used to retire a stale Desktop shortcut that points at that old executable.
+!define MAGINALIA_PRERELEASE_NAME "MAGINALIA α2 wild berry"
 
 !ifndef BUILD_UNINSTALLER
+Var MAGINALIA_LEGACY_LINK_REMOVED
+Var MAGINALIA_PRERELEASE_LINK_REMOVED
 Var MAGINALIA_DESKTOP_SHORTCUT_CHECKBOX
 Var MAGINALIA_DESKTOP_SHORTCUT_STATE
 Var MAGINALIA_NDLOCR_CHECKBOX
@@ -80,9 +89,38 @@ FunctionEnd
   ${Else}
     RMDir /r "$INSTDIR\resources\ndlocr"
   ${EndIf}
+  # Upgrade over α1: the α1 uninstaller never removes the optional Desktop
+  # shortcut, so it would dangle at the removed α1 executable. Delete it only
+  # when it points at the α1 executable inside this install directory, and
+  # carry the user's choice over to the new name.
+  StrCpy $MAGINALIA_LEGACY_LINK_REMOVED "0"
+  IfFileExists "$DESKTOP\${MAGINALIA_LEGACY_NAME}.lnk" 0 MAGINALIA_LegacyDesktopShortcutDone
+    System::Call 'Kernel32::SetEnvironmentVariable(t "MAGINALIA_LEGACY_LNK", t "$DESKTOP\${MAGINALIA_LEGACY_NAME}.lnk")i'
+    System::Call 'Kernel32::SetEnvironmentVariable(t "MAGINALIA_LEGACY_EXE", t "$INSTDIR\${MAGINALIA_LEGACY_NAME}.exe")i'
+    nsExec::Exec '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$l=(New-Object -ComObject WScript.Shell).CreateShortcut($$env:MAGINALIA_LEGACY_LNK);if($$l.TargetPath -ieq $$env:MAGINALIA_LEGACY_EXE){Remove-Item -LiteralPath $$env:MAGINALIA_LEGACY_LNK;exit 0}else{exit 3}"'
+    Pop $0
+    ${If} $0 == 0
+      StrCpy $MAGINALIA_LEGACY_LINK_REMOVED "1"
+    ${EndIf}
+  MAGINALIA_LegacyDesktopShortcutDone:
+  # A pre-release build may have created "MAGINALIA α2 wild berry.lnk". Same
+  # rule: delete it only when it targets that old-named executable inside this
+  # install directory, and carry the user's choice over to the new name.
+  StrCpy $MAGINALIA_PRERELEASE_LINK_REMOVED "0"
+  IfFileExists "$DESKTOP\${MAGINALIA_PRERELEASE_NAME}.lnk" 0 MAGINALIA_PrereleaseDesktopShortcutDone
+    System::Call 'Kernel32::SetEnvironmentVariable(t "MAGINALIA_LEGACY_LNK", t "$DESKTOP\${MAGINALIA_PRERELEASE_NAME}.lnk")i'
+    System::Call 'Kernel32::SetEnvironmentVariable(t "MAGINALIA_LEGACY_EXE", t "$INSTDIR\${MAGINALIA_PRERELEASE_NAME}.exe")i'
+    nsExec::Exec '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$l=(New-Object -ComObject WScript.Shell).CreateShortcut($$env:MAGINALIA_LEGACY_LNK);if($$l.TargetPath -ieq $$env:MAGINALIA_LEGACY_EXE){Remove-Item -LiteralPath $$env:MAGINALIA_LEGACY_LNK;exit 0}else{exit 3}"'
+    Pop $0
+    ${If} $0 == 0
+      StrCpy $MAGINALIA_PRERELEASE_LINK_REMOVED "1"
+    ${EndIf}
+  MAGINALIA_PrereleaseDesktopShortcutDone:
   ${If} $MAGINALIA_DESKTOP_SHORTCUT_STATE == ${BST_CHECKED}
-    IfFileExists "$DESKTOP\MAGINALIA desktop α1.lnk" MAGINALIA_DesktopShortcutConflict
-    CreateShortCut "$DESKTOP\MAGINALIA desktop α1.lnk" "$INSTDIR\${APP_EXECUTABLE_FILENAME}" "" "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
+  ${OrIf} $MAGINALIA_LEGACY_LINK_REMOVED == "1"
+  ${OrIf} $MAGINALIA_PRERELEASE_LINK_REMOVED == "1"
+    IfFileExists "$DESKTOP\MAGINALIA Alpha2 Wild Berry.lnk" MAGINALIA_DesktopShortcutConflict
+    CreateShortCut "$DESKTOP\MAGINALIA Alpha2 Wild Berry.lnk" "$INSTDIR\${APP_EXECUTABLE_FILENAME}" "" "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
     Goto MAGINALIA_DesktopShortcutDone
     MAGINALIA_DesktopShortcutConflict:
       MessageBox MB_ICONEXCLAMATION|MB_OK "同じ名前のショートカットがあるため、デスクトップには追加しませんでした。"

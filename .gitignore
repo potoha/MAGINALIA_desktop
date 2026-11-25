@@ -1,9 +1,11 @@
 node_modules/
 apps/desktop/dist/
 apps/desktop/release/
+apps/desktop/release-new/
 # node-gyp output for the Windows named-mutex addon spike. The shipped binary is
 # built in CI and copied into the installer; build/ is never committed.
 apps/desktop/native/shelf-mutex/build/
+apps/desktop/native/windows-integration/build/
 apps/desktop/packaging/runtime/
 apps/desktop/packaging/.stage/
 packages/*/dist/
@@ -18,3 +20,8 @@ sidecars/reviewer/.venv/
 sidecars/reviewer/.pytest-tmp/
 sidecars/reviewer/.pytest_cache/
 
+
+# Session handoffs, reports and human-task kits (kept locally, not committed)
+docs/handoff-*.md
+docs/report-*.md
+docs/human-tasks-*/

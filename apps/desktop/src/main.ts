@@ -3,6 +3,7 @@ import {
   BrowserWindow,
   Menu,
   WebContentsView,
+  clipboard,
   dialog,
   ipcMain,
   shell,
@@ -12,10 +13,12 @@ import {
   type OpenDialogReturnValue,
   type WebContents
 } from "electron";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, realpath, writeFile } from "node:fs/promises";
 import * as path from "node:path";
+import { PRODUCT_DISPLAY_NAME, brandVersionString } from "./branding";
 import { findApplicationIconPath, findBrandAssetPath } from "./brand-assets";
 import {
   brandProgressUpdateScript,
@@ -100,6 +103,7 @@ import {
   type SaveMarkdownResult
 } from "./markdown-ipc";
 import { LibraryService } from "./library-service";
+import { inspectFolderMarkers } from "./folder-identity";
 import { createLibraryHandlers } from "./library-ipc";
 import { createShelfHandlers, REFRESH_SHELF_CHANNEL, SEARCH_SHELF_CHANNEL } from "./shelf-ipc";
 import { ConfiguredPrivateShelf } from "./configured-private-shelf";
@@ -107,6 +111,35 @@ import { ShelfLocationRegistry } from "./shelf-location-registry";
 import { resolveDesktopConfigurationPaths, type DesktopConfigurationPaths } from "./desktop-configuration";
 import { createReviewerShelfSyncAdapter } from "./reviewer-shelf-sync";
 import { materializeApprovedReviewerRecords } from "./reviewer-approval-materializer";
+import { createShelfBindingFileStore, removeShelfBindingFile, resolveShelfBindingStoragePaths, type ShelfBindingStoragePaths } from "./shelf-binding-store";
+import { resolveReviewerShelfWriteCoordination } from "./reviewer-shelf-write-binding";
+import { createNativePrivateDirectory, getNativeLocalAppDataPath, inspectNativePathSecurity } from "./shelf-native-mutex";
+import {
+  clearCollectorSaveDestination,
+  collectorSaveDestinationConfirmationText,
+  configureCollectorSaveDestination,
+  type CollectorSaveDestinationDependencies,
+} from "./collector-save-destination";
+import {
+  CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL,
+  CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL,
+  type CollectorSaveDestinationIpcResult,
+} from "./collector-save-destination-ipc";
+import {
+  COLLECTOR_INTEGRATION_CHANNEL,
+  COLLECTOR_NOTICES_EVENT_CHANNEL,
+  DISMISS_COLLECTOR_NOTICE_CHANNEL,
+  GET_COLLECTOR_NOTICES_CHANNEL,
+  type CollectorIntegrationResponse,
+} from "./collector-integration-ipc";
+import {
+  createCollectorApplyGate,
+  createCollectorIntegrationService,
+  type CollectorIntegrationService,
+} from "./collector-integration-service";
+import { createCollectorIntegrationRuntimeFromParts } from "./collector-startup-refresh-composition";
+import { createProductCollectorRegistryAdapter } from "./collector-registry-adapter";
+import type { CollectorNotice } from "./collector-integration-notices";
 import { createReferenceHandlers } from "./reference-ipc";
 import { resolveShelfQuoteRefs } from "./shelf-resolution";
 import { PackagedReviewerLaunchStrategy, ReviewerProcessManager, UserDataReviewerWorkspaceLocator } from "./reviewer-process-manager";
@@ -190,6 +223,7 @@ import {
 } from "./autosave-ipc";
 import { AutosaveShutdownCoordinator } from "./autosave-shutdown";
 import { establishApplicationIdentity, MAGINALIA_APPLICATION_NAME } from "./application-identity";
+import { E2E_ISOLATION_ROOT_ENV, enforceE2EIsolationBeforeStartup } from "./e2e-isolation";
 import { FirstRunCoordinator } from "./first-run-coordinator";
 import { FirstRunJournalStore } from "./first-run-setup";
 import { runFirstRunRestoreSmoke, runFirstRunSmoke } from "./first-run-smoke";
@@ -209,6 +243,11 @@ import {
   RUN_FIRST_RUN_SETUP_CHANNEL,
   isFirstRunChoices,
 } from "./first-run-ipc";
+
+// Test-only E2E isolation gate (#93). Inert unless MAGINALIA_E2E_ISOLATION_ROOT
+// is set; otherwise it exits with code 78 before any Desktop side effect when a
+// Desktop-controlled destination resolves outside the disposable test root.
+const e2eIsolationState = enforceE2EIsolationBeforeStartup(app);
 
 // Set a product-stable Electron identity before resolving any local stores.
 // Retain the profile Electron selected before this upgrade so existing state
@@ -280,11 +319,200 @@ const projectService = new ProjectService(
 const projectAssetService = new ProjectAssetService(documentWorkspaceService);
 const libraryService = new LibraryService();
 let desktopConfigurationPaths: DesktopConfigurationPaths | undefined;
+let shelfBindingStoragePaths: ShelfBindingStoragePaths | undefined;
+let shelfBindingStore: ReturnType<typeof createShelfBindingFileStore> | undefined;
 function getDesktopConfigurationPaths(): DesktopConfigurationPaths {
   // Electron chooses userData; resolving lazily ensures that path is final and
   // avoids accidentally binding Shelf discovery to bootstrap cwd/state.
   desktopConfigurationPaths ??= resolveDesktopConfigurationPaths(userDataPath);
   return desktopConfigurationPaths;
+}
+
+function getShelfBindingStorage(): {
+  readonly paths: ShelfBindingStoragePaths;
+  readonly store: ReturnType<typeof createShelfBindingFileStore>;
+} {
+  shelfBindingStoragePaths ??= resolveShelfBindingStoragePaths(getNativeLocalAppDataPath());
+  // Missing integration directories are created with a protected current-user /
+  // SYSTEM / Administrators DACL so the Collector ACL check can pass even when the
+  // inherited LocalAppData ACL grants other principals write access.
+  shelfBindingStore ??= createShelfBindingFileStore(shelfBindingStoragePaths.bindingDirectory, {
+    createDirectory: async (directory) => { createNativePrivateDirectory(directory); },
+  });
+  return { paths: shelfBindingStoragePaths, store: shelfBindingStore };
+}
+
+let collectorSaveDestinationBusy = false;
+
+async function showCollectorSaveDestinationDialog(options: MessageBoxOptions) {
+  return mainWindow === null || mainWindow.isDestroyed()
+    ? dialog.showMessageBox(options)
+    : dialog.showMessageBox(mainWindow, options);
+}
+
+/** Runs one Collector save-destination command; dialogs are owned by the main process. */
+async function runCollectorSaveDestinationCommand(
+  command: (dependencies: CollectorSaveDestinationDependencies) => Promise<CollectorSaveDestinationIpcResult>,
+): Promise<CollectorSaveDestinationIpcResult> {
+  if (collectorSaveDestinationBusy) return { kind: "busy" };
+  collectorSaveDestinationBusy = true;
+  try {
+    let storage: ReturnType<typeof getShelfBindingStorage>;
+    try {
+      storage = getShelfBindingStorage();
+    } catch {
+      await showCollectorSaveDestinationDialog({
+        type: "error",
+        title: "Collector の保存先",
+        message: "Collector 連携の設定場所を確認できません。",
+        detail: "Windows のユーザー用ローカルアプリデータフォルダーを確認できませんでした。Collector の保存先の設定は変更されていません。",
+        noLink: true,
+      });
+      return { kind: "error" };
+    }
+    return await command({
+      shelfLocationPath: getDesktopConfigurationPaths().shelfLocationPath,
+      storagePaths: storage.paths,
+      store: storage.store,
+      inspectPathSecurity: inspectNativePathSecurity,
+      removeBinding: () => removeShelfBindingFile(storage.paths.bindingDirectory),
+      confirm: async (request) => {
+        const text = collectorSaveDestinationConfirmationText(request);
+        const result = await showCollectorSaveDestinationDialog({
+          type: "question",
+          title: text.title,
+          message: text.message,
+          detail: text.detail,
+          buttons: [text.confirmLabel, "キャンセル"],
+          defaultId: 1,
+          cancelId: 1,
+          noLink: true,
+        });
+        return result.response === 0;
+      },
+      notify: async (notice) => {
+        await showCollectorSaveDestinationDialog({
+          type: notice.type,
+          title: "Collector の保存先",
+          message: notice.message,
+          ...(notice.detail === undefined ? {} : { detail: notice.detail }),
+          noLink: true,
+        });
+      },
+    });
+  } catch {
+    return { kind: "error" };
+  } finally {
+    collectorSaveDestinationBusy = false;
+  }
+}
+
+// ----- Collector integration (WP-7 slice A) -------------------------------------------------
+// One main-process service owns every Collector apply (setup / repair / remove / startup refresh),
+// serialized through one gate. The renderer only sends enumerated intents; no path crosses IPC.
+const collectorApplyGate = createCollectorApplyGate();
+let collectorIntegration: CollectorIntegrationService | undefined;
+
+function logCollectorIntegrationError(code: string, error?: unknown): void {
+  // Code and error name only: an error message could carry a machine-local path.
+  console.error(code, error instanceof Error ? error.name : typeof error);
+}
+
+function publishCollectorNotices(notices: readonly CollectorNotice[]): void {
+  const window = mainWindow;
+  if (window === null || window.isDestroyed() || window.webContents.isDestroyed()) return;
+  window.webContents.send(COLLECTOR_NOTICES_EVENT_CHANNEL, notices);
+}
+
+function launchDetachedProcess(executablePath: string, args: readonly string[]): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const child = spawn(executablePath, [...args], { detached: true, stdio: "ignore" });
+      child.once("error", () => resolve(false));
+      child.once("spawn", () => {
+        child.unref();
+        resolve(true);
+      });
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+async function confirmCollectorRemoval(): Promise<{ readonly confirmed: boolean; readonly clearSaveDestination: boolean }> {
+  const result = await showCollectorSaveDestinationDialog({
+    type: "question",
+    title: "Collector 連携",
+    message: "Collector 連携を解除しますか？",
+    detail: "この MAGINALIA の連携プログラムの登録と、拡張機能のフォルダーを削除します。本棚・引用データ・Workdesk・書き込み記録は削除されません。ブラウザーに保留中の引用がある場合は、先に Collector で内容を確認してください。ブラウザーの拡張機能一覧に残る MAGINALIA Collector は、そのブラウザーの画面から削除できます（削除すると保留中の引用も消えます）。",
+    buttons: ["解除する", "キャンセル"],
+    defaultId: 1,
+    cancelId: 1,
+    checkboxLabel: "保存先の設定も解除する",
+    checkboxChecked: false,
+    noLink: true,
+  });
+  return { confirmed: result.response === 0, clearSaveDestination: result.response === 0 && result.checkboxChecked };
+}
+
+/** Builds the service once. Never throws: a failure leaves the feature off and the app starting. */
+function createCollectorIntegrationForMain(): CollectorIntegrationService | undefined {
+  try {
+    const runtime = createCollectorIntegrationRuntimeFromParts({
+      e2eIsolationActive: e2eIsolationState !== undefined || process.env[E2E_ISOLATION_ROOT_ENV] !== undefined,
+      createRegistry: createProductCollectorRegistryAdapter,
+      inspectPathSecurity: inspectNativePathSecurity,
+      createPrivateDirectory: createNativePrivateDirectory,
+      resourcesPath: process.resourcesPath,
+      isPackaged: app.isPackaged,
+      processEnvironment: process.env,
+      noticeStatePath: path.join(userDataPath, "collector-notice-state.json"),
+      wrapApply: (apply) => (request) => collectorApplyGate.queue(() => apply(request)),
+    });
+    return createCollectorIntegrationService({
+      mode: runtime.mode,
+      startupRefresh: runtime.startupRefresh,
+      inspect: runtime.inspect,
+      apply: runtime.apply,
+      locateBrowser: runtime.locateBrowser,
+      gate: collectorApplyGate,
+      launchBrowser: launchDetachedProcess,
+      writeClipboardText: (text) => clipboard.writeText(text),
+      openExternal: async (url) => {
+        try {
+          await shell.openExternal(url);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      openFolder: async (folder) => (await shell.openPath(folder)) === "",
+      confirmRemove: confirmCollectorRemoval,
+      clearSaveDestination: () => runCollectorSaveDestinationCommand(clearCollectorSaveDestination),
+      publishNotices: publishCollectorNotices,
+      logError: logCollectorIntegrationError,
+    });
+  } catch (error: unknown) {
+    logCollectorIntegrationError("MAGINALIA_COLLECTOR_INTEGRATION_UNAVAILABLE", error);
+    return undefined;
+  }
+}
+
+/** Fire and forget: the startup path never waits for the Collector inspection or refresh. */
+function startCollectorIntegration(): void {
+  if (smokeMode) return; // smoke runs must not touch the registry
+  collectorIntegration = createCollectorIntegrationForMain();
+  const service = collectorIntegration;
+  if (service === undefined) return;
+  void service.runStartup();
+  service.startPeriodicReconcile();
+  app.on("browser-window-focus", () => { void service.reconcile(); });
+}
+
+async function handleCollectorIntegrationRequest(event: IpcMainInvokeEvent, value: unknown, ...args: readonly unknown[]): Promise<CollectorIntegrationResponse> {
+  if (args.length !== 0 || !isLiveMainWindowSender(event.sender)) return { kind: "error" };
+  if (collectorIntegration === undefined) return { kind: "unavailable", reason: "startup-failed" };
+  return collectorIntegration.handle(value);
 }
 
 let configuredPrivateShelf: ConfiguredPrivateShelf | undefined;
@@ -315,6 +543,81 @@ async function getActivePrivateShelfForDesktop(owner: object) {
   }
   if (selection.canceled || selection.filePaths.length !== 1) return active;
   return configured.configureAndOpen(owner, selection.filePaths[0]);
+}
+
+async function getReviewerShelfWriteCoordination(shelfRoot: string) {
+  const owner = mainWindow?.webContents;
+  if (owner === undefined || owner.isDestroyed()) throw new Error("The Desktop window is unavailable.");
+  const active = await getConfiguredPrivateShelf().getActive(owner);
+  if (active.kind !== "private-shelf" || active.folderIdentityRecovery !== undefined) {
+    throw new Error("The configured Private Shelf identity cannot be verified.");
+  }
+  const configurationPath = getDesktopConfigurationPaths().shelfLocationPath;
+  const location = await new ShelfLocationRegistry(configurationPath).load();
+  if (location.kind !== "loaded" || typeof location.config.privateShelf.registry !== "string") {
+    throw new Error("The configured Private Shelf location cannot be read.");
+  }
+  const privateShelfLocator = location.config.privateShelf.registry;
+  let canonicalConfiguredRoot: string;
+  let canonicalRequestedRoot: string;
+  try {
+    [canonicalConfiguredRoot, canonicalRequestedRoot] = await Promise.all([
+      realpath(privateShelfLocator),
+      realpath(shelfRoot),
+    ]);
+  } catch {
+    throw new Error("The configured Private Shelf is unavailable.");
+  }
+  if (path.resolve(canonicalConfiguredRoot) !== path.resolve(active.canonicalRoot)
+    || path.resolve(canonicalRequestedRoot) !== path.resolve(active.canonicalRoot)) {
+    throw new Error("The configured Private Shelf changed before Reviewer materialization.");
+  }
+  const markerInspection = await inspectFolderMarkers(active.canonicalRoot);
+  if (markerInspection.kind !== "valid" || markerInspection.marker.type !== "shelf"
+    || (active.folderIdentityId !== undefined && active.folderIdentityId.toLowerCase() !== markerInspection.marker.id.toLowerCase())) {
+    throw new Error("The configured Private Shelf marker is missing, conflicting, or changed.");
+  }
+
+  const storage = getShelfBindingStorage();
+  const context = {
+    shelfName: active.library.displayName,
+    shelfRoot: active.canonicalRoot,
+    shelfLocationPath: configurationPath,
+    privateShelfLocator,
+    typedMarker: markerInspection.marker,
+  };
+  return resolveReviewerShelfWriteCoordination({
+    storagePaths: storage.paths,
+    store: storage.store,
+    context,
+    confirmRebind: async (reason, shelf) => {
+      const detail = reason === "binding-missing"
+        ? "MAGINALIA will remember this explicitly selected Private Shelf for Reviewer writes and shared Windows coordination. It will not change Shelf files or its identity marker."
+        : "The configured Shelf path or identity differs from the saved connection. Reconfirm this Shelf to update MAGINALIA's binding. No Shelf files or identity markers will be changed.";
+      const options: MessageBoxOptions = {
+        type: "question",
+        title: "Confirm Private Shelf connection",
+        message: `Use ${shelf.shelfName} for Reviewer writes?`,
+        detail,
+        buttons: ["Confirm Shelf", "Cancel"],
+        defaultId: 1,
+        cancelId: 1,
+        noLink: true,
+      };
+      const result = mainWindow === null
+        ? await dialog.showMessageBox(options)
+        : await dialog.showMessageBox(mainWindow, options);
+      return result.response === 0;
+    },
+    reloadConfiguration: async () => {
+      const latest = await new ShelfLocationRegistry(configurationPath).load();
+      return latest.kind === "loaded" ? latest.config.privateShelf.registry : null;
+    },
+    reloadTypedMarker: async () => {
+      const latest = await inspectFolderMarkers(active.canonicalRoot).catch(() => undefined);
+      return latest?.kind === "valid" && latest.marker.type === "shelf" ? latest.marker : null;
+    },
+  });
 }
 // The main process is the only owner of the Reviewer process, workspace, and
 // loopback origin.  It is deliberately lazy: ordinary Project/Workdesk work
@@ -694,7 +997,8 @@ const reviewerShelfSync = createReviewerShelfSyncAdapter({
   // Reviewer is started only for Shelf materialization or explicit refresh.
   // Its origin and process token stay in the main process.
   getBaseUrl: getManagedReviewerBaseUrl,
-  getDesktopRequestToken: () => getReviewerProcessManager().getDesktopRequestToken()
+  getDesktopRequestToken: () => getReviewerProcessManager().getDesktopRequestToken(),
+  getWriteCoordination: getReviewerShelfWriteCoordination,
 });
 let reviewerApprovalMaterialization: Promise<void> = Promise.resolve();
 function handleReviewerCaptureApproved(event: Electron.IpcMainEvent, annotationId: unknown): void {
@@ -1273,6 +1577,24 @@ function registerMarkdownIpc(): void {
     () => mainWindow === null || mainWindow.isDestroyed() ? null : mainWindow.webContents,
     installNativeApplicationMenu
   ));
+  ipcMain.handle(CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL, async (event): Promise<CollectorSaveDestinationIpcResult> => {
+    if (event.sender !== mainWindow?.webContents) return { kind: "error" };
+    return runCollectorSaveDestinationCommand(configureCollectorSaveDestination);
+  });
+  ipcMain.handle(CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL, async (event): Promise<CollectorSaveDestinationIpcResult> => {
+    if (event.sender !== mainWindow?.webContents) return { kind: "error" };
+    return runCollectorSaveDestinationCommand(clearCollectorSaveDestination);
+  });
+  ipcMain.handle(COLLECTOR_INTEGRATION_CHANNEL, handleCollectorIntegrationRequest);
+  ipcMain.handle(GET_COLLECTOR_NOTICES_CHANNEL, async (event, ...args: readonly unknown[]): Promise<readonly CollectorNotice[]> => {
+    if (args.length !== 0 || !isLiveMainWindowSender(event.sender)) return [];
+    // The first request proves a notice surface exists: only now may the one-time alpha1 notice be spent.
+    return collectorIntegration?.connectNoticeSurface() ?? [];
+  });
+  ipcMain.handle(DISMISS_COLLECTOR_NOTICE_CHANNEL, async (event, noticeId: unknown, ...args: readonly unknown[]): Promise<readonly CollectorNotice[]> => {
+    if (args.length !== 0 || !isLiveMainWindowSender(event.sender)) return [];
+    return collectorIntegration?.dismissNotice(noticeId) ?? [];
+  });
   ipcMain.handle(OPEN_BUNDLED_MANUAL_CHANNEL, async (event) => {
     if (event.sender !== mainWindow?.webContents) return { kind: "error" as const };
     const manualPath = app.isPackaged
@@ -1382,6 +1704,11 @@ function registerMarkdownIpc(): void {
 function unregisterMarkdownIpc(): void {
   ipcMain.removeHandler(UPDATE_APPLICATION_MENU_CHANNEL);
   ipcMain.removeHandler(OPEN_BUNDLED_MANUAL_CHANNEL);
+  ipcMain.removeHandler(CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL);
+  ipcMain.removeHandler(CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL);
+  ipcMain.removeHandler(COLLECTOR_INTEGRATION_CHANNEL);
+  ipcMain.removeHandler(GET_COLLECTOR_NOTICES_CHANNEL);
+  ipcMain.removeHandler(DISMISS_COLLECTOR_NOTICE_CHANNEL);
   ipcMain.removeHandler(GET_FIRST_RUN_STATUS_CHANNEL);
   ipcMain.removeHandler(RUN_FIRST_RUN_SETUP_CHANNEL);
   ipcMain.removeHandler(OPEN_MARKDOWN_CHANNEL);
@@ -1440,7 +1767,7 @@ function unregisterMarkdownIpc(): void {
 let startupProgressWindow: BrowserWindow | null = null;
 let startupProgressWindowReady = false;
 let startupProgressWindowShown = false;
-let startupProgressState: BrandProgressState = createBrandProgressState("MAGINALIA desktop α1 を起動しています", 0);
+let startupProgressState: BrandProgressState = createBrandProgressState(`${PRODUCT_DISPLAY_NAME} を起動しています`, 0);
 let startupOutcome: "pending" | "succeeded" | "failed" = "pending";
 let startupProgressTimer: NodeJS.Timeout | null = null;
 const startupProgressReadiness = new StartupProgressReadiness<BrowserWindow>(10_000);
@@ -1470,6 +1797,16 @@ function readBrandPngDataUrl(...fileNames: string[]): string | null {
   if (resolved === null) return null;
   try {
     return `data:image/png;base64,${readFileSync(resolved).toString("base64")}`;
+  } catch {
+    return null;
+  }
+}
+
+function readBrandFontDataUrl(fileName: string): string | null {
+  const resolved = resolveBrandAsset(fileName);
+  if (resolved === null) return null;
+  try {
+    return `data:font/woff2;base64,${readFileSync(resolved).toString("base64")}`;
   } catch {
     return null;
   }
@@ -1539,9 +1876,10 @@ function startStartupProgressWindow(delayMs: number): void {
     startupProgressWindow = window;
     const splashContents = window.webContents;
     const html = renderBrandProgressHtml({
-      logoDataUrl: readBrandPngDataUrl("splash.png", "header.png", "icon.png"),
+      logoDataUrl: readBrandPngDataUrl("splash.png"),
       markerDataUrl: readBrandPngDataUrl("marker-stroke.png"),
-    });
+      fontDataUrl: readBrandFontDataUrl(path.join("fonts", "jost-latin-700-normal.woff2")),
+    }, brandVersionString(app));
     const onReadyToShow = () => {
       if (window.isDestroyed()) {
         failStartupProgressWindow(window, new Error("The startup progress window was destroyed before it became ready."));
@@ -1604,7 +1942,7 @@ function completeStartupProgress(window: BrowserWindow): void {
       clearTimeout(startupProgressTimer);
       startupProgressTimer = null;
     }
-    updateStartupProgress("MAGINALIA desktop α1 の準備ができました", 1);
+    updateStartupProgress(`${PRODUCT_DISPLAY_NAME} の準備ができました`, 1);
   }
   window.show();
   if (!completesInitialStartup) return;
@@ -2387,10 +2725,10 @@ void app.whenReady().then(async () => {
     console.error("MAGINALIA_FIRST_RUN_JOURNAL_UNAVAILABLE", error);
   }
   if (!smokeMode || brandProgressSmoke) {
-    updateStartupProgress("MAGINALIA desktop α1 を起動しています", 0.08);
+    updateStartupProgress(`${PRODUCT_DISPLAY_NAME} を起動しています`, 0.08);
     startStartupProgressWindow(140);
     if (process.platform === "darwin") {
-      const dockIcon = resolveBrandAsset("icon.v2.png");
+      const dockIcon = resolveBrandAsset("logo.png");
       if (dockIcon !== null) app.dock?.setIcon(dockIcon);
     }
   }
@@ -2411,6 +2749,7 @@ void app.whenReady().then(async () => {
   if (!smokeMode || brandProgressSmoke) updateStartupProgress("編集画面を読み込んでいます", 0.72);
   openMainWindow();
   app.on("activate", openMainWindow);
+  startCollectorIntegration();
 });
 
 app.on("will-quit", () => {
@@ -2424,6 +2763,7 @@ app.on("will-quit", () => {
   cleanupStartupProgressWindowListeners();
   if (reviewerProcessManager !== undefined) void reviewerProcessManager.shutdown();
   void modHost.dispose();
+  collectorIntegration?.stop();
   unregisterMarkdownIpc();
 });
 

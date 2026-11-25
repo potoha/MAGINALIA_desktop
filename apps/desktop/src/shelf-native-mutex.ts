@@ -1,9 +1,9 @@
 /**
- * Windows named-mutex write lock for one Private Shelf (technical verification).
+ * Windows named-mutex write lock for one Private Shelf.
  *
- * This is the OD-10(b) spike: the cross-process exclusion authority is a Windows
- * kernel mutex instead of a lock file. It is not reachable from the product write
- * path, the Desktop UI, or the Native Messaging Host.
+ * The Desktop Reviewer writer uses this as its cross-process exclusion authority.
+ * The future Native Messaging Host must use the same mutex; this module does not
+ * enable Host saving.
  *
  * Why a kernel mutex (see `docs/collector-shelf-native-mutex.md`):
  *
@@ -34,10 +34,37 @@ import { randomUUID } from "node:crypto";
 import { lstatSync } from "node:fs";
 import path from "node:path";
 
-// Absolute paths are required, so the base only has to be a valid filename. This
-// avoids depending on `__dirname`, which is absent when the module is loaded as ESM
-// by the test runner.
-const requireNative = createRequire(path.join(process.cwd(), "shelf-native-mutex.cjs"));
+// Absolute paths are required, so the base only has to be a valid filename. `__filename`
+// is used when available; the cwd-based fallback only applies when the module is loaded
+// as ESM by the test runner. Created lazily so the production Host never calls cwd().
+function requireNative(candidate: string): unknown {
+  const base = productAddonLocation
+    ? process.execPath
+    : typeof __filename === "string" ? __filename : path.join(process.cwd(), "shelf-native-mutex.cjs");
+  return createRequire(base)(candidate);
+}
+
+/**
+ * Production Collector Host addon location. When set, the addon is loaded only from
+ * a fixed code location, never from an environment variable, the working directory
+ * or Electron resources:
+ *
+ * - `module`: the compiled layout next to this module (`dist/main` ->
+ *   `native/shelf-mutex/build/Release/shelf_mutex.node`), for the Node product entry
+ *   run from a built checkout;
+ * - `sea`: `shelf_mutex.node` in the same folder as the standalone executable
+ *   (`process.execPath`), for the Node single executable application.
+ */
+export type ProductNativeAddonLocation = "module" | "sea";
+let productAddonLocation: ProductNativeAddonLocation | undefined;
+
+/** Select the production addon location before the first native call. */
+export function useProductNativeAddonLocation(location: ProductNativeAddonLocation): void {
+  if (nativeModule !== undefined || nativeLoadError !== undefined) {
+    fail("native-mutex-unavailable", "The Shelf mutex addon location must be selected before it is loaded.");
+  }
+  productAddonLocation = location;
+}
 
 export type ShelfNativeMutexErrorCode =
   | "native-mutex-unavailable"
@@ -74,6 +101,12 @@ export type ShelfMutexScope = "session" | "machine";
 
 interface NativeMutexModule {
   readonly apiVersion: number;
+  /** Windows SHGetKnownFolderPath(FOLDERID_LocalAppData), validated as a local drive. */
+  getLocalAppDataPath?(): unknown;
+  /** Raw owner/DACL/reparse facts for one entry, read from a handle that does not follow links. */
+  inspectPathSecurity?(target: string): unknown;
+  /** Create one missing directory with a protected current-user/SYSTEM/Administrators DACL. */
+  createPrivateDirectory?(target: string): unknown;
   createMutex(name: string, options?: { security?: "current-user" | "system-only" }): object;
   openMutex(name: string): object;
   acquire(handle: object, waitMs?: number): {
@@ -99,6 +132,8 @@ let nativeModule: NativeMutexModule | undefined;
 let nativeLoadError: Error | undefined;
 
 const ADDON_RESOURCE_PATH = path.join("shelf-mutex", "shelf_mutex.node");
+/** Standalone Collector Host: the addon ships next to the executable. */
+export const SEA_ADDON_FILENAME = "shelf_mutex.node";
 const ADDON_DEVELOPMENT_PATH = path.join("native", "shelf-mutex", "build", "Release", "shelf_mutex.node");
 
 export interface NativeAddonCandidateOptions {
@@ -113,7 +148,7 @@ export interface NativeAddonCandidateOptions {
 }
 
 export interface NativeAddonResolution {
-  readonly mode: "packaged" | "development";
+  readonly mode: "packaged" | "development" | "product-module" | "product-sea";
   readonly candidates: readonly string[];
 }
 
@@ -152,6 +187,31 @@ export function resolveNativeAddonCandidates(options: NativeAddonCandidateOption
   return Object.freeze({ mode: "development", candidates: Object.freeze(candidates) });
 }
 
+/**
+ * Production Collector Host: exactly one candidate derived from a code location. No
+ * environment variable, working directory or Electron resources path participates.
+ */
+export function resolveProductNativeAddonCandidates(
+  location: ProductNativeAddonLocation,
+  options: { readonly moduleDirectory?: string | undefined; readonly executablePath?: string | undefined },
+): NativeAddonResolution {
+  if (location === "sea") {
+    return Object.freeze({
+      mode: "product-sea",
+      candidates: Object.freeze(nonEmpty(options.executablePath)
+        ? [path.join(path.dirname(path.resolve(options.executablePath)), SEA_ADDON_FILENAME)]
+        : []),
+    });
+  }
+  if (location === "module" && nonEmpty(options.moduleDirectory)) {
+    return Object.freeze({
+      mode: "product-module",
+      candidates: Object.freeze([path.resolve(options.moduleDirectory, "..", "..", ADDON_DEVELOPMENT_PATH)]),
+    });
+  }
+  return Object.freeze({ mode: "product-module", candidates: Object.freeze([]) });
+}
+
 /** True when `candidate` is `root` or lies inside it after resolution. */
 export function isPathWithin(root: string, candidate: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
@@ -187,17 +247,27 @@ export function loadNativeShelfMutex(): NativeMutexModule {
     fail("native-mutex-unavailable", "The Shelf mutex addon could not be loaded.", nativeLoadError.message);
   }
   const processLike = process as NodeJS.Process & { resourcesPath?: string; defaultApp?: boolean };
-  const resolution = resolveNativeAddonCandidates({
-    resourcesPath: processLike.resourcesPath,
-    defaultApp: processLike.defaultApp,
-    envOverride: process.env["MAGINALIA_SHELF_MUTEX_PATH"],
-    cwd: process.cwd(),
-    moduleDirectory: typeof __dirname === "string" ? __dirname : undefined
-  });
+  const resolution = productAddonLocation !== undefined
+    ? resolveProductNativeAddonCandidates(productAddonLocation, {
+      moduleDirectory: typeof __dirname === "string" ? __dirname : undefined,
+      executablePath: process.execPath,
+    })
+    : resolveNativeAddonCandidates({
+      resourcesPath: processLike.resourcesPath,
+      defaultApp: processLike.defaultApp,
+      envOverride: process.env["MAGINALIA_SHELF_MUTEX_PATH"],
+      cwd: process.cwd(),
+      moduleDirectory: typeof __dirname === "string" ? __dirname : undefined
+    });
   const attempts: string[] = [];
   for (const candidate of resolution.candidates) {
     if (resolution.mode === "packaged" && !isTrustedPackagedAddon(processLike.resourcesPath ?? "", candidate)) {
       attempts.push(`${candidate}: not a trusted file inside the packaged resources directory`);
+      continue;
+    }
+    if (resolution.mode !== "packaged" && resolution.mode !== "development"
+      && !isTrustedPackagedAddon(path.dirname(candidate), candidate)) {
+      attempts.push(`${candidate}: not a regular file at the fixed product location`);
       continue;
     }
     try {
@@ -224,6 +294,46 @@ export function nativeShelfMutexAvailable(): boolean {
   } catch {
     return false;
   }
+}
+
+/** Resolve the per-user machine-local root from Windows, without environment fallbacks. */
+export function getNativeLocalAppDataPath(): string {
+  const native = loadNativeShelfMutex();
+  if (typeof native.getLocalAppDataPath !== "function") {
+    fail("native-mutex-unavailable", "The Shelf mutex addon cannot resolve Windows LocalAppData.");
+  }
+  let value: unknown;
+  try {
+    value = native.getLocalAppDataPath();
+  } catch (error: unknown) {
+    throw translateNativeError(error);
+  }
+  if (typeof value !== "string" || value.length === 0) {
+    fail("native-mutex-unavailable", "Windows LocalAppData could not be resolved.");
+  }
+  return value;
+}
+
+/** Raw native result; interpreted by `collector-path-security.ts`. */
+export function inspectNativePathSecurity(target: string): unknown {
+  const native = loadNativeShelfMutex();
+  if (typeof native.inspectPathSecurity !== "function") {
+    fail("native-mutex-unavailable", "The Shelf mutex addon cannot inspect Windows file security.");
+  }
+  return native.inspectPathSecurity(target);
+}
+
+/** Returns "created" or "exists"; an existing entry is never re-permissioned. */
+export function createNativePrivateDirectory(target: string): "created" | "exists" {
+  const native = loadNativeShelfMutex();
+  if (typeof native.createPrivateDirectory !== "function") {
+    fail("native-mutex-unavailable", "The Shelf mutex addon cannot create a private directory.");
+  }
+  const result = native.createPrivateDirectory(target);
+  if (result !== "created" && result !== "exists") {
+    fail("native-mutex-failed", "The private directory result is invalid.");
+  }
+  return result;
 }
 
 /**
@@ -344,6 +454,12 @@ export async function acquireShelfMutex(options: AcquireShelfMutexOptions): Prom
   const handle = handleFor(name);
   const deadline = now() + acquireTimeoutMs;
   for (;;) {
+    // Another waiter in this process may have acquired the recursive OS mutex
+    // while this task was in `delay()`. Recheck immediately before every native
+    // wait so a second waiter cannot acquire recursively and replace its token.
+    if (heldNames.has(name)) {
+      fail("shelf-write-busy", "This process already holds the Shelf write lock.", name);
+    }
     const result = native.acquire(handle, 0);
     if (result.acquired) {
       const token = randomUUID();

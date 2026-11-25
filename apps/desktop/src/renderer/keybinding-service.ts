@@ -1,3 +1,4 @@
+import { APPLICATION_MENU_ROLE_RESERVED_KEYBINDINGS } from "../application-menu-contract";
 import type { CommandContext } from "./command-context";
 import type { CommandDescriptor, CommandRegistry } from "./command-registry";
 
@@ -42,6 +43,33 @@ export type KeybindingChangeResult =
 
 export type KeybindingConflictResolution = "cancel" | "replace";
 
+/**
+ * A persisted or default binding that could not stay effective because it
+ * would make one chord ambiguous or collide with a reserved/native chord.
+ * Resolution is deterministic and surfaced in the Shortcut Editor.
+ */
+export type KeybindingCollisionNotice =
+  | {
+    /** A later persisted override reused a chord already claimed by an earlier override; it is now unbound. */
+    readonly kind: "duplicate-override";
+    readonly commandId: string;
+    readonly keybinding: string;
+    readonly keptCommandId: string;
+  }
+  | {
+    /** A persisted override used a reserved OS or native-menu chord; it was ignored. */
+    readonly kind: "reserved-override";
+    readonly commandId: string;
+    readonly keybinding: string;
+  }
+  | {
+    /** A default binding is shadowed by another command's user override. */
+    readonly kind: "default-shadowed";
+    readonly commandId: string;
+    readonly keybinding: string;
+    readonly keptCommandId: string;
+  };
+
 interface PersistedKeybindingsV1 {
   readonly version: 1;
   readonly overrides: Readonly<Record<string, string | null>>;
@@ -79,7 +107,10 @@ export const DEFAULT_KEYBINDINGS: Readonly<Record<string, string>> = Object.free
   "maginalia.editor.setHeading3": "Mod+3",
   "maginalia.editor.setHeading4": "Mod+4",
   "maginalia.editor.setHeading5": "Mod+5",
-  "maginalia.editor.setHeading6": "Mod+6"
+  "maginalia.editor.setHeading6": "Mod+6",
+  // `Ctrl` stays Control on macOS, where Command+Tab belongs to the OS.
+  "maginalia.document.activateNext": "Ctrl+Tab",
+  "maginalia.document.activatePrevious": "Ctrl+Shift+Tab"
 });
 
 /** Overrides for platform conventions that differ from the portable defaults. */
@@ -254,7 +285,10 @@ function isSafeUserBinding(binding: string, platform: KeybindingPlatform, comman
   if (!hasCommandModifier && (isPrintableKey(key) || NAVIGATION_KEYS.has(key))) return false;
   const platformReserved = platform === "mac" ? MAC_RESERVED_KEYBINDINGS : platform === "windows" ? WINDOWS_RESERVED_KEYBINDINGS : LINUX_RESERVED_KEYBINDINGS;
   if (SHARED_RESERVED_KEYBINDINGS.includes(binding as typeof SHARED_RESERVED_KEYBINDINGS[number])
-    || platformReserved.includes(binding as never)) {
+    || platformReserved.includes(binding as never)
+    // Native application-menu roles (for example Window > Close on Mod+W)
+    // are registered by Electron and would win over a renderer shortcut.
+    || APPLICATION_MENU_ROLE_RESERVED_KEYBINDINGS.includes(binding)) {
     const defaultBinding = defaults[commandId];
     return defaultBinding !== undefined && normalizeKeybinding(defaultBinding, platform) === binding;
   }
@@ -268,6 +302,9 @@ export class KeybindingService {
   private readonly storage: KeybindingStorage | undefined;
   private readonly allowInMemoryOnly: boolean;
   private readonly overrides: Map<string, string | null>;
+  /** Chord -> command that owns it through a user override (unique by construction). */
+  private readonly overrideOwners = new Map<string, string>();
+  private readonly loadNotices: readonly KeybindingCollisionNotice[];
   private readonly listeners = new Set<() => void>();
   private readonly registrySubscription: () => void;
 
@@ -279,7 +316,10 @@ export class KeybindingService {
     this.defaults = getPlatformDefaultKeybindings(this.platform);
     this.allowInMemoryOnly = options.storage === null;
     this.storage = options.storage === undefined ? defaultStorage() : options.storage ?? undefined;
-    this.overrides = this.readOverrides();
+    const loaded = this.readOverrides();
+    this.overrides = loaded.overrides;
+    this.loadNotices = Object.freeze(loaded.notices);
+    this.indexOverrideOwners();
     this.registrySubscription = registry.onDidChange(() => this.notify());
   }
 
@@ -287,7 +327,32 @@ export class KeybindingService {
     const command = this.registry.get(commandId);
     if (command === null || command.visibility === "internal") return null;
     if (this.overrides.has(commandId)) return this.overrides.get(commandId) ?? null;
-    return this.getDefaultBinding(commandId);
+    const defaultBinding = this.getDefaultBinding(commandId);
+    // A user override on another live command takes the chord; the default is
+    // shadowed rather than left ambiguous (which would swallow the key).
+    return defaultBinding !== null && this.shadowingOverrideOwner(commandId, defaultBinding) !== null ? null : defaultBinding;
+  }
+
+  /**
+   * Deterministic collision resolutions from loading persisted overrides, plus
+   * defaults currently shadowed by another command's override.
+   */
+  public getCollisionNotices(): readonly KeybindingCollisionNotice[] {
+    // Load notices stay relevant only while the user has not since rebound the
+    // affected command (a duplicate stays unbound until then).
+    const notices: KeybindingCollisionNotice[] = this.loadNotices.filter((notice) => notice.kind === "reserved-override"
+      ? !this.overrides.has(notice.commandId)
+      : this.overrides.get(notice.commandId) === null);
+    for (const commandId of Object.keys(this.defaults).sort()) {
+      const command = this.registry.get(commandId);
+      if (command === null || command.visibility === "internal" || this.overrides.has(commandId)) continue;
+      const defaultBinding = this.getDefaultBinding(commandId);
+      const owner = defaultBinding === null ? null : this.shadowingOverrideOwner(commandId, defaultBinding);
+      if (defaultBinding !== null && owner !== null) {
+        notices.push({ kind: "default-shadowed", commandId, keybinding: defaultBinding, keptCommandId: owner });
+      }
+    }
+    return Object.freeze(notices);
   }
 
   /** True when at least one persisted user override is still active in memory. */
@@ -414,29 +479,63 @@ export class KeybindingService {
     this.listeners.clear();
   }
 
-  private readOverrides(): Map<string, string | null> {
-    if (this.storage === undefined) return new Map();
+  private readOverrides(): { readonly overrides: Map<string, string | null>; readonly notices: KeybindingCollisionNotice[] } {
+    const empty = () => ({ overrides: new Map<string, string | null>(), notices: [] });
+    if (this.storage === undefined) return empty();
     let raw: string | null;
-    try { raw = this.storage.getItem(STORAGE_KEY); } catch { return new Map(); }
-    if (raw === null) return new Map();
+    try { raw = this.storage.getItem(STORAGE_KEY); } catch { return empty(); }
+    if (raw === null) return empty();
     try {
       const parsed: unknown = JSON.parse(raw);
       if (typeof parsed !== "object" || parsed === null || !("version" in parsed) || parsed.version !== 1
-        || !("overrides" in parsed) || typeof parsed.overrides !== "object" || parsed.overrides === null || Array.isArray(parsed.overrides)) return new Map();
+        || !("overrides" in parsed) || typeof parsed.overrides !== "object" || parsed.overrides === null || Array.isArray(parsed.overrides)) return empty();
       const values = parsed.overrides as Record<string, unknown>;
       const result = new Map<string, string | null>();
-      for (const [commandId, value] of Object.entries(values)) {
+      const notices: KeybindingCollisionNotice[] = [];
+      const owners = new Map<string, string>();
+      // Persisted files are written sorted by command ID; sort again so a
+      // hand-edited or legacy file still resolves duplicates deterministically.
+      for (const [commandId, value] of Object.entries(values).sort(([left], [right]) => left.localeCompare(right))) {
         if (!COMMAND_ID_PATTERN.test(commandId)) continue;
         if (value === null) result.set(commandId, null);
         else if (typeof value === "string") {
           const normalized = normalizeKeybinding(value, this.platform);
-          if (normalized !== null && isSafeUserBinding(normalized, this.platform, commandId, this.defaults)) result.set(commandId, normalized);
+          if (normalized === null) continue;
+          if (!isSafeUserBinding(normalized, this.platform, commandId, this.defaults)) {
+            notices.push({ kind: "reserved-override", commandId, keybinding: normalized });
+            continue;
+          }
+          const keptCommandId = owners.get(normalized);
+          if (keptCommandId !== undefined) {
+            // Keep the first valid owner; unbind the later duplicate instead of
+            // falling back to a default that could collide again.
+            result.set(commandId, null);
+            notices.push({ kind: "duplicate-override", commandId, keybinding: normalized, keptCommandId });
+            continue;
+          }
+          owners.set(normalized, commandId);
+          result.set(commandId, normalized);
         }
       }
-      return result;
+      return { overrides: result, notices };
     } catch {
-      return new Map();
+      return empty();
     }
+  }
+
+  private indexOverrideOwners(): void {
+    this.overrideOwners.clear();
+    for (const [commandId, keybinding] of this.overrides) {
+      if (keybinding !== null && !this.overrideOwners.has(keybinding)) this.overrideOwners.set(keybinding, commandId);
+    }
+  }
+
+  /** The live public command whose user override claims `keybinding`, if not `commandId` itself. */
+  private shadowingOverrideOwner(commandId: string, keybinding: string): string | null {
+    const owner = this.overrideOwners.get(keybinding);
+    if (owner === undefined || owner === commandId) return null;
+    const command = this.registry.get(owner);
+    return command === null || command.visibility === "internal" ? null : owner;
   }
 
   private persist(overrides: ReadonlyMap<string, string | null>): boolean {
@@ -454,6 +553,7 @@ export class KeybindingService {
   private replaceOverrides(next: ReadonlyMap<string, string | null>): void {
     this.overrides.clear();
     for (const [commandId, keybinding] of next) this.overrides.set(commandId, keybinding);
+    this.indexOverrideOwners();
     this.notify();
   }
 

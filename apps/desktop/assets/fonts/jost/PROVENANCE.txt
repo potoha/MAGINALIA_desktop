@@ -1,0 +1,16 @@
+Jost Bold (700), latin subset, woff2
+
+Package:  @fontsource/jost 5.3.0 (npm; package license field: OFL-1.1)
+Source:   https://registry.npmjs.org/@fontsource/jost/-/jost-5.3.0.tgz
+          (package tarball SHA-256 c09334afaca948bbb5a674998a9fbcfbd8a8f5dd07eeceb6389357658d93fadf)
+Upstream: https://github.com/indestructible-type/Jost (The Jost Project Authors)
+License:  SIL Open Font License 1.1 (OFL-1.1); text in OFL.txt
+
+Files (copied unmodified from the package):
+  jost-latin-700-normal.woff2   package path files/jost-latin-700-normal.woff2
+    SHA-256 81da4d711250508c3f686d210ed07d5eb6229185d313fcc73fda7bf2b37d2ca5
+  OFL.txt                       package path LICENSE
+    SHA-256 536533cad95838e13777663c4109b802aa662ef1ef285337f0c7f51d35682fdc
+
+The font is bundled with the application and read from disk at runtime. The
+application never downloads it and does not depend on the npm package.

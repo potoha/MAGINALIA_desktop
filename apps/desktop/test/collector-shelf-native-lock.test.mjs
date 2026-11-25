@@ -22,9 +22,10 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
+import { execFileSync, spawn } from "node:child_process";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,6 +35,7 @@ const worker = fileURLToPath(new URL("./collector-shelf-native-worker.mjs", impo
 const addonBinary = fileURLToPath(
   new URL("../native/shelf-mutex/build/Release/shelf_mutex.node", import.meta.url)
 );
+const requireNative = createRequire(import.meta.url);
 const format = await import("@maginalia/format");
 
 /**
@@ -59,6 +61,14 @@ if (!symlinkSupport) {
       "the real-process symlink-marker test is skipped. The junction case still runs."
   );
 }
+
+test("native addon resolves LocalAppData from the Windows known folder", () => {
+  const native = requireNative(addonBinary);
+  const localAppData = native.getLocalAppDataPath();
+  assert.equal(typeof localAppData, "string");
+  assert.match(localAppData, /^[A-Za-z]:\\/u);
+  assert.equal(path.win32.normalize(localAppData), localAppData);
+});
 
 const symlinkTest = symlinkSupport ? test : test.skip;
 
@@ -359,6 +369,433 @@ test("a process killed after publishing the Book is recovered by retrying the sa
   }
 });
 
+test("Reviewer and Host share one native lock and a killed Host stage blocks Reviewer until receipt recovery", async () => {
+  const fixture = await createShelfFixture("reviewer-host-native-collision");
+  const participant = await startParticipant(fixture);
+  const hostCommand = baseCommand(fixture, {
+    requestId: `req-reviewer-host-${randomUUID()}`,
+    url: "https://example.test/reviewer-host-collision",
+    mode: "crashAfterBookHold"
+  });
+  const reviewerRecord = {
+    annotationId: "123e4567-e89b-42d3-a456-426614174020",
+    reviewState: "APPROVED",
+    packageId: "capkg:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    sourceKind: "website",
+    getDate: "202610311200",
+    url: hostCommand.url,
+    quote: "Reviewerから追加した引用。",
+    pageLabel: "1",
+    comment: "確認済み"
+  };
+  const reviewerCommand = {
+    mode: "reviewer",
+    shelfRoot: fixture.shelfRoot,
+    expectedShelfId: fixture.shelfId,
+    coordinationRoot: fixture.coordinationRoot,
+    acquireTimeoutMs: 30_000,
+    reviewerRecord
+  };
+  let host;
+  let reviewer;
+  try {
+    host = await startWorker(hostCommand);
+    await host.waitForLine((line) => line.stage === "book-published");
+    reviewer = await startWorker(reviewerCommand);
+    await reviewer.waitForLine((line) => line.stage === "starting");
+    // Give the Reviewer process time to enter its non-blocking native-lock polling loop.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await forceKill(host);
+    host = undefined;
+
+    const blockedCode = await reviewer.closed;
+    assert.equal(blockedCode, 3, `${JSON.stringify(reviewer.lines)} ${reviewer.stderr()}`);
+    assert.equal(reviewer.lines.at(-1)?.code, "shelf-write-recovery-state-unavailable");
+    await reviewer.cleanup();
+    reviewer = undefined;
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1, "Reviewer must not add a duplicate while Host recovery is pending");
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 0, "Reviewer must not publish while Host owns staged recovery");
+
+    const recovery = await runWorker({ ...baseCommand(fixture, { requestId: hostCommand.requestId, url: hostCommand.url }), mode: "recoveryState" });
+    assert.equal(recovery.result.recoveryState.pending, true);
+    assert.equal(recovery.result.recoveryState.requestId, hostCommand.requestId);
+
+    const hostRetry = await runWorker(baseCommand(fixture, { requestId: hostCommand.requestId, url: hostCommand.url }), 120_000);
+    assert.equal(hostRetry.code, 0, `${JSON.stringify(hostRetry.result)} ${hostRetry.stderr}`);
+    assert.equal(hostRetry.result.receipt.state, "committed");
+    const clean = await runWorker({ ...baseCommand(fixture, { requestId: hostCommand.requestId, url: hostCommand.url }), mode: "recoveryState" });
+    assert.equal(clean.result.recoveryState.pending, false);
+
+    const reviewerRetry = await runWorker(reviewerCommand, 120_000);
+    assert.equal(reviewerRetry.code, 0, `${JSON.stringify(reviewerRetry.result)} ${reviewerRetry.stderr}`);
+    assert.equal(reviewerRetry.result.result.materialized, 1);
+    const books = await readJsonFiles(fixture.booksDirectory);
+    const annotations = await readJsonFiles(fixture.annotationsDirectory);
+    assert.equal(books.length, 1, "both writers must share the website Book");
+    assert.equal(annotations.length, 2, "Host and Reviewer must each retain their Annotation");
+    assert.equal(annotations.find((annotation) => annotation.deviceMetadata?.maginaliaReviewer)?.deviceMetadata.maginaliaReviewer.annotationId, reviewerRecord.annotationId);
+  } finally {
+    if (reviewer !== undefined) await forceKill(reviewer).catch(() => {});
+    if (host !== undefined) await forceKill(host).catch(() => {});
+    await stopParticipant(participant);
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("a force-killed Reviewer after asset and Book publication resumes the same v2 request", async () => {
+  const fixture = await createShelfFixture("reviewer-killed-after-book");
+  const reviewerAnnotationId = "123e4567-e89b-42d3-a456-426614174106";
+  const assetBytes = Buffer.from([0xff, 0xd8, 0xff, 0x41, 0x42, 0x43]);
+  const assetDigest = createHash("sha256").update(assetBytes).digest("hex");
+  const reviewerRecord = {
+    annotationId: reviewerAnnotationId,
+    reviewState: "APPROVED",
+    packageId: "capkg:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    sourceKind: "Handwritten",
+    getDate: "202603021415",
+    isbn13: "9780306406157",
+    quote: "初回openBD情報を保持した引用。",
+    pageLabel: "3",
+    comment: "確認済み",
+    sourceFiles: [{
+      path: "images/source.jpg",
+      mediaType: "image/jpeg",
+      sha256: assetDigest,
+      bytes: [...assetBytes]
+    }]
+  };
+  const requestId = `reviewer-${createHash("sha256").update(reviewerAnnotationId, "utf8").digest("hex")}`;
+  const command = {
+    mode: "reviewerCrashAtBoundary",
+    boundary: "before-annotation",
+    shelfRoot: fixture.shelfRoot,
+    expectedShelfId: fixture.shelfId,
+    coordinationRoot: fixture.coordinationRoot,
+    annotationsDirectory: fixture.annotationsDirectory,
+    acquireTimeoutMs: 30_000,
+    reviewerRecord,
+    metadataLookup: {
+      status: "ok",
+      metadata: { isbn13: reviewerRecord.isbn13, title: "初回openBD書名", authors: ["初回著者"] }
+    }
+  };
+  let crashed;
+  try {
+    crashed = await startWorker(command);
+    await crashed.waitForLine((line) => line.stage === "reviewer-boundary" && line.boundary === "before-annotation");
+    await forceKill(crashed);
+    crashed = undefined;
+
+    const journalPath = path.join(journalDirectory(fixture), `${requestId}.json`);
+    const staged = JSON.parse(await readFile(journalPath, "utf8"));
+    assert.equal(staged.version, 2);
+    assert.equal(staged.state, "staged");
+    assert.equal(staged.reviewerEnrichment.metadata.title, "初回openBD書名");
+    const books = await readJsonFiles(fixture.booksDirectory);
+    assert.equal(books.length, 1);
+    assert.equal(books[0].title, "初回openBD書名");
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 0);
+    assert.deepEqual(
+      await readFile(path.join(fixture.shelfRoot, ...books[0].source.files[0].path.split("/"))),
+      assetBytes
+    );
+    const markerPath = path.join(path.dirname(journalDirectory(fixture)), "writer-recovery.json");
+    const marker = JSON.parse(await readFile(markerPath, "utf8"));
+    assert.equal(marker.requestId, requestId);
+
+    // The retry's provider is now unavailable. The v2 journal snapshot must
+    // reconstruct the exact original Book and Annotation without another lookup.
+    const retry = await runWorker({ ...command, mode: "reviewer", metadataLookup: { status: "not-found" } }, 120_000);
+    assert.equal(retry.code, 0, `${JSON.stringify(retry.result)} ${retry.stderr}`);
+    const retryStart = retry.lines.find((line) => line.stage === "starting");
+    assert.equal(retryStart.mutex.createdFresh, true, "the Reviewer restart must recover with a new mutex object after all processes exited");
+    assert.equal(retryStart.recoveryState.pending, true, "the recovery marker must drive verification when the old mutex object disappeared");
+    assert.deepEqual(retry.result.result, { materialized: 1, unchanged: 0, pending: [], conflicts: 0 });
+    const receipt = JSON.parse(await readFile(journalPath, "utf8"));
+    assert.equal(receipt.state, "committed");
+    assert.equal(receipt.bookId, staged.bookId);
+    assert.equal(receipt.annotationId, staged.annotationId);
+    const recoveredBooks = await readJsonFiles(fixture.booksDirectory);
+    const annotations = await readJsonFiles(fixture.annotationsDirectory);
+    assert.equal(recoveredBooks.length, 1);
+    assert.equal(recoveredBooks[0].title, "初回openBD書名");
+    assert.equal(annotations.length, 1);
+    assert.equal(annotations[0].deviceMetadata.maginaliaReviewer.annotationId, reviewerAnnotationId);
+    assert.equal(annotations[0].quote, reviewerRecord.quote);
+    assert.deepEqual(
+      await readFile(path.join(fixture.shelfRoot, ...recoveredBooks[0].source.files[0].path.split("/"))),
+      assetBytes
+    );
+    const clean = await runWorker({ ...command, mode: "recoveryState" });
+    assert.equal(clean.result.recoveryState.pending, false);
+  } finally {
+    if (crashed !== undefined) await forceKill(crashed).catch(() => {});
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("a Reviewer killed after staging and before its first asset resumes without partial files", async () => {
+  const fixture = await createShelfFixture("reviewer-killed-before-asset");
+  const reviewerAnnotationId = "123e4567-e89b-42d3-a456-426614174112";
+  const assetBytes = Buffer.from([0xff, 0xd8, 0xff, 0x51, 0x52]);
+  const assetDigest = createHash("sha256").update(assetBytes).digest("hex");
+  const reviewerRecord = {
+    annotationId: reviewerAnnotationId,
+    reviewState: "APPROVED",
+    packageId: "capkg:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    sourceKind: "Handwritten",
+    getDate: "202603021415",
+    title: "Pre-asset crash",
+    authors: [],
+    quote: "ステージ後の引用。",
+    pageLabel: "3",
+    comment: "",
+    sourceFiles: [{ path: "images/source.jpg", mediaType: "image/jpeg", sha256: assetDigest, bytes: [...assetBytes] }]
+  };
+  const requestId = `reviewer-${createHash("sha256").update(reviewerAnnotationId, "utf8").digest("hex")}`;
+  const command = {
+    mode: "reviewerCrashAtBoundary",
+    boundary: "before-asset",
+    shelfRoot: fixture.shelfRoot,
+    expectedShelfId: fixture.shelfId,
+    coordinationRoot: fixture.coordinationRoot,
+    annotationsDirectory: fixture.annotationsDirectory,
+    acquireTimeoutMs: 30_000,
+    reviewerRecord
+  };
+  let crashed;
+  try {
+    crashed = await startWorker(command);
+    await crashed.waitForLine((line) => line.stage === "reviewer-boundary" && line.boundary === "staged-before-asset");
+    await forceKill(crashed);
+    crashed = undefined;
+
+    const journalPath = path.join(journalDirectory(fixture), `${requestId}.json`);
+    assert.equal(JSON.parse(await readFile(journalPath, "utf8")).state, "staged");
+    const markerPath = path.join(path.dirname(journalDirectory(fixture)), "writer-recovery.json");
+    assert.equal(JSON.parse(await readFile(markerPath, "utf8")).requestId, requestId);
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 0);
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 0);
+    const sourceFolder = createHash("sha256").update(`image/jpeg:${assetDigest}`, "utf8").digest("hex");
+    const assetPath = path.join(fixture.shelfRoot, "sources", sourceFolder, "images", "source.jpg");
+    await assert.rejects(readFile(assetPath), { code: "ENOENT" });
+
+    const retry = await runWorker({ ...command, mode: "reviewer" }, 120_000);
+    assert.equal(retry.code, 0, `${JSON.stringify(retry.result)} ${retry.stderr}`);
+    const retryStart = retry.lines.find((line) => line.stage === "starting");
+    assert.equal(retryStart.mutex.createdFresh, true);
+    assert.equal(retryStart.recoveryState.pending, true);
+    assert.deepEqual(retry.result.result, { materialized: 1, unchanged: 0, pending: [], conflicts: 0 });
+    assert.equal(JSON.parse(await readFile(journalPath, "utf8")).state, "committed");
+    assert.deepEqual(await readFile(assetPath), assetBytes);
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 1);
+    const clean = await runWorker({ ...command, mode: "recoveryState" });
+    assert.equal(clean.result.recoveryState.pending, false);
+  } finally {
+    if (crashed !== undefined) await forceKill(crashed).catch(() => {});
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("a Reviewer killed after Annotation publication but before receipt reuses the same file", async () => {
+  const fixture = await createShelfFixture("reviewer-killed-after-annotation");
+  const reviewerAnnotationId = "123e4567-e89b-42d3-a456-426614174113";
+  const assetBytes = Buffer.from([0xff, 0xd8, 0xff, 0x61, 0x62]);
+  const assetDigest = createHash("sha256").update(assetBytes).digest("hex");
+  const reviewerRecord = {
+    annotationId: reviewerAnnotationId,
+    reviewState: "APPROVED",
+    packageId: "capkg:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    sourceKind: "Handwritten",
+    getDate: "202603021415",
+    title: "Post-annotation crash",
+    authors: [],
+    quote: "Annotation先行の引用。",
+    pageLabel: "3",
+    comment: "",
+    sourceFiles: [{ path: "images/source.jpg", mediaType: "image/jpeg", sha256: assetDigest, bytes: [...assetBytes] }]
+  };
+  const requestId = `reviewer-${createHash("sha256").update(reviewerAnnotationId, "utf8").digest("hex")}`;
+  const command = {
+    mode: "reviewerCrashAtBoundary",
+    boundary: "after-annotation-before-receipt",
+    shelfRoot: fixture.shelfRoot,
+    expectedShelfId: fixture.shelfId,
+    coordinationRoot: fixture.coordinationRoot,
+    annotationsDirectory: fixture.annotationsDirectory,
+    acquireTimeoutMs: 30_000,
+    reviewerRecord
+  };
+  let crashed;
+  try {
+    crashed = await startWorker(command);
+    await crashed.waitForLine((line) => line.stage === "reviewer-boundary" && line.boundary === "after-annotation-before-receipt");
+    await forceKill(crashed);
+    crashed = undefined;
+
+    const journalPath = path.join(journalDirectory(fixture), `${requestId}.json`);
+    const staged = JSON.parse(await readFile(journalPath, "utf8"));
+    assert.equal(staged.state, "staged");
+    const annotationNamesBefore = await readdir(fixture.annotationsDirectory);
+    assert.equal(annotationNamesBefore.length, 1);
+    const annotationPath = path.join(fixture.annotationsDirectory, annotationNamesBefore[0]);
+    const annotationBefore = await readFile(annotationPath, "utf8");
+    const markerPath = path.join(path.dirname(journalDirectory(fixture)), "writer-recovery.json");
+    assert.equal(JSON.parse(await readFile(markerPath, "utf8")).requestId, requestId);
+
+    const retry = await runWorker({ ...command, mode: "reviewer" }, 120_000);
+    assert.equal(retry.code, 0, `${JSON.stringify(retry.result)} ${retry.stderr}`);
+    const retryStart = retry.lines.find((line) => line.stage === "starting");
+    assert.equal(retryStart.mutex.createdFresh, true);
+    assert.equal(retryStart.recoveryState.pending, true);
+    assert.deepEqual(retry.result.result, { materialized: 0, unchanged: 1, pending: [], conflicts: 0 });
+    assert.equal(JSON.parse(await readFile(journalPath, "utf8")).state, "committed");
+    assert.equal(await readFile(annotationPath, "utf8"), annotationBefore);
+    assert.deepEqual(await readdir(fixture.annotationsDirectory), annotationNamesBefore);
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 1);
+    const clean = await runWorker({ ...command, mode: "recoveryState" });
+    assert.equal(clean.result.recoveryState.pending, false);
+  } finally {
+    if (crashed !== undefined) await forceKill(crashed).catch(() => {});
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("the Reviewer approval and refresh path recovers through the shared writer after a process kill", async () => {
+  const fixture = await createShelfFixture("reviewer-approval-killed-before-annotation");
+  const fixtureRoot = await realpath(fixture.base);
+  const reviewerAnnotationId = "123e4567-e89b-42d3-a456-426614174121";
+  const reviewerRecord = {
+    annotationId: reviewerAnnotationId,
+    reviewState: "APPROVED",
+    packageId: "capkg:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    sourceKind: "book",
+    getDate: "202610311200",
+    isbn13: "9780306406157",
+    title: "Reviewer approval route",
+    authors: ["著者"],
+    quote: "承認から共有Writerへ渡る引用。",
+    pageLabel: "12",
+    comment: "確認済み"
+  };
+  const requestId = `reviewer-${createHash("sha256").update(reviewerAnnotationId, "utf8").digest("hex")}`;
+  const command = {
+    mode: "reviewerApprovalCrashAtBoundary",
+    boundary: "before-annotation",
+    shelfRoot: fixture.shelfRoot,
+    expectedShelfId: fixture.shelfId,
+    coordinationRoot: fixture.coordinationRoot,
+    bindingDirectory: path.join(fixtureRoot, "integration"),
+    shelfLocationPath: path.join(fixtureRoot, "shelf_location.yml"),
+    acquireTimeoutMs: 30_000,
+    reviewerRecord
+  };
+  let crashed;
+  try {
+    crashed = await startWorker(command);
+    const firstBinding = await crashed.waitForLine((line) => line.stage === "reviewer-binding");
+    assert.equal(firstBinding.expectedShelfId, fixture.shelfId);
+    assert.equal(firstBinding.bindingConfirmations, 1);
+    await crashed.waitForLine((line) => line.stage === "reviewer-boundary" && line.boundary === "before-annotation");
+    await forceKill(crashed);
+    crashed = undefined;
+
+    const journalPath = path.join(journalDirectory(fixture), `${requestId}.json`);
+    const staged = JSON.parse(await readFile(journalPath, "utf8"));
+    assert.equal(staged.state, "staged");
+    assert.equal(staged.version, 2);
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 0);
+    const markerPath = path.join(path.dirname(journalDirectory(fixture)), "writer-recovery.json");
+    assert.equal(JSON.parse(await readFile(markerPath, "utf8")).requestId, requestId);
+    const bindingPath = path.join(command.bindingDirectory, "private-shelf-binding.json");
+    const savedBinding = JSON.parse(await readFile(bindingPath, "utf8"));
+    assert.equal(savedBinding.expectedShelfId, fixture.shelfId);
+    assert.equal(savedBinding.generation, 1);
+
+    const retry = await runWorker({ ...command, mode: "reviewerApproval" }, 120_000);
+    assert.equal(retry.code, 0, `${JSON.stringify(retry.result)} ${retry.stderr}`);
+    assert.equal(retry.result.path, "reviewer-approval-sync");
+    const retryStart = retry.lines.find((line) => line.stage === "starting");
+    const retryBinding = retry.lines.find((line) => line.stage === "reviewer-binding");
+    assert.equal(retryStart.mutex.createdFresh, true);
+    assert.equal(retryStart.recoveryState.pending, true);
+    assert.equal(retryBinding.bindingConfirmations, 0, "a normal retry must reuse the per-user binding without prompting again");
+    assert.equal(retry.result.bindingConfirmations, 0);
+    assert.deepEqual(retry.result.result, { materialized: 1, unchanged: 0, pending: [], conflicts: 0 });
+    assert.equal(JSON.parse(await readFile(journalPath, "utf8")).state, "committed");
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
+    const annotations = await readJsonFiles(fixture.annotationsDirectory);
+    assert.equal(annotations.length, 1);
+    assert.equal(annotations[0].deviceMetadata.maginaliaReviewer.annotationId, reviewerAnnotationId);
+    assert.equal(annotations[0].quote, reviewerRecord.quote);
+    const clean = await runWorker({ ...command, mode: "recoveryState" });
+    assert.equal(clean.result.recoveryState.pending, false);
+  } finally {
+    if (crashed !== undefined) await forceKill(crashed).catch(() => {});
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("a Reviewer process killed after its receipt leaves a verifiable stale marker", async () => {
+  const fixture = await createShelfFixture("reviewer-killed-after-receipt");
+  const participant = await startParticipant(fixture);
+  const reviewerAnnotationId = "123e4567-e89b-42d3-a456-426614174107";
+  const reviewerRecord = {
+    annotationId: reviewerAnnotationId,
+    reviewState: "APPROVED",
+    packageId: "capkg:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    sourceKind: "book",
+    getDate: "202610311200",
+    isbn13: "9780306406157",
+    title: "既知の書誌",
+    authors: ["著者"],
+    quote: "receipt境界の引用。",
+    pageLabel: "1",
+    comment: ""
+  };
+  const requestId = `reviewer-${createHash("sha256").update(reviewerAnnotationId, "utf8").digest("hex")}`;
+  const command = {
+    mode: "reviewerCrashAtBoundary",
+    boundary: "after-receipt",
+    shelfRoot: fixture.shelfRoot,
+    expectedShelfId: fixture.shelfId,
+    coordinationRoot: fixture.coordinationRoot,
+    acquireTimeoutMs: 30_000,
+    reviewerRecord
+  };
+  let crashed;
+  try {
+    crashed = await startWorker(command);
+    const boundary = await crashed.waitForLine((line) => line.stage === "reviewer-boundary" && line.boundary === "after-receipt");
+    assert.equal(boundary.receipt.state, "committed");
+    await forceKill(crashed);
+    crashed = undefined;
+
+    const journalPath = path.join(journalDirectory(fixture), `${requestId}.json`);
+    const committed = JSON.parse(await readFile(journalPath, "utf8"));
+    assert.equal(committed.state, "committed");
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 1);
+    const pending = await runWorker({ ...command, mode: "recoveryState" });
+    assert.equal(pending.result.recoveryState.pending, true);
+
+    const retry = await runWorker({ ...command, mode: "reviewer" }, 120_000);
+    assert.equal(retry.code, 0, `${JSON.stringify(retry.result)} ${retry.stderr}`);
+    assert.deepEqual(retry.result.result, { materialized: 0, unchanged: 1, pending: [], conflicts: 0 });
+    const clean = await runWorker({ ...command, mode: "recoveryState" });
+    assert.equal(clean.result.recoveryState.pending, false);
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 1);
+    assert.equal(JSON.parse(await readFile(journalPath, "utf8")).annotationId, committed.annotationId);
+  } finally {
+    if (crashed !== undefined) await forceKill(crashed).catch(() => {});
+    await stopParticipant(participant);
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
 test("a process.exit between Book and Annotation still leaves a recoverable journal", async () => {
   const fixture = await createShelfFixture("native-orderly-crash");
   const participant = await startParticipant(fixture);
@@ -507,6 +944,168 @@ test("a malformed journal is refused even though the mutex was newly created", a
     assert.equal((await readdir(coordinationDirectory(fixture))).includes("writer-recovery.json"), true);
   } finally {
     await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("the test Host refuses a malformed recovery marker beside a valid committed journal", async () => {
+  const fixture = await createShelfFixture("native-host-malformed-marker");
+  try {
+    const existing = await runWorker(baseCommand(fixture, {
+      quote: "既存の確定済みHost引用。",
+      url: "https://example.test/host-existing"
+    }));
+    assert.equal(existing.code, 0, `${JSON.stringify(existing.result)} ${existing.stderr}`);
+    const bookFile = path.join(fixture.booksDirectory, (await readdir(fixture.booksDirectory))[0]);
+    const annotationFile = path.join(fixture.annotationsDirectory, (await readdir(fixture.annotationsDirectory))[0]);
+    const bookHash = createHash("sha256").update(await readFile(bookFile)).digest("hex");
+    const annotationHash = createHash("sha256").update(await readFile(annotationFile)).digest("hex");
+    const priorJournalFiles = await readdir(journalDirectory(fixture));
+    assert.equal(priorJournalFiles.length, 1);
+    const marker = path.join(coordinationDirectory(fixture), "writer-recovery.json");
+    const markerBytes = "{\"version\": 1,";
+    await writeFile(marker, markerBytes, "utf8");
+
+    const rejected = await runWorker(baseCommand(fixture, {
+      quote: "拒否されるHost引用。",
+      url: "https://example.test/host-rejected"
+    }));
+    assert.equal(rejected.code, 3, `${JSON.stringify(rejected.result)} ${rejected.stderr}`);
+    assert.equal(rejected.result.code, "shelf-write-recovery-state-invalid");
+    assert.equal(await readFile(marker, "utf8"), markerBytes);
+    assert.equal(createHash("sha256").update(await readFile(bookFile)).digest("hex"), bookHash);
+    assert.equal(createHash("sha256").update(await readFile(annotationFile)).digest("hex"), annotationHash);
+    assert.deepEqual(await readdir(journalDirectory(fixture)), priorJournalFiles);
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 1);
+  } finally {
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("the Reviewer writer refuses an empty recovery marker beside a valid committed journal", async () => {
+  const fixture = await createShelfFixture("native-reviewer-empty-marker");
+  try {
+    const existing = await runWorker(baseCommand(fixture, {
+      quote: "既存の確定済みReviewerテスト用引用。",
+      url: "https://example.test/reviewer-existing"
+    }));
+    assert.equal(existing.code, 0, `${JSON.stringify(existing.result)} ${existing.stderr}`);
+    const bookFile = path.join(fixture.booksDirectory, (await readdir(fixture.booksDirectory))[0]);
+    const annotationFile = path.join(fixture.annotationsDirectory, (await readdir(fixture.annotationsDirectory))[0]);
+    const bookHash = createHash("sha256").update(await readFile(bookFile)).digest("hex");
+    const annotationHash = createHash("sha256").update(await readFile(annotationFile)).digest("hex");
+    const priorJournalFiles = await readdir(journalDirectory(fixture));
+    assert.equal(priorJournalFiles.length, 1);
+    const marker = path.join(coordinationDirectory(fixture), "writer-recovery.json");
+    await writeFile(marker, "", "utf8");
+
+    const rejected = await runWorker({
+      mode: "reviewer",
+      shelfRoot: fixture.shelfRoot,
+      expectedShelfId: fixture.shelfId,
+      coordinationRoot: fixture.coordinationRoot,
+      acquireTimeoutMs: 30_000,
+      reviewerRecord: { annotationId: "123e4567-e89b-42d3-a456-426614174190" }
+    });
+    assert.equal(rejected.code, 3, `${JSON.stringify(rejected.result)} ${rejected.stderr}`);
+    assert.equal(rejected.result.code, "shelf-write-recovery-state-invalid");
+    assert.equal(await readFile(marker, "utf8"), "");
+    assert.equal(createHash("sha256").update(await readFile(bookFile)).digest("hex"), bookHash);
+    assert.equal(createHash("sha256").update(await readFile(annotationFile)).digest("hex"), annotationHash);
+    assert.deepEqual(await readdir(journalDirectory(fixture)), priorJournalFiles);
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 1);
+  } finally {
+    await rm(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("an unreadable recovery marker blocks Reviewer and test Host without changing evidence", async (t) => {
+  const fixture = await createShelfFixture("native-unreadable-marker");
+  let marker;
+  let identity;
+  let bookFile;
+  let annotationFile;
+  let bookHash;
+  let annotationHash;
+  let denyApplied = false;
+  const markerBytes = `${JSON.stringify({
+    version: 1,
+    state: "write-in-progress",
+    pid: 4242,
+    requestId: "req-unreadable-marker",
+    startedAt: new Date().toISOString()
+  })}\n`;
+  try {
+    const existing = await runWorker(baseCommand(fixture, {
+      quote: "既存の確定済み引用。",
+      url: "https://example.test/unreadable-existing"
+    }));
+    assert.equal(existing.code, 0, `${JSON.stringify(existing.result)} ${existing.stderr}`);
+    bookFile = path.join(fixture.booksDirectory, (await readdir(fixture.booksDirectory))[0]);
+    annotationFile = path.join(fixture.annotationsDirectory, (await readdir(fixture.annotationsDirectory))[0]);
+    bookHash = createHash("sha256").update(await readFile(bookFile)).digest("hex");
+    annotationHash = createHash("sha256").update(await readFile(annotationFile)).digest("hex");
+    const priorJournalFiles = await readdir(journalDirectory(fixture));
+    assert.equal(priorJournalFiles.length, 1);
+    marker = path.join(coordinationDirectory(fixture), "writer-recovery.json");
+    await writeFile(marker, markerBytes, "utf8");
+
+    if (process.platform !== "win32") {
+      t.skip("Unreadable-file ACL behavior is verified only on Windows.");
+      return;
+    }
+    try {
+      identity = execFileSync("whoami", [], { encoding: "utf8", windowsHide: true }).trim();
+      denyApplied = true;
+      execFileSync("icacls", [marker, "/deny", `${identity}:(R)`], { stdio: "ignore", windowsHide: true });
+    } catch (error) {
+      t.skip(`This Windows account could not apply a temporary read-deny ACL: ${String(error)}`);
+      return;
+    }
+    const remainedReadable = await readFile(marker).then(() => true, () => false);
+    if (remainedReadable) {
+      t.skip("The current Windows token can still read the temporary ACL-protected marker.");
+      return;
+    }
+
+    const rejectedHost = await runWorker(baseCommand(fixture, {
+      quote: "拒否されるHost引用。",
+      url: "https://example.test/unreadable-host-rejected"
+    }));
+    assert.equal(rejectedHost.code, 3, `${JSON.stringify(rejectedHost.result)} ${rejectedHost.stderr}`);
+    assert.equal(rejectedHost.result.code, "shelf-write-recovery-state-unavailable");
+    const rejectedReviewer = await runWorker({
+      mode: "reviewer",
+      shelfRoot: fixture.shelfRoot,
+      expectedShelfId: fixture.shelfId,
+      coordinationRoot: fixture.coordinationRoot,
+      acquireTimeoutMs: 30_000,
+      reviewerRecord: { annotationId: "123e4567-e89b-42d3-a456-426614174191" }
+    });
+    assert.equal(rejectedReviewer.code, 3, `${JSON.stringify(rejectedReviewer.result)} ${rejectedReviewer.stderr}`);
+    assert.equal(rejectedReviewer.result.code, "shelf-write-recovery-state-unavailable");
+
+    assert.deepEqual(await readdir(journalDirectory(fixture)), priorJournalFiles);
+    assert.equal((await readJsonFiles(fixture.booksDirectory)).length, 1);
+    assert.equal((await readJsonFiles(fixture.annotationsDirectory)).length, 1);
+  } finally {
+    try {
+      if (denyApplied && marker && identity) {
+        try {
+          execFileSync("icacls", [marker, "/remove:d", identity], { stdio: "ignore", windowsHide: true });
+        } catch {
+          execFileSync("icacls", [marker, "/reset"], { stdio: "ignore", windowsHide: true });
+        }
+      }
+      if (marker) assert.equal(await readFile(marker, "utf8"), markerBytes);
+      if (bookFile && annotationFile && bookHash && annotationHash) {
+        assert.equal(createHash("sha256").update(await readFile(bookFile)).digest("hex"), bookHash);
+        assert.equal(createHash("sha256").update(await readFile(annotationFile)).digest("hex"), annotationHash);
+      }
+    } finally {
+      await rm(fixture.base, { recursive: true, force: true });
+    }
   }
 });
 

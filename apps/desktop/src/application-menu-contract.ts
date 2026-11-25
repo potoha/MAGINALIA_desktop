@@ -22,7 +22,15 @@ export const APPLICATION_MENU_MANIFEST = [
       { kind: "command", id: "maginalia.document.exportDocx", label: "DOCX にエクスポート…" },
       { kind: "separator" },
       { kind: "command", id: "maginalia.settings.open", label: "設定…" },
-      { kind: "command", id: "maginalia.settings.shortcuts", label: "ショートカット設定…" }
+      { kind: "command", id: "maginalia.settings.shortcuts", label: "ショートカット設定…" },
+      { kind: "separator" },
+      { kind: "command", id: "maginalia.collector.setup", label: "Collector 連携を設定…" },
+      { kind: "command", id: "maginalia.collector.repair", label: "Collector 連携の確認・修復…" },
+      { kind: "command", id: "maginalia.collector.removeIntegration", label: "Collector 連携を解除…" },
+      { kind: "command", id: "maginalia.collector.cancelRemove", label: "Collector 連携の解除を取りやめる" },
+      { kind: "separator" },
+      { kind: "command", id: "maginalia.collector.configureSaveDestination", label: "Collector の保存先を設定…" },
+      { kind: "command", id: "maginalia.collector.clearSaveDestination", label: "Collector の保存先を解除…" }
     ]
   },
   {
@@ -118,6 +126,32 @@ export type ApplicationMenuCommandState = {
 export const APPLICATION_MENU_COMMAND_IDS: readonly ApplicationMenuCommandId[] = Object.freeze(
   APPLICATION_MENU_MANIFEST.flatMap((menu) => menu.items.flatMap((item) => item.kind === "command" ? [item.id] : []))
 );
+
+export type ApplicationMenuRole = Extract<ApplicationMenuManifestEntry, { readonly kind: "role" }>["role"];
+
+/**
+ * Accelerators that Electron itself registers for the native roles used in the
+ * manifest (verified against the Electron 44.3.0 role table: cut/copy/paste/
+ * selectAll/minimize/close use CommandOrControl+X/C/V/A/M/W). A renderer
+ * shortcut on one of these chords would silently lose to the native role, so
+ * the KeybindingService treats them as reserved. Spelling uses the portable
+ * `Mod` modifier of the renderer keybinding store.
+ */
+export const APPLICATION_MENU_ROLE_KEYBINDINGS: Readonly<Record<ApplicationMenuRole, string>> = Object.freeze({
+  cut: "Mod+X",
+  copy: "Mod+C",
+  paste: "Mod+V",
+  selectAll: "Mod+A",
+  minimize: "Mod+M",
+  close: "Mod+W"
+});
+
+/** Role chords for the roles that the manifest actually installs. */
+export const APPLICATION_MENU_ROLE_RESERVED_KEYBINDINGS: readonly string[] = Object.freeze([
+  ...new Set(APPLICATION_MENU_MANIFEST.flatMap((menu) => menu.items.flatMap((item) => item.kind === "role"
+    ? [APPLICATION_MENU_ROLE_KEYBINDINGS[item.role]]
+    : [])))
+]);
 
 const applicationMenuCommandIdSet: ReadonlySet<string> = new Set(APPLICATION_MENU_COMMAND_IDS);
 

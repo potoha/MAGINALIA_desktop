@@ -58,6 +58,9 @@ import {
 } from "./preload-api";
 import { GET_FIRST_RUN_STATUS_CHANNEL, RUN_FIRST_RUN_SETUP_CHANNEL } from "./first-run-ipc";
 import { OPEN_BUNDLED_MANUAL_CHANNEL } from "./manual-ipc";
+import { CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL, CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL } from "./collector-save-destination-ipc";
+import { COLLECTOR_INTEGRATION_CHANNEL, COLLECTOR_NOTICES_EVENT_CHANNEL, DISMISS_COLLECTOR_NOTICE_CHANNEL, GET_COLLECTOR_NOTICES_CHANNEL } from "./collector-integration-ipc";
+import { buildAlpha1MigrationNotice } from "./collector-integration-notices";
 import { APPLICATION_MENU_COMMAND_CHANNEL, UPDATE_APPLICATION_MENU_CHANNEL } from "./application-menu-contract";
 
 describe("preload boundary", () => {
@@ -75,6 +78,12 @@ describe("preload boundary", () => {
       "updateApplicationMenu",
       "onApplicationCommand",
       "openBundledManual",
+      "configureCollectorSaveDestination",
+      "clearCollectorSaveDestination",
+      "runCollectorIntegration",
+      "getCollectorNotices",
+      "dismissCollectorNotice",
+      "onCollectorNotices",
       "openMarkdown",
       "saveMarkdown",
       "openDocument",
@@ -136,6 +145,8 @@ describe("preload boundary", () => {
     await api.runFirstRunSetup({ workdeskMode: "new", privateShelfMode: "existing", registerPublicShelf: false });
     api.onFirstRunProgress(() => undefined);
     await api.openBundledManual();
+    await api.configureCollectorSaveDestination();
+    await api.clearCollectorSaveDestination();
     await api.openMarkdown();
     await api.saveMarkdown({ sessionId: "opaque-session", text: "# Draft\r\n" });
     await api.openDocument();
@@ -260,6 +271,8 @@ describe("preload boundary", () => {
       { channel: GET_FIRST_RUN_STATUS_CHANNEL, args: [] },
       { channel: RUN_FIRST_RUN_SETUP_CHANNEL, args: [{ workdeskMode: "new", privateShelfMode: "existing", registerPublicShelf: false }] },
       { channel: OPEN_BUNDLED_MANUAL_CHANNEL, args: [] },
+      { channel: CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL, args: [] },
+      { channel: CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL, args: [] },
       { channel: OPEN_MARKDOWN_CHANNEL, args: [] },
       { channel: SAVE_MARKDOWN_CHANNEL, args: [{ sessionId: "opaque-session", text: "# Draft\r\n" }] },
       { channel: OPEN_DOCUMENT_CHANNEL, args: [] },
@@ -483,5 +496,44 @@ describe("preload boundary", () => {
       .rejects.toThrow("snapshot is invalid");
     await expect(api.updateApplicationMenu([{ id: "maginalia.document.save", enabled: true, shortcut: "Ctrl+Unknown" }] as never))
       .rejects.toThrow("snapshot is invalid");
+  });
+});
+
+describe("Collector integration preload boundary", () => {
+  it("sends only validated, enumerated intents and copies only the known fields", async () => {
+    const calls: Array<{ channel: string; args: unknown[] }> = [];
+    const api = createMarkdownPreloadApi(async (channel, ...args) => { calls.push({ channel, args: [...args] }); return { kind: "busy" }; });
+    await api.runCollectorIntegration({ intent: "setup", confirmReplaceForeign: true });
+    for (const bad of [null, "setup", { intent: "run", command: "calc" }, { intent: "inspect", path: "C:\\x" }, { intent: "setup", proceedWithoutSupportedBrowser: "yes" }, { intent: "remove", confirmReplaceForeign: true }, { intent: "openBrowserExtensions", browser: "C:\\x\\chrome.exe" }, { intent: "openBrowserExtensions", browser: "brave" }, { intent: "setup", browser: "brave" }, { intent: "inspect", browser: "chrome" }, { intent: "openBrowserDownloadPage", url: "https://example.test" }, { intent: "openBrowserDownloadPage", browser: "https://example.test" }]) {
+      expect(() => api.runCollectorIntegration(bad as never)).toThrow("request is invalid");
+    }
+    expect(calls).toEqual([{ channel: COLLECTOR_INTEGRATION_CHANNEL, args: [{ intent: "setup", confirmReplaceForeign: true }] }]);
+    await api.runCollectorIntegration({ intent: "openBrowserExtensions", browser: "edge" });
+    expect(calls[1]).toEqual({ channel: COLLECTOR_INTEGRATION_CHANNEL, args: [{ intent: "openBrowserExtensions", browser: "edge" }] });
+    await api.runCollectorIntegration({ intent: "setup", browser: "chrome" });
+    expect(calls[2]).toEqual({ channel: COLLECTOR_INTEGRATION_CHANNEL, args: [{ intent: "setup", browser: "chrome" }] });
+    await api.runCollectorIntegration({ intent: "openBrowserDownloadPage", browser: "edge" });
+    expect(calls[3]).toEqual({ channel: COLLECTOR_INTEGRATION_CHANNEL, args: [{ intent: "openBrowserDownloadPage", browser: "edge" }] });
+  });
+
+  it("validates notice ids going out and notice lists coming in", async () => {
+    const calls: Array<{ channel: string; args: unknown[] }> = [];
+    const notice = buildAlpha1MigrationNotice();
+    const events: Array<{ channel: string; listener: (value: unknown) => void }> = [];
+    const api = createMarkdownPreloadApi(
+      async (channel, ...args) => { calls.push({ channel, args: [...args] }); return channel === GET_COLLECTOR_NOTICES_CHANNEL ? [notice] : { not: "a list" }; },
+      (channel, listener) => { events.push({ channel, listener }); return () => undefined; }
+    );
+    expect(await api.getCollectorNotices()).toEqual([notice]);
+    expect(await api.dismissCollectorNotice(notice.id)).toEqual([]);
+    await expect(api.dismissCollectorNotice("collector.notice.unknown")).rejects.toThrow("notice id is invalid");
+    expect(calls.map((call) => call.channel)).toEqual([GET_COLLECTOR_NOTICES_CHANNEL, DISMISS_COLLECTOR_NOTICE_CHANNEL]);
+    const received: unknown[] = [];
+    api.onCollectorNotices((notices) => received.push(notices));
+    expect(events[0]?.channel).toBe(COLLECTOR_NOTICES_EVENT_CHANNEL);
+    events[0]?.listener([notice]);
+    events[0]?.listener([{ ...notice, id: "collector.notice.injected" }]);
+    events[0]?.listener("junk");
+    expect(received).toEqual([[notice]]);
   });
 });

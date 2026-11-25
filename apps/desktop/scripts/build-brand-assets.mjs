@@ -9,8 +9,17 @@ const desktopRoot = path.resolve(scriptDirectory, "..");
 const repositoryRoot = path.resolve(desktopRoot, "../..");
 const sourceRoot = path.join(repositoryRoot, "assets");
 const outputRoot = path.join(desktopRoot, "dist", "branding");
-const applicationIconSource = path.join(sourceRoot, "icon.v2.png");
-const sourceNames = ["header.png", "icon.png", "icon.v2.png", "iconnottran.png", "splash.png"];
+// logo.png is the compact "[ ]*" mark (application icon, favicon, workbench
+// header mark). splash.png is the text-free wordmark art (splash, first run,
+// marker-stroke source). Swapping either asset only needs these two names.
+const applicationIconSource = path.join(sourceRoot, "logo.png");
+const wordmarkSource = path.join(sourceRoot, "splash.png");
+const sourceNames = ["logo.png", "splash.png"];
+const fontSourceRoot = path.join(desktopRoot, "assets", "fonts", "jost");
+const fontNames = ["jost-latin-700-normal.woff2"];
+// Optimized, HiDPI-capable derivative of the logo for renderer surfaces
+// (header mark at ~26 CSS px, favicon): 128 px covers 4x at 32 CSS px.
+const logoMarkSize = 128;
 
 await rm(outputRoot, { recursive: true, force: true });
 if (!existsSync(applicationIconSource)) {
@@ -27,9 +36,21 @@ for (const name of sourceNames) {
   await copyFile(source, path.join(outputRoot, name));
 }
 
-const headerPath = path.join(sourceRoot, "header.png");
-if (existsSync(headerPath)) {
-  const marker = await extractMarkerStroke(headerPath);
+for (const name of fontNames) {
+  const source = path.join(fontSourceRoot, name);
+  if (!existsSync(source)) {
+    process.stdout.write(`Bundled font unavailable; splash uses the system font stack: ${name}
+`);
+    continue;
+  }
+  await mkdir(path.join(outputRoot, "fonts"), { recursive: true });
+  await copyFile(source, path.join(outputRoot, "fonts", name));
+}
+
+await writeFile(path.join(outputRoot, "logo-mark.png"), await createLogoMark(applicationIconSource, logoMarkSize));
+
+if (existsSync(wordmarkSource)) {
+  const marker = await extractMarkerStroke(wordmarkSource);
   if (marker !== null) {
     await writeFile(path.join(outputRoot, "marker-stroke.png"), marker);
   } else {
@@ -47,7 +68,9 @@ async function extractMarkerStroke(sourcePath) {
   const columns = Array.from({ length: info.width }, () => null);
   let left = info.width;
   let right = -1;
-  const minimumMarkerY = Math.floor(info.height * 0.42);
+  // Skip the asterisk accents in the upper part of the wordmark art; the
+  // painted marker band sits in the lower half.
+  const minimumMarkerY = Math.floor(info.height * 0.5);
 
   for (let offset = 0; offset < data.length; offset += 4) {
     const red = data[offset];
@@ -131,19 +154,30 @@ function median(values) {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
+/** Square, transparent, ~6% safe margin on every side. */
+async function createSquareTransparentIcon(sourcePath, size) {
+  const pad = Math.round(size * 0.06);
+  const inner = size - pad * 2;
+  const transparent = { r: 0, g: 0, b: 0, alpha: 0 };
+  return sharp(sourcePath)
+    .ensureAlpha()
+    .resize(inner, inner, { fit: "contain", background: transparent })
+    .extend({ top: pad, bottom: pad, left: pad, right: pad, background: transparent })
+    .png()
+    .toBuffer();
+}
+
+async function createLogoMark(sourcePath, size) {
+  return sharp(sourcePath)
+    .ensureAlpha()
+    .resize(size, size, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+}
+
 async function createWindowsIcon(sourcePath) {
   const sizes = [16, 24, 32, 48, 64, 128, 256];
-  const { data } = await sharp(sourcePath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
-  const background = {
-    r: data[0],
-    g: data[1],
-    b: data[2],
-    alpha: data[3] / 255,
-  };
-  const pngImages = await Promise.all(sizes.map((size) => sharp(sourcePath)
-    .resize(size, size, { fit: "contain", background })
-    .png()
-    .toBuffer()));
+  const pngImages = await Promise.all(sizes.map((size) => createSquareTransparentIcon(sourcePath, size)));
 
   const directory = Buffer.alloc(6);
   directory.writeUInt16LE(0, 0);

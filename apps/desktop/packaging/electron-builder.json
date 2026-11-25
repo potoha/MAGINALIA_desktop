@@ -1,6 +1,6 @@
 {
   "appId": "org.maginalia.desktop.alpha1",
-  "productName": "MAGINALIA desktop α1",
+  "productName": "MAGINALIA Alpha2 Wild Berry",
   "asar": true,
   "directories": {
     "app": "packaging/.stage/app",
@@ -19,7 +19,12 @@
     { "from": "packaging/runtime/ndlocr-runtime-contract.json", "to": "ndlocr-runtime-contract.json" },
     { "from": "packaging/runtime/tutorial-sample", "to": "tutorial-sample" },
     { "from": "packaging/manual", "to": "manual", "filter": ["マニュアル.pdf"] },
-    { "from": "packaging/runtime/THIRD-PARTY-NOTICES", "to": "THIRD-PARTY-NOTICES" }
+    { "from": "packaging/runtime/THIRD-PARTY-NOTICES", "to": "THIRD-PARTY-NOTICES" },
+    { "from": "packaging/runtime/shelf-mutex", "to": "shelf-mutex", "filter": ["shelf_mutex.node", "PROVENANCE.json"] },
+    { "from": "packaging/runtime/windows-integration", "to": "windows-integration", "filter": ["windows_integration.node", "PROVENANCE.json"] },
+    { "from": "packaging/runtime/collector-host", "to": "collector-host", "filter": ["MAGINALIA-Collector-Host.exe", "shelf_mutex.node", "LICENSE.txt", "NOTICE.txt", "NODE-LICENSE.txt", "PROVENANCE.txt"] },
+    { "from": "packaging/runtime/collector-extension", "to": "collector-extension" },
+    { "from": "packaging/runtime/collector-payload.json", "to": "collector-payload.json" }
   ],
   "win": {
     "target": [{ "target": "nsis", "arch": ["x64"] }],
@@ -35,7 +40,7 @@
     "uninstallerIcon": "packaging/.stage/app/dist/branding/maginalia.ico",
     "createStartMenuShortcut": true,
     "createDesktopShortcut": false,
-    "shortcutName": "MAGINALIA desktop α1",
+    "shortcutName": "MAGINALIA Alpha2 Wild Berry",
     "deleteAppDataOnUninstall": false,
     "runAfterFinish": true,
     "language": 1041,

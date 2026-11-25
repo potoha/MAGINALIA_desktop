@@ -15,6 +15,7 @@ export function searchRegisteredWorkdeskProjects(
     return [{
       resultId: project.projectIdentityId,
       commandId: "maginalia.workdesk.openProject",
+      args: { projectIdentityId: project.projectIdentityId },
       title: `「${project.title}」を開く`,
       category: "Workdesk Project",
       description: "Open this registered Project",
@@ -36,6 +37,7 @@ export function searchCurrentProjectDocuments(
     return [{
       resultId: file.fileId,
       commandId: "maginalia.project.openFile",
+      args: { fileId: file.fileId },
       title: file.displayName,
       category: "Project document",
       description: `Open in ${project.displayName}`,

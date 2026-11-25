@@ -45,7 +45,23 @@ export const COMMAND_CONTEXT_KEYS = [
   "workdesk.homeAvailable",
   // True only while the current Explorer displays a child Project of that
   // active Workdesk.
-  "workdesk.childProject"
+  "workdesk.childProject",
+  // True while the inline Explorer "New Markdown" form is open.
+  "explorer.creationActive",
+  // More than one central document tab is open, so tab cycling can act.
+  "document.multipleTabs",
+  // A Document/Project open implementation is wired for this runtime.
+  "document.openAvailable",
+  // Export IPC and controller are available for this runtime.
+  "export.available",
+  // The main-process validated external-link opener is available.
+  "link.externalAvailable",
+  // Private Shelf search can run (API available) and has a selected result.
+  "shelf.available",
+  "shelf.resultSelected",
+  // Current-Project Markdown search is available, and a result source is shown.
+  "projectSearch.available",
+  "projectSearch.hasSource"
 ] as const;
 
 export type CommandContextKey = typeof COMMAND_CONTEXT_KEYS[number];
@@ -60,7 +76,8 @@ export function matchesWhen(context: CommandContext, when: string | undefined): 
   return when.split("&&").every((rawClause) => {
     const clause = rawClause.trim();
     if (clause.length === 0) return false;
-    const equals = /^([a-z.]+)\s*(==|!=)\s*([a-zA-Z0-9_-]+)$/u.exec(clause);
+    // Keys are camelCase segments (for example `editor.linkType`).
+    const equals = /^([a-zA-Z.]+)\s*(==|!=)\s*([a-zA-Z0-9_-]+)$/u.exec(clause);
     if (equals !== null) {
       const [, key, operator, value] = equals;
       if (!isKey(key)) return false;
