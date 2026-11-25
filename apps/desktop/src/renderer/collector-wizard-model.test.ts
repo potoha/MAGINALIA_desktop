@@ -1736,6 +1736,23 @@ describe("wizard model: step A choices (通常のブラウザー / Chrome / Edge
     expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
   });
 
+  it("D074: Chrome blocked by policy, Edge not installed, Vivaldi installed: nothing can be chosen and 次へ is disabled (default Vivaldi or not)", () => {
+    const installed = { chrome: "found", vivaldi: "found" } as const;
+    for (const defaultBrowser of ["vivaldi", "other"] as const) {
+      const h = atStepA(realStatus(defaultBrowser, installed, ["chrome"]));
+      const view = wizardAView(h.state);
+      expect(view.options.some((option) => option.selectable), defaultBrowser).toBe(false);
+      expect(view.options.map((option) => [option.id, option.selectable, option.note]).sort(), defaultBrowser).toEqual([["chrome", false, "policy-blocked"], ["vivaldi", false, "borrowed-blocked"]]);
+      expect(view.allBlocked, defaultBrowser).toBe(true);
+      expect(h.state.selectedBrowser, defaultBrowser).toBeNull();
+      expect(isWizardEventAllowed(h.state, { type: "selectBrowser", browser: "vivaldi" }), defaultBrowser).toBe(false);
+      expect(isWizardEventAllowed(h.state, { type: "selectBrowser", browser: "chrome" }), defaultBrowser).toBe(false);
+      expect(isWizardEventAllowed(h.state, { type: "next" }), defaultBrowser).toBe(false);
+      // The all-blocked screen offers no 次へ button at all.
+      expect(wizardActions(h.state).find((candidate) => candidate.id === "next")?.enabled ?? false, defaultBrowser).toBe(false);
+    }
+  });
+
   it("2b: Firefox default, Edge blocked, Chrome missing, Vivaldi installed: Vivaldi works through the Chrome key, so it is offered and the wizard is not all-blocked", () => {
     const h = atStepA(realStatus("other", { edge: "found", vivaldi: "found" }, ["edge"]));
     const view = wizardAView(h.state);
