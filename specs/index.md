@@ -46,7 +46,7 @@
 | INS-05 | アンインストール時のデータの保持 | specs/installer.md | 実装済み |
 | INS-06 | Collector のペイロードの同梱 | specs/installer.md | 実装済み |
 | LIC-01 | Desktop のライセンスは AGPL-3.0-or-later | specs/license.md | 未着手 |
-| LIC-02 | CLA を導入しない | specs/license.md | 未着手 |
+| LIC-02 | 貢献者同意（CLA 相当）を置く | specs/license.md | 未着手 |
 | LIC-03 | TRADEMARKS（名称・ロゴの扱い） | specs/license.md | 未着手 |
 | LIC-04 | Collector（別リポジトリ）の MIT の扱い | specs/license.md | 未着手 |
 
@@ -56,9 +56,9 @@
 - INS-02（未署名）、LIC-01〜LIC-04：テストなし。
 
 ## 要確認の重点（詳細は各ファイル末尾）
-1. 設計書は Chrome のみ・状態ファイル v1。実装は Chrome と Edge の 2 キー・v2（collector.md #1）。
+1. 解決：PO 判断（2026-11-25）で、対応ブラウザーは Chrome と Edge の 2 つ、コードを正とする（collector.md 冒頭、#1）。
 2. 初回セットアップ完了画面からの Collector 案内は実装が見つからない（wizard.md #1）。
 3. ライセンスの実装は PR #112 のブランチにあり、基準ブランチは MIT のまま（license.md #1）。
-4. D073「CLA なし」と、CONTRIBUTING の著作権譲渡への同意文・PR テンプレートのチェックボックスの関係（license.md #2）。
+4. 解決：PO 判断（2026-11-25、D075）で CLA 相当を採用（license.md #2）。
 5. D074「進めない」と、ウィザードの Vivaldi の抜け道コードの関係（wizard.md #3）。
 6. 未署名・SmartScreen の注意書きは README.md:43 にある。導入ガイドに実行手順まで書くかは未決定（installer.md #3）。

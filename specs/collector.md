@@ -9,6 +9,7 @@
 - 根拠文書：`docs/collector-wizard-integration-design.md`（設計案）、`docs/desktop-alpha2-packaging.md`、引継ぎ `docs/handoff-collector-wizard-s8-2026-11-23-v4.md`（`D:\python\MAGINALIA_ALPHA` 側。この worktree には無い）。
 - Desktop アプリ本体（main プロセス）が、ユーザー操作の後に Host ファイルと HKCU のレジストリ値を書く。インストーラは読み取り専用のペイロードを配るだけ（設計 3.2）。
 - 描画側（renderer）は「意図（intent）」だけを送り、パスは送らない（設計 4.1）。
+- **対応ブラウザー（PO 確認 2026-11-25）：Chrome と Edge の 2 つ。** Vivaldi は Chrome のキーを借りて動く（独自のキーは書かない）。設計書の「Chrome のみ」は古く、コードと本書を正とする。
 - 設計書は Chrome のみ・状態ファイル v1 の記述。実装は Chrome と Edge の 2 つの書込み先・状態ファイル v2 に進んでいる。差は「要確認」に列挙した。
 - 「実機」欄：パッケージ版の実機確認（インストール、レジストリ、ブラウザー操作）は、引継ぎ v4 の時点で未実施。実機確認の記録があるのは、引継ぎ v4 §2・§4 の Edge の ProgId・拡張機能 ID・origin など（2026-11-22）だけ。
 
