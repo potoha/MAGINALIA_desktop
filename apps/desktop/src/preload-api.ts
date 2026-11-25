@@ -125,6 +125,23 @@ import {
 } from "./first-run-ipc";
 import { OPEN_BUNDLED_MANUAL_CHANNEL, type OpenBundledManualResult } from "./manual-ipc";
 import {
+  CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL,
+  CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL,
+  type CollectorSaveDestinationIpcResult
+} from "./collector-save-destination-ipc";
+import {
+  COLLECTOR_INTEGRATION_CHANNEL,
+  COLLECTOR_NOTICES_EVENT_CHANNEL,
+  DISMISS_COLLECTOR_NOTICE_CHANNEL,
+  GET_COLLECTOR_NOTICES_CHANNEL,
+  isCollectorIntegrationRequest,
+  isCollectorNoticeId,
+  isCollectorNoticeList,
+  type CollectorIntegrationRequest,
+  type CollectorIntegrationResponse
+} from "./collector-integration-ipc";
+import type { CollectorNotice } from "./collector-integration-notices";
+import {
   CREATE_WORKDESK_CHANNEL,
   CREATE_WORKDESK_FILE_CHANNEL,
   CREATE_WORKDESK_PROJECT_CHANNEL,
@@ -185,6 +202,14 @@ import {
   type SearchProjectMarkdownRequest,
   type SearchProjectMarkdownResult
 } from "./project-search-ipc";
+import {
+  APPLICATION_MENU_COMMAND_CHANNEL,
+  UPDATE_APPLICATION_MENU_CHANNEL,
+  isApplicationMenuCommandId,
+  isApplicationMenuSnapshot,
+  type ApplicationMenuCommandId,
+  type ApplicationMenuCommandState
+} from "./application-menu-contract";
 
 export const OPEN_MARKDOWN_CHANNEL = "maginalia:open-markdown";
 export const SAVE_MARKDOWN_CHANNEL = "maginalia:save-markdown";
@@ -341,6 +366,7 @@ export type { ResolveProjectAssetRequest, ImportDroppedImageRequest, ProjectAsse
 
 export type EventUnsubscribe = () => void;
 export type AutosaveFlushCallback = (request: AutosaveFlushRequest) => boolean | Promise<boolean>;
+export type ApplicationMenuCommandCallback = (commandId: ApplicationMenuCommandId) => void;
 export type ModCapabilityCallback = (
   request: ModCapabilityRequestEvent,
 ) => ModCapabilityResponse | Promise<ModCapabilityResponse>;
@@ -349,7 +375,15 @@ export interface MarkdownPreloadApi {
   getFirstRunStatus?(): Promise<FirstRunStatus>;
   runFirstRunSetup?(choices: FirstRunChoices): Promise<FirstRunSetupResult>;
   onFirstRunProgress?(callback: (event: FirstRunProgressEvent) => void): EventUnsubscribe;
+  updateApplicationMenu?(snapshot: readonly ApplicationMenuCommandState[]): Promise<void>;
+  onApplicationCommand?(callback: ApplicationMenuCommandCallback): EventUnsubscribe;
   openBundledManual?(): Promise<OpenBundledManualResult>;
+  configureCollectorSaveDestination?(): Promise<CollectorSaveDestinationIpcResult>;
+  clearCollectorSaveDestination?(): Promise<CollectorSaveDestinationIpcResult>;
+  runCollectorIntegration?(request: CollectorIntegrationRequest): Promise<CollectorIntegrationResponse>;
+  getCollectorNotices?(): Promise<readonly CollectorNotice[]>;
+  dismissCollectorNotice?(noticeId: string): Promise<readonly CollectorNotice[]>;
+  onCollectorNotices?(callback: (notices: readonly CollectorNotice[]) => void): EventUnsubscribe;
   openMarkdown(): Promise<OpenMarkdownResult>;
   saveMarkdown(request: SaveMarkdownRequest): Promise<SaveMarkdownResult>;
   openDocument?(): Promise<OpenDocumentResult>;
@@ -415,7 +449,15 @@ export type CompleteMarkdownPreloadApi = MarkdownPreloadApi & {
   getFirstRunStatus(): Promise<FirstRunStatus>;
   runFirstRunSetup(choices: FirstRunChoices): Promise<FirstRunSetupResult>;
   onFirstRunProgress(callback: (event: FirstRunProgressEvent) => void): EventUnsubscribe;
+  updateApplicationMenu(snapshot: readonly ApplicationMenuCommandState[]): Promise<void>;
+  onApplicationCommand(callback: ApplicationMenuCommandCallback): EventUnsubscribe;
   openBundledManual(): Promise<OpenBundledManualResult>;
+  configureCollectorSaveDestination(): Promise<CollectorSaveDestinationIpcResult>;
+  clearCollectorSaveDestination(): Promise<CollectorSaveDestinationIpcResult>;
+  runCollectorIntegration(request: CollectorIntegrationRequest): Promise<CollectorIntegrationResponse>;
+  getCollectorNotices(): Promise<readonly CollectorNotice[]>;
+  dismissCollectorNotice(noticeId: string): Promise<readonly CollectorNotice[]>;
+  onCollectorNotices(callback: (notices: readonly CollectorNotice[]) => void): EventUnsubscribe;
   openDocument(): Promise<OpenDocumentResult>;
   openManuscript(request: OpenManuscriptRequest): Promise<OpenManuscriptResult>;
   listExplorer(request: ExplorerListRequest): Promise<ExplorerListResult>;
@@ -494,7 +536,46 @@ export function createMarkdownPreloadApi(
         if (isFirstRunProgressEvent(value)) callback(value);
       });
     },
+    updateApplicationMenu: async (snapshot) => {
+      if (!isApplicationMenuSnapshot(snapshot)) throw new TypeError("The application menu snapshot is invalid.");
+      const accepted = await invoke(UPDATE_APPLICATION_MENU_CHANNEL, snapshot);
+      if (accepted !== true) throw new Error("The application menu update was rejected.");
+    },
+    onApplicationCommand: (callback) => {
+      if (typeof callback !== "function") throw new TypeError("The application menu callback is invalid.");
+      return subscribe(APPLICATION_MENU_COMMAND_CHANNEL, (value) => {
+        if (isApplicationMenuCommandId(value)) callback(value);
+      });
+    },
     openBundledManual: () => invoke(OPEN_BUNDLED_MANUAL_CHANNEL) as Promise<OpenBundledManualResult>,
+    configureCollectorSaveDestination: () => invoke(CONFIGURE_COLLECTOR_SAVE_DESTINATION_CHANNEL) as Promise<CollectorSaveDestinationIpcResult>,
+    clearCollectorSaveDestination: () => invoke(CLEAR_COLLECTOR_SAVE_DESTINATION_CHANNEL) as Promise<CollectorSaveDestinationIpcResult>,
+    runCollectorIntegration: (request) => {
+      if (!isCollectorIntegrationRequest(request)) throw new TypeError("The Collector integration request is invalid.");
+      // Copy the validated fields only: nothing else the caller attached can reach the main process.
+      const { intent, confirmReplaceForeign, proceedWithoutSupportedBrowser, browser } = request;
+      return invoke(COLLECTOR_INTEGRATION_CHANNEL, {
+        intent,
+        ...(confirmReplaceForeign === undefined ? {} : { confirmReplaceForeign }),
+        ...(proceedWithoutSupportedBrowser === undefined ? {} : { proceedWithoutSupportedBrowser }),
+        ...(browser === undefined ? {} : { browser })
+      }) as Promise<CollectorIntegrationResponse>;
+    },
+    getCollectorNotices: async () => {
+      const notices = await invoke(GET_COLLECTOR_NOTICES_CHANNEL);
+      return isCollectorNoticeList(notices) ? notices : [];
+    },
+    dismissCollectorNotice: async (noticeId) => {
+      if (!isCollectorNoticeId(noticeId)) throw new TypeError("The Collector notice id is invalid.");
+      const notices = await invoke(DISMISS_COLLECTOR_NOTICE_CHANNEL, noticeId);
+      return isCollectorNoticeList(notices) ? notices : [];
+    },
+    onCollectorNotices: (callback) => {
+      if (typeof callback !== "function") throw new TypeError("The Collector notices callback is invalid.");
+      return subscribe(COLLECTOR_NOTICES_EVENT_CHANNEL, (value) => {
+        if (isCollectorNoticeList(value)) callback(value);
+      });
+    },
     openMarkdown: () => invoke(OPEN_MARKDOWN_CHANNEL) as Promise<OpenMarkdownResult>,
     saveMarkdown: (request) => invoke(SAVE_MARKDOWN_CHANNEL, request) as Promise<SaveMarkdownResult>,
     openDocument: () => invoke(OPEN_DOCUMENT_CHANNEL) as Promise<OpenDocumentResult>,

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { OpenMarkdownResult, SaveMarkdownRequest } from "../markdown-ipc";
 import type { ProjectFileOpenResult, ProjectOpenResult } from "../project-ipc";
-import type { ProjectFileSummary } from "../project-service";
+import type { ProjectFileSummary, ProjectOpened } from "../project-service";
 import { WritingController, type WritingStatus, type WritingSurface, type WritingTextRange, type WritingView } from "./controller";
 import { ProjectNavigationController, type ProjectNavigationApi, type ProjectNavigationState, type ProjectNavigationView } from "./project-controller";
 
@@ -220,6 +220,100 @@ describe("ProjectNavigationController", () => {
     expect(test.writing.getDocumentSessions()).toHaveLength(1);
     expect(test.writing.getDocumentViews()).toHaveLength(1);
     expect(test.navigation.getOpenedFileIds()).toEqual([files[0].fileId]);
+  });
+
+  it("does not invoke a deferred Project loader when dirty switching is canceled", async () => {
+    const test = harness("cancel");
+    const secondProject = { projectId: "00000000-0000-4000-8000-000000000011", displayName: "Tea" };
+    await test.navigation.openProject();
+    test.surface.edit("keep the current edit");
+    const load = vi.fn(async () => ({ kind: "opened" as const, project: secondProject, files }));
+
+    const activated = await test.navigation.activateProjectFromLoader(load);
+
+    expect(activated).toBe(false);
+    expect(load).not.toHaveBeenCalled();
+    expect(test.view.state.project).toEqual(project);
+    expect(test.view.state.activeFileId).toBe(files[0].fileId);
+    expect(test.surface.text).toBe("keep the current edit");
+  });
+
+  it("does not invoke a deferred Project loader when autosave flush is refused", async () => {
+    const flushAll = vi.fn(async () => false);
+    const test = harness("cancel", (file) => opened(file), true, flushAll);
+    const secondProject = { projectId: "00000000-0000-4000-8000-000000000011", displayName: "Tea" };
+    await test.navigation.openProject();
+    test.surface.edit("keep the current edit");
+    const load = vi.fn(async () => ({ kind: "opened" as const, project: secondProject, files }));
+
+    const activated = await test.navigation.activateProjectFromLoader(load);
+
+    expect(activated).toBe(false);
+    expect(flushAll).toHaveBeenCalledTimes(1);
+    expect(load).not.toHaveBeenCalled();
+    expect(test.view.state.project).toEqual(project);
+    expect(test.surface.text).toBe("keep the current edit");
+    expect(test.view.error).toBe("Save or discard the current manuscript before switching.");
+  });
+
+  it("flushes before invoking a deferred Project loader and applies its opened result", async () => {
+    const order: string[] = [];
+    const flushAll = vi.fn(async () => { order.push("flush"); return true; });
+    const test = harness("cancel", (file) => opened(file), true, flushAll);
+    const secondProject = { projectId: "00000000-0000-4000-8000-000000000011", displayName: "Tea" };
+    await test.navigation.openProject();
+    const load = vi.fn(async () => {
+      order.push("load");
+      return { kind: "opened" as const, project: secondProject, files };
+    });
+
+    const activated = await test.navigation.activateProjectFromLoader(load);
+
+    expect(activated).toBe(true);
+    expect(order).toEqual(["flush", "load"]);
+    expect(test.view.state.project).toEqual(secondProject);
+    expect(test.view.state.activeFileId).toBe(files[0].fileId);
+    expect(test.surface.text).toBe("first");
+  });
+
+  it("serializes deferred Project loads through the busy guard", async () => {
+    const test = harness("cancel");
+    const secondProject = { projectId: "00000000-0000-4000-8000-000000000011", displayName: "Tea" };
+    await test.navigation.openProject();
+    let finishLoad: ((result: ProjectOpened | null) => void) | undefined;
+    const load = vi.fn(() => new Promise<ProjectOpened | null>((resolve) => { finishLoad = resolve; }));
+    const firstAttempt = test.navigation.activateProjectFromLoader(load);
+    const concurrentLoad = vi.fn(async () => ({ kind: "opened" as const, project, files }));
+
+    expect(await test.navigation.activateProjectFromLoader(concurrentLoad)).toBe(false);
+    expect(concurrentLoad).not.toHaveBeenCalled();
+    expect(load).toHaveBeenCalledTimes(1);
+
+    finishLoad?.({ kind: "opened", project: secondProject, files });
+    expect(await firstAttempt).toBe(true);
+    expect(test.view.state.project).toEqual(secondProject);
+  });
+
+  it("keeps the active Project for null or rejected deferred loads and releases the busy guard", async () => {
+    const test = harness("cancel");
+    const secondProject = { projectId: "00000000-0000-4000-8000-000000000011", displayName: "Tea" };
+    await test.navigation.openProject();
+    const canceledLoad = vi.fn(async () => null);
+
+    expect(await test.navigation.activateProjectFromLoader(canceledLoad)).toBe(false);
+    expect(canceledLoad).toHaveBeenCalledTimes(1);
+    expect(test.view.state.project).toEqual(project);
+
+    const failedLoad = vi.fn(async () => { throw new Error("IPC failed"); });
+    expect(await test.navigation.activateProjectFromLoader(failedLoad)).toBe(false);
+    expect(failedLoad).toHaveBeenCalledTimes(1);
+    expect(test.view.state.project).toEqual(project);
+    expect(test.view.error).toBe("The Project folder could not be opened. Choose it again.");
+
+    const retryLoad = vi.fn(async () => ({ kind: "opened" as const, project: secondProject, files }));
+    expect(await test.navigation.activateProjectFromLoader(retryLoad)).toBe(true);
+    expect(retryLoad).toHaveBeenCalledTimes(1);
+    expect(test.view.state.project).toEqual(secondProject);
   });
 
   it("flushes every session before replacing the Project", async () => {

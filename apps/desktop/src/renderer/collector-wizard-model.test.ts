@@ -1,0 +1,1864 @@
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+import { COLLECTOR_BROWSER_IDS, recommendCollectorBrowser, type CollectorBrowserId, type CollectorRecommendationReason } from "../collector-browser-table";
+import type { CollectorApplyReason } from "../collector-integration-apply-types";
+import {
+  isCollectorIntegrationRequest,
+  type CollectorBrowserSummary,
+  type CollectorConnectionSummary,
+  type CollectorIntegrationResponse,
+  type CollectorIntegrationStatus,
+} from "../collector-integration-ipc";
+import type { CollectorSaveDestinationIpcResult } from "../collector-save-destination-ipc";
+import { WIZARD_MESSAGE_IDS, wizardSupportedBrowserList, type WizardMessageId } from "./collector-wizard-copy";
+import {
+  APPLY_REASON_MESSAGE,
+  classifyWizardResponse,
+  initialWizardState,
+  isWizardEventAllowed,
+  moveRadioSelection,
+  reduceWizard,
+  wizardActions,
+  wizardAView,
+  wizardConnectionView,
+  wizardDoneView,
+  wizardStepDView,
+  wizardAllBrowsersBlocked,
+  wizardBrowserOptions,
+  wizardCopy,
+  wizardDestinationConfigured,
+  wizardIsBusy,
+  wizardInFlightNotice,
+  wizardMessage,
+  wizardProgress,
+  wizardRecommendationReason,
+  WIZARD_CONNECTION_TIMEOUT_MS,
+  WIZARD_INFLIGHT_CANCEL_MS,
+  WIZARD_POLL_INTERVAL_MS,
+  type WizardBrowserOption,
+  type WizardEffect,
+  type WizardState,
+  type WizardSystemEvent,
+  type WizardUserEvent,
+} from "./collector-wizard-model";
+
+// ----- fixtures ---------------------------------------------------------------------------------
+
+const T0 = 1_000_000;
+
+function entry(id: CollectorBrowserId, over: Partial<CollectorBrowserSummary> = {}): CollectorBrowserSummary {
+  const verified = id === "chrome";
+  return {
+    id,
+    verification: verified ? "verified" : "unverified",
+    installed: "found",
+    registration: "absent",
+    registrationVia: null,
+    policyBlocked: false,
+    extensionLoadMayBeBlocked: false,
+    extensionsAddress: `${id}://extensions`,
+    ...over,
+  };
+}
+
+type StatusOverrides = Omit<Partial<CollectorIntegrationStatus>, "browsers"> & { browsers?: Partial<CollectorIntegrationStatus["browsers"]> };
+
+function status(over: StatusOverrides = {}): CollectorIntegrationStatus {
+  const { browsers, ...rest } = over;
+  return {
+    applyInProgress: false,
+    removeRequested: false,
+    state: "not-set-up",
+    reasons: [],
+    inspectionComplete: true,
+    registration: "absent",
+    browsers: {
+      defaultBrowser: "chrome",
+      recommended: "chrome",
+      recommendationReason: "default-supported",
+      preferred: null,
+      entries: [entry("edge"), entry("chrome"), entry("vivaldi")],
+      ...browsers,
+    },
+    policy: { blocked: false, userLevelHostsDisabled: false, hostBlocked: false, extensionLoadMayBeBlocked: false },
+    installed: { hostVersion: null, extensionVersion: null },
+    payloadStatus: "valid",
+    extensionFolderPlaced: true,
+    writesAllowed: true,
+    ...rest,
+  };
+}
+
+function statusResponse(over: StatusOverrides = {}): CollectorIntegrationResponse {
+  return { kind: "status", status: status(over) };
+}
+
+function applyResponse(over: Partial<Extract<CollectorIntegrationResponse, { kind: "apply" }>> = {}): CollectorIntegrationResponse {
+  return { kind: "apply", action: "setup", outcome: "applied", reason: null, warnings: [], selfCheck: "ok", status: status({ state: "ready" }), ...over };
+}
+
+function connection(summary: CollectorConnectionSummary, applyInProgress = false): CollectorIntegrationResponse {
+  return { kind: "connection", state: "ready", applyInProgress, connection: summary };
+}
+
+interface Harness {
+  state: WizardState;
+  now: number;
+  /** Every effect emitted so far. */
+  log: WizardEffect[];
+}
+
+type AnyEvent = WizardUserEvent | WizardSystemEvent;
+
+function start(): Harness {
+  return { state: initialWizardState(), now: T0, log: [] };
+}
+
+function send(h: Harness, event: AnyEvent, at?: number): readonly WizardEffect[] {
+  if (at !== undefined) h.now = at;
+  const reduction = reduceWizard(h.state, { ...event, now: h.now });
+  h.state = reduction.state;
+  h.log.push(...reduction.effects);
+  for (const effect of reduction.effects) {
+    if (effect.type === "request") expect(isCollectorIntegrationRequest(effect.request), JSON.stringify(effect.request)).toBe(true);
+  }
+  return reduction.effects;
+}
+
+function requestsOf(effects: readonly WizardEffect[]) {
+  return effects.flatMap((effect) => (effect.type === "request" ? [effect.request] : []));
+}
+
+/** Answers the request that is in flight. */
+function respond(h: Harness, response: CollectorIntegrationResponse): readonly WizardEffect[] {
+  expect(h.state.inFlight, "a request is in flight").not.toBeNull();
+  return send(h, { type: "response", requestId: h.state.inFlight!.requestId, response });
+}
+
+function atStepA(over: StatusOverrides = {}): Harness {
+  const h = start();
+  send(h, { type: "opened" });
+  respond(h, statusResponse(over));
+  return h;
+}
+
+function atStepB(over: StatusOverrides = {}): Harness {
+  const h = atStepA(over);
+  send(h, { type: "next" });
+  expect(h.state.step).toBe("B");
+  return h;
+}
+
+/** Step B on an outdated installation whose remove is still requested, after pressing the register button. */
+function atStepBPaused(): Harness {
+  const h = atStepB({ state: "outdated", removeRequested: true });
+  send(h, { type: "register" });
+  expect(wizardMessage(h.state)?.id).toBe("outdated-remove-paused");
+  return h;
+}
+
+function atStepC(): Harness {
+  const h = atStepB();
+  send(h, { type: "register" });
+  respond(h, applyResponse());
+  send(h, { type: "next" });
+  expect(h.state.step).toBe("C");
+  return h;
+}
+
+function atStepD(placed = true): Harness {
+  const h = atStepC();
+  send(h, { type: "confirmDestination" });
+  send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "configured", writesEnabled: true } });
+  send(h, { type: "next" });
+  expect(h.state.step).toBe("D");
+  respond(h, statusResponse({ state: "ready", extensionFolderPlaced: placed }));
+  return h;
+}
+
+function atStepE(): Harness {
+  const h = atStepD();
+  send(h, { type: "loaded" }, T0 + 10_000);
+  expect(h.state.step).toBe("E");
+  return h;
+}
+
+const ALL_KINDS_RESPONSES: readonly CollectorIntegrationResponse[] = [
+  { kind: "unavailable", reason: "e2e-isolation" },
+  { kind: "unavailable", reason: "payload-unavailable" },
+  { kind: "unavailable", reason: "startup-failed" },
+  { kind: "invalid-request" },
+  { kind: "busy" },
+  { kind: "error" },
+  statusResponse(),
+  applyResponse(),
+  applyResponse({ outcome: "failed", reason: "write-failed" }),
+  { kind: "cancelled" },
+  { kind: "cancel-remove", result: "cleared" },
+  { kind: "cancel-remove", result: "not-requested" },
+  { kind: "cancel-remove", result: "nothing-to-cancel" },
+  { kind: "cancel-remove", result: "unchanged" },
+  { kind: "browser-required", status: status() },
+  { kind: "browser-extensions", browser: "chrome", result: "opened" },
+  { kind: "browser-extensions", browser: null, result: "browser-not-found" },
+  { kind: "browser-download", result: "opened" },
+  { kind: "extension-folder", intent: "copyExtensionPath", result: "done" },
+  { kind: "extension-folder", intent: "revealExtensionFolder", result: "failed" },
+  connection({ state: "waiting" }),
+  connection({ state: "connected", extensionVersion: "0.3.0", hostVersion: "0.2.0", contactedAt: "2026-11-20T00:00:00.000Z" }),
+];
+
+function actionLabels(h: Harness): string[] {
+  return wizardActions(h.state).map((action) => action.label);
+}
+
+function action(h: Harness, id: string) {
+  const found = wizardActions(h.state).find((candidate) => candidate.id === id);
+  expect(found, `action ${id} on step ${h.state.step}`).toBeDefined();
+  return found!;
+}
+
+// ----- tests ------------------------------------------------------------------------------------
+
+describe("wizard model: start and step A", () => {
+  it("opening asks for an inspection once and moves focus to the heading", () => {
+    const h = start();
+    const effects = send(h, { type: "opened" });
+    expect(requestsOf(effects)).toEqual([{ intent: "inspect" }]);
+    expect(effects.map((effect) => effect.type)).toEqual(["request", "focusHeading", "ticker"]);
+    expect(wizardIsBusy(h.state)).toBe(true);
+    expect(wizardProgress(h.state)).toBe("手順 1 / 5");
+    expect(send(h, { type: "opened" })).toEqual([]);
+  });
+
+  it("selects the recommended browser and offers 次へ", () => {
+    const h = atStepA();
+    expect(h.state.statusLoad).toBe("ready");
+    expect(h.state.selectedBrowser).toBe("chrome");
+    expect(actionLabels(h)).toEqual(["あとで設定", "次へ"]);
+    expect(action(h, "next").enabled).toBe(true);
+    expect(wizardMessage(h.state)).toBeNull();
+  });
+
+  it("discards a status taken while an apply was running", () => {
+    const h = start();
+    send(h, { type: "opened" });
+    respond(h, statusResponse({ applyInProgress: true }));
+    expect(h.state.status).toBeNull();
+    expect(h.state.statusLoad).toBe("failed");
+    expect(wizardMessage(h.state)?.id).toBe("busy");
+    expect(action(h, "recheckBrowsers").enabled).toBe(true);
+    send(h, { type: "recheckBrowsers" });
+    respond(h, statusResponse());
+    expect(h.state.statusLoad).toBe("ready");
+    expect(wizardMessage(h.state)).toBeNull();
+  });
+
+  it("an IPC failure on the first inspection can be retried", () => {
+    const h = start();
+    send(h, { type: "opened" });
+    send(h, { type: "requestFailed", requestId: h.state.inFlight!.requestId });
+    expect(h.state.statusLoad).toBe("failed");
+    expect(wizardMessage(h.state)).toMatchObject({ id: "inspect-failed", role: "alert" });
+    expect(send(h, { type: "recheckBrowsers" }).map((effect) => effect.type)).toEqual(["request", "ticker"]);
+  });
+
+  it("every reason keeps the right buttons (default-supported and the other selectable reasons)", () => {
+    for (const reason of ["default-supported", "default-unsupported", "default-not-chromium", "default-unverified", "default-not-installed", "default-unknown"] as const) {
+      const h = atStepA({ browsers: { recommendationReason: reason } });
+      expect(actionLabels(h), reason).toEqual(["あとで設定", "次へ"]);
+    }
+  });
+
+  it("none-installed: download, recheck and an explicit continue; 次へ is not offered", () => {
+    const h = atStepA({
+      browsers: { recommended: null, recommendationReason: "none-installed", entries: [entry("edge", { installed: "not-found" }), entry("chrome", { installed: "not-found" }), entry("vivaldi", { installed: "not-found" })] },
+    });
+    expect(h.state.selectedBrowser).toBeNull();
+    expect(actionLabels(h)).toEqual(["あとで設定", "Google Chrome のダウンロードページを開く", "Microsoft Edge のダウンロードページを開く", "もう一度確認", "ブラウザーは入っています（このまま続ける）"]);
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
+    // The download page is requested by browser id only.
+    expect(requestsOf(send(h, { type: "openDownloadPage", browser: "edge" }))).toEqual([{ intent: "openBrowserDownloadPage", browser: "edge" }]);
+    respond(h, { kind: "browser-download", result: "opened" });
+    expect(requestsOf(send(h, { type: "openDownloadPage", browser: "chrome" }))).toEqual([{ intent: "openBrowserDownloadPage", browser: "chrome" }]);
+    respond(h, { kind: "browser-download", result: "opened" });
+    expect(wizardMessage(h.state)?.id).toBe("download-opened");
+    // A row without a download URL (unverified, so not even listed) is refused.
+    expect(isWizardEventAllowed(h.state, { type: "openDownloadPage", browser: "vivaldi" })).toBe(false);
+    // Nothing is written until the user chooses to continue, and only then is the flag sent.
+    send(h, { type: "continueWithoutBrowser" });
+    expect(h.state.step).toBe("B");
+    expect(h.state.proceedWithoutBrowser).toBe(true);
+    expect(requestsOf(send(h, { type: "register" }))).toEqual([{ intent: "setup", proceedWithoutSupportedBrowser: true }]);
+  });
+
+  it("download results map to messages", () => {
+    const h = atStepA({ browsers: { recommended: null, recommendationReason: "none-installed", entries: [entry("chrome", { installed: "not-found" })] } });
+    for (const [result, id] of [["failed", "download-failed"], ["not-offered", "download-not-offered"], ["opened", "download-opened"]] as const) {
+      send(h, { type: "openDownloadPage", browser: "chrome" });
+      respond(h, { kind: "browser-download", result });
+      expect(wizardMessage(h.state)?.id).toBe(id);
+    }
+  });
+
+  it("detection-failed: the verified rows are listed as 確認できませんでした and the user must choose one to continue", () => {
+    const h = atStepA({
+      browsers: { recommended: null, recommendationReason: "detection-failed", entries: [entry("edge", { installed: "unknown" }), entry("chrome", { installed: "unknown" }), entry("vivaldi", { installed: "unknown" })] },
+    });
+    expect(wizardBrowserOptions(h.state.status)).toEqual([{ id: "chrome", recommended: false, selectable: true, note: "detection-unknown" }]);
+    expect(h.state.selectedBrowser).toBeNull();
+    expect(action(h, "continueWithoutBrowser").enabled).toBe(false);
+    expect(action(h, "continueWithoutBrowser").label).toBe("このブラウザーで続ける");
+    send(h, { type: "selectBrowser", browser: "chrome" });
+    expect(action(h, "continueWithoutBrowser").enabled).toBe(true);
+    send(h, { type: "continueWithoutBrowser" });
+    expect(requestsOf(send(h, { type: "register" }))).toEqual([{ intent: "setup", browser: "chrome", proceedWithoutSupportedBrowser: true }]);
+  });
+
+  it("a policy-blocked browser is shown but cannot be selected or continued with", () => {
+    const h = atStepA({ browsers: { recommended: null, recommendationReason: "none-installed", entries: [entry("chrome", { policyBlocked: true })] } });
+    expect(wizardBrowserOptions(h.state.status)).toEqual([{ id: "chrome", recommended: false, selectable: false, note: "policy-blocked" }]);
+    expect(isWizardEventAllowed(h.state, { type: "selectBrowser", browser: "chrome" })).toBe(false);
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
+  });
+
+  it("selecting an unlisted or unverified browser is ignored", () => {
+    const h = atStepA();
+    expect(send(h, { type: "selectBrowser", browser: "edge" })).toEqual([]);
+    expect(h.state.selectedBrowser).toBe("chrome");
+  });
+
+  it("going on from step A clears an earlier continue-without choice and sends the selected browser", () => {
+    const h = atStepA();
+    send(h, { type: "next" });
+    expect(h.state.proceedWithoutBrowser).toBe(false);
+    expect(requestsOf(send(h, { type: "register" }))).toEqual([{ intent: "setup", browser: "chrome" }]);
+  });
+});
+
+describe("wizard model: radiogroup keys", () => {
+  const options: readonly WizardBrowserOption[] = [
+    { id: "edge", recommended: true, selectable: true, note: null },
+    { id: "chrome", recommended: false, selectable: false, note: "policy-blocked" },
+    { id: "vivaldi", recommended: false, selectable: true, note: null },
+  ];
+
+  it("moves forward and back, wraps at both ends and skips disabled options", () => {
+    expect(moveRadioSelection(options, "edge", "ArrowDown")).toBe("vivaldi");
+    expect(moveRadioSelection(options, "edge", "ArrowRight")).toBe("vivaldi");
+    expect(moveRadioSelection(options, "vivaldi", "ArrowDown")).toBe("edge");
+    expect(moveRadioSelection(options, "edge", "ArrowUp")).toBe("vivaldi");
+    expect(moveRadioSelection(options, "edge", "ArrowLeft")).toBe("vivaldi");
+    expect(moveRadioSelection(options, "vivaldi", "ArrowUp")).toBe("edge");
+  });
+
+  it("Home and End jump; with no selection forward lands first and back lands last", () => {
+    expect(moveRadioSelection(options, "vivaldi", "Home")).toBe("edge");
+    expect(moveRadioSelection(options, "edge", "End")).toBe("vivaldi");
+    expect(moveRadioSelection(options, null, "ArrowDown")).toBe("edge");
+    expect(moveRadioSelection(options, null, "ArrowUp")).toBe("vivaldi");
+    expect(moveRadioSelection(options, "chrome", "ArrowDown")).toBe("edge");
+  });
+
+  it("a single option wraps onto itself and nothing selectable gives null", () => {
+    const single: readonly WizardBrowserOption[] = [{ id: "chrome", recommended: true, selectable: true, note: null }];
+    expect(moveRadioSelection(single, "chrome", "ArrowDown")).toBe("chrome");
+    expect(moveRadioSelection(single, "chrome", "ArrowUp")).toBe("chrome");
+    expect(moveRadioSelection([{ id: "chrome", recommended: false, selectable: false, note: "policy-blocked" }], null, "ArrowDown")).toBeNull();
+    expect(moveRadioSelection([], null, "Home")).toBeNull();
+  });
+
+  it("the reducer moves the selection and the focus together", () => {
+    const h = atStepA();
+    const effects = send(h, { type: "radioKey", key: "ArrowDown" });
+    expect(effects).toEqual([{ type: "focusRadio", browser: "chrome" }]);
+    expect(h.state.selectedBrowser).toBe("chrome");
+    const none = atStepA({ browsers: { recommended: null, recommendationReason: "none-installed", entries: [entry("chrome", { policyBlocked: true })] } });
+    expect(send(none, { type: "radioKey", key: "ArrowDown" })).toEqual([]);
+  });
+
+  it("only offers verified, found rows (Edge and Vivaldi are unverified in the table)", () => {
+    expect(wizardBrowserOptions(status()).map((option) => option.id)).toEqual(["chrome"]);
+    expect(wizardBrowserOptions(null)).toEqual([]);
+  });
+});
+
+describe("wizard model: step B", () => {
+  it("nothing is requested until the user presses the button, and the request carries the enum only", () => {
+    const h = atStepB();
+    expect(h.log.filter((effect) => effect.type === "request").map((effect) => (effect as { request: unknown }).request)).toEqual([{ intent: "inspect" }]);
+    const effects = send(h, { type: "register" });
+    expect(requestsOf(effects)).toEqual([{ intent: "setup", browser: "chrome" }]);
+    expect(wizardIsBusy(h.state)).toBe(true);
+  });
+
+  it("maps a successful apply to registered / registered-verified / already-ready / refreshed", () => {
+    const cases: ReadonlyArray<readonly [Partial<Extract<CollectorIntegrationResponse, { kind: "apply" }>>, WizardMessageId]> = [
+      [{ selfCheck: "ok" }, "registered-verified"],
+      [{ selfCheck: "skipped" }, "registered"],
+      [{ outcome: "noop", selfCheck: "skipped" }, "already-ready"],
+      [{ action: "refresh", outcome: "applied" }, "refreshed"],
+    ];
+    for (const [over, id] of cases) {
+      const h = atStepB();
+      send(h, { type: "register" });
+      respond(h, applyResponse(over));
+      expect(wizardMessage(h.state)?.id).toBe(id);
+      expect(wizardMessage(h.state)?.role).toBe("status");
+      expect(action(h, "next").enabled).toBe(true);
+      expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(false);
+    }
+  });
+
+  it("a foreign registration asks first; only 切り替える sends confirmReplaceForeign", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, applyResponse({ outcome: "refused", reason: "foreign-confirmation-required", status: status({ state: "foreign-registration" }) }));
+    expect(wizardMessage(h.state)).toMatchObject({ id: "foreign-confirmation", role: "alert" });
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "やめる", "切り替える"]);
+    // The register button path is closed while the question is open.
+    expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(false);
+    expect(send(h, { type: "register" })).toEqual([]);
+    expect(requestsOf(send(h, { type: "confirmForeign" }))).toEqual([{ intent: "setup", browser: "chrome", confirmReplaceForeign: true }]);
+  });
+
+  it("やめる sends nothing and records that the switch was declined", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, applyResponse({ outcome: "refused", reason: "foreign-confirmation-required", status: status({ state: "foreign-registration" }) }));
+    expect(send(h, { type: "declineForeign" })).toEqual([]);
+    expect(wizardMessage(h.state)?.id).toBe("foreign-declined");
+    expect(isWizardEventAllowed(h.state, { type: "confirmForeign" })).toBe(false);
+    // Without the explicit action there was never a confirm flag in any request.
+    expect(requestsOf(h.log).some((request) => "confirmReplaceForeign" in request)).toBe(false);
+  });
+
+  it("repairs (not sets up) from damaged or registration-missing, without browser flags", () => {
+    for (const state of ["damaged", "registration-missing"] as const) {
+      const h = atStepB({ state });
+      expect(requestsOf(send(h, { type: "register" }))).toEqual([{ intent: "repair" }]);
+    }
+    const h = atStepB({ state: "foreign-registration" });
+    send(h, { type: "register" });
+    respond(h, applyResponse({ outcome: "refused", reason: "foreign-confirmation-required", status: status({ state: "foreign-registration" }) }));
+    expect(requestsOf(send(h, { type: "confirmForeign" }))).toEqual([{ intent: "setup", browser: "chrome", confirmReplaceForeign: true }]);
+  });
+
+  it("every apply reason produces a result, and policy blocks are terminal", () => {
+    const reasons = Object.keys(APPLY_REASON_MESSAGE) as CollectorApplyReason[];
+    expect(reasons.length).toBeGreaterThan(20);
+    for (const reason of reasons) {
+      const h = atStepB();
+      send(h, { type: "register" });
+      respond(h, applyResponse({ outcome: "refused", reason }));
+      const message = wizardMessage(h.state);
+      expect(message, reason).not.toBeNull();
+      expect(WIZARD_MESSAGE_IDS).toContain(message!.id);
+      expect(h.state.inFlight, reason).toBeNull();
+      expect(h.state.step, reason).toBe("B");
+    }
+  });
+
+  it("policy-blocked names the selected browser when it is the blocked one, and offers only 閉じる and 戻る", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, applyResponse({
+      outcome: "refused",
+      reason: "policy-blocked",
+      status: status({ state: "policy-blocked", browsers: { entries: [entry("edge"), entry("chrome", { policyBlocked: true }), entry("vivaldi")] } }),
+    }));
+    expect(wizardMessage(h.state)?.id).toBe("policy-blocked-browser");
+    expect(wizardMessage(h.state)?.copy.headline).toBe("組織の管理設定により、Google Chrome はこの種類の連携プログラムを使えないようになっています。");
+    expect(actionLabels(h)).toEqual(["戻る", "閉じる"]);
+    expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(false);
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
+
+    const generic = atStepB();
+    send(generic, { type: "register" });
+    respond(generic, applyResponse({ outcome: "refused", reason: "policy-blocked" }));
+    expect(wizardMessage(generic.state)?.id).toBe("policy-blocked");
+  });
+
+  it("busy is ignored and the same operation can be retried", () => {
+    for (const response of [{ kind: "busy" } as const, applyResponse({ outcome: "refused", reason: "busy" })]) {
+      const h = atStepB();
+      const first = requestsOf(send(h, { type: "register" }));
+      respond(h, response);
+      expect(wizardMessage(h.state)?.id).toBe("busy");
+      expect(h.state.step).toBe("B");
+      expect(action(h, "register").label).toBe("もう一度試す");
+      expect(requestsOf(send(h, { type: "register" }))).toEqual(first);
+    }
+  });
+
+  it("failed or partial results can be retried; a rejected IPC call too", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, applyResponse({ outcome: "partial", reason: null }));
+    expect(wizardMessage(h.state)?.id).toBe("register-failed");
+    send(h, { type: "register" });
+    send(h, { type: "requestFailed", requestId: h.state.inFlight!.requestId });
+    expect(wizardMessage(h.state)?.id).toBe("request-failed");
+    expect(action(h, "register").enabled).toBe(true);
+  });
+
+  it("a status taken during an apply is not adopted from an apply response", () => {
+    const h = atStepB();
+    const before = h.state.status;
+    send(h, { type: "register" });
+    respond(h, applyResponse({ status: status({ applyInProgress: true, state: "damaged" }) }));
+    expect(h.state.status).toBe(before);
+    expect(wizardMessage(h.state)?.id).toBe("registered-verified");
+  });
+
+  it("browser-required returns to step A with the new facts and writes nothing", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    const effects = respond(h, {
+      kind: "browser-required",
+      status: status({ browsers: { recommended: null, recommendationReason: "none-installed", entries: [entry("chrome", { installed: "not-found" })] } }),
+    });
+    expect(h.state.step).toBe("A");
+    expect(effects.map((effect) => effect.type)).toEqual(["focusHeading", "ticker"]);
+    expect(h.state.selectedBrowser).toBeNull();
+    expect(h.state.proceedWithoutBrowser).toBe(false);
+    expect(actionLabels(h)).toContain("ブラウザーは入っています（このまま続ける）");
+  });
+});
+
+describe("wizard model: one operation at a time", () => {
+  it("ignores operation events while a setup is in flight, and cannot be closed during it", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    const id = h.state.nextRequestId;
+    for (const event of [{ type: "register" }, { type: "next" }, { type: "back" }, { type: "later" }, { type: "escape" }, { type: "confirmForeign" }] as const) {
+      expect(send(h, event), event.type).toEqual([]);
+    }
+    expect(h.state.nextRequestId).toBe(id);
+    expect(h.state.closed).toBeNull();
+    expect(wizardActions(h.state).every((candidate) => !candidate.enabled)).toBe(true);
+  });
+
+  it("a read-only operation in flight blocks other operations but may be walked away from", () => {
+    const h = atStepA();
+    send(h, { type: "recheckBrowsers" });
+    expect(send(h, { type: "recheckBrowsers" })).toEqual([]);
+    expect(send(h, { type: "next" })).toEqual([]);
+    const effects = send(h, { type: "later" });
+    expect(effects).toEqual([{ type: "ticker", active: false, intervalMs: expect.any(Number) }, { type: "close", outcome: "later" }]);
+    expect(h.state.closed).toBe("later");
+  });
+
+  it("a stale or unknown response is ignored", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    const stale = h.state.inFlight!.requestId - 1;
+    const before = h.state;
+    expect(send(h, { type: "response", requestId: stale, response: applyResponse() })).toEqual([]);
+    expect(h.state).toBe(before);
+    expect(send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "cancelled" } })).toEqual([]);
+    expect(send(h, { type: "requestFailed", requestId: 999 })).toEqual([]);
+  });
+
+  it("every response kind is handled for every operation without throwing or leaving a request in flight", () => {
+    const builders: ReadonlyArray<readonly [string, () => Harness]> = [
+      ["inspect", () => { const h = start(); send(h, { type: "opened" }); return h; }],
+      ["recheck", () => { const h = atStepA(); send(h, { type: "recheckBrowsers" }); return h; }],
+      ["setup", () => { const h = atStepB(); send(h, { type: "register" }); return h; }],
+      ["placement", () => { const h = atStepC(); send(h, { type: "confirmDestination" }); send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "cancelled" } }); send(h, { type: "next" }); return h; }],
+      ["open-browser", () => { const h = atStepD(); send(h, { type: "openBrowserExtensions" }); return h; }],
+      ["copy-path", () => { const h = atStepD(); send(h, { type: "copyPath" }); return h; }],
+      ["reveal", () => { const h = atStepD(); send(h, { type: "revealFolder" }); return h; }],
+      ["cancel-remove", () => { const h = atStepBPaused(); send(h, { type: "cancelRemove" }); return h; }],
+      ["poll", () => { const h = atStepE(); return h; }],
+    ];
+    for (const [name, build] of builders) {
+      for (const response of ALL_KINDS_RESPONSES) {
+        const h = build();
+        expect(h.state.inFlight, name).not.toBeNull();
+        expect(() => respond(h, response), `${name} <- ${response.kind}`).not.toThrow();
+        expect(h.state.inFlight, `${name} <- ${response.kind}`).toBeNull();
+        expect(h.state.closed).toBeNull();
+      }
+    }
+  });
+
+  it("classifies all thirteen response kinds", () => {
+    const kinds = new Set(ALL_KINDS_RESPONSES.map((response) => response.kind));
+    expect([...kinds].sort()).toEqual([
+      "apply", "browser-download", "browser-extensions", "browser-required", "busy", "cancel-remove", "cancelled", "connection", "error",
+      "extension-folder", "invalid-request", "status", "unavailable",
+    ]);
+    for (const response of ALL_KINDS_RESPONSES) expect(classifyWizardResponse(response)).toBeDefined();
+  });
+
+  it("an unavailable integration is reported on any step and blocks step B for good", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, { kind: "unavailable", reason: "e2e-isolation" });
+    expect(wizardMessage(h.state)?.id).toBe("unavailable-e2e-isolation");
+    expect(actionLabels(h)).toEqual(["戻る", "閉じる"]);
+  });
+});
+
+describe("wizard model: step C (design 4.4)", () => {
+  const cases: ReadonlyArray<readonly [CollectorSaveDestinationIpcResult, WizardMessageId, readonly string[]]> = [
+    [{ kind: "configured", writesEnabled: true }, "destination-configured", ["戻る", "あとで設定", "次へ"]],
+    [{ kind: "already-configured", writesEnabled: true }, "destination-configured", ["戻る", "あとで設定", "次へ"]],
+    [{ kind: "configured", writesEnabled: false }, "destination-writes-disabled", ["戻る", "あとで設定", "次へ（保存は無効のまま）"]],
+    [{ kind: "already-configured", writesEnabled: false }, "destination-writes-disabled", ["戻る", "あとで設定", "次へ（保存は無効のまま）"]],
+    [{ kind: "cancelled" }, "destination-cancelled", ["戻る", "あとで設定", "もう一度確認する", "次へ"]],
+    [{ kind: "error" }, "destination-error", ["保存先を選び直す", "Collector のセットアップをキャンセル", "もう一度試す"]],
+    [{ kind: "busy" }, "destination-busy", ["保存先を選び直す", "Collector のセットアップをキャンセル", "もう一度試す"]],
+    [{ kind: "not-configured" }, "destination-error", ["保存先を選び直す", "Collector のセットアップをキャンセル", "もう一度試す"]],
+    [{ kind: "cleared" }, "destination-error", ["保存先を選び直す", "Collector のセットアップをキャンセル", "もう一度試す"]],
+  ];
+
+  it("starts with 保存先を確認する and dispatches the existing command once", () => {
+    const h = atStepC();
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "保存先を確認する"]);
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
+    const effects = send(h, { type: "confirmDestination" });
+    expect(effects[0]).toEqual({ type: "configureSaveDestination", requestId: h.state.inFlight!.requestId });
+    expect(send(h, { type: "confirmDestination" })).toEqual([]);
+  });
+
+  for (const [result, id, labels] of cases) {
+    it(`maps ${result.kind}${"writesEnabled" in result ? ` (writes ${result.writesEnabled ? "on" : "off"})` : ""} to ${id}`, () => {
+      const h = atStepC();
+      send(h, { type: "confirmDestination" });
+      send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result });
+      expect(wizardMessage(h.state)?.id).toBe(id);
+      expect(actionLabels(h)).toEqual(labels);
+      expect(wizardDestinationConfigured(h.state)).toBe(id === "destination-configured");
+    });
+  }
+
+  it("an IPC rejection reads as an error and can be retried", () => {
+    const h = atStepC();
+    send(h, { type: "confirmDestination" });
+    send(h, { type: "requestFailed", requestId: h.state.inFlight!.requestId });
+    expect(wizardMessage(h.state)?.id).toBe("destination-error");
+    expect(action(h, "confirmDestination").enabled).toBe(true);
+  });
+
+  it("cancelled lets the user go on, and the step E line then says the destination is not set", () => {
+    const h = atStepC();
+    send(h, { type: "confirmDestination" });
+    send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "cancelled" } });
+    send(h, { type: "next" });
+    expect(h.state.step).toBe("D");
+    expect(wizardDestinationConfigured(h.state)).toBe(false);
+  });
+});
+
+describe("wizard model: step D", () => {
+  it("entering D checks the extension folder, then offers the actions", () => {
+    const h = atStepC();
+    send(h, { type: "confirmDestination" });
+    send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "configured", writesEnabled: true } });
+    const effects = send(h, { type: "next" });
+    expect(requestsOf(effects)).toEqual([{ intent: "inspect" }]);
+    expect(effects.map((effect) => effect.type)).toEqual(["request", "focusHeading", "ticker"]);
+    expect(h.state.placement).toBe("checking");
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定"]);
+    respond(h, statusResponse({ state: "ready", extensionFolderPlaced: true }));
+    expect(h.state.placement).toBe("placed");
+    expect(actionLabels(h)).toEqual([
+      "戻る", "あとで設定", "Google Chrome で拡張機能の画面を開く", "アドレスをコピー", "パスをコピー", "フォルダーを開く", "読み込みました",
+    ]);
+    expect(wizardProgress(h.state)).toBe("手順 4 / 5");
+  });
+
+  it("an unplaced folder shows a message and can be rechecked", () => {
+    const h = atStepD(false);
+    expect(h.state.placement).toBe("missing");
+    expect(wizardMessage(h.state)).toMatchObject({ id: "extension-not-placed", role: "alert" });
+    expect(isWizardEventAllowed(h.state, { type: "loaded" })).toBe(false);
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "もう一度試す"]);
+    send(h, { type: "retryPlacement" });
+    respond(h, statusResponse({ state: "ready", extensionFolderPlaced: true }));
+    expect(h.state.placement).toBe("placed");
+    expect(wizardMessage(h.state)).toBeNull();
+  });
+
+  it("opens the browser by id, copies the address (no path) and asks the main process for the path actions", () => {
+    const h = atStepD();
+    expect(requestsOf(send(h, { type: "openBrowserExtensions" }))).toEqual([{ intent: "openBrowserExtensions", browser: "chrome" }]);
+    respond(h, { kind: "browser-extensions", browser: "chrome", result: "opened" });
+    expect(wizardMessage(h.state)?.id).toBe("browser-opened");
+    send(h, { type: "openBrowserExtensions" });
+    respond(h, { kind: "browser-extensions", browser: "chrome", result: "failed" });
+    expect(wizardMessage(h.state)).toMatchObject({ id: "browser-not-opened", role: "alert" });
+    expect(wizardMessage(h.state)?.copy.detail).toContain("chrome://extensions");
+
+    const copy = send(h, { type: "copyAddress" });
+    expect(copy).toEqual([{ type: "copyText", purpose: "address", text: "chrome://extensions" }]);
+    send(h, { type: "clipboardResult", purpose: "address", ok: true });
+    expect(wizardMessage(h.state)).toMatchObject({ id: "address-copied", role: "status" });
+    send(h, { type: "clipboardResult", purpose: "address", ok: false });
+    expect(wizardMessage(h.state)?.id).toBe("address-copy-failed");
+
+    expect(requestsOf(send(h, { type: "copyPath" }))).toEqual([{ intent: "copyExtensionPath" }]);
+    respond(h, { kind: "extension-folder", intent: "copyExtensionPath", result: "done" });
+    expect(wizardMessage(h.state)?.id).toBe("path-copied");
+    send(h, { type: "copyPath" });
+    respond(h, { kind: "extension-folder", intent: "copyExtensionPath", result: "failed" });
+    expect(wizardMessage(h.state)?.id).toBe("path-copy-failed");
+
+    expect(requestsOf(send(h, { type: "revealFolder" }))).toEqual([{ intent: "revealExtensionFolder" }]);
+    respond(h, { kind: "extension-folder", intent: "revealExtensionFolder", result: "unavailable" });
+    expect(wizardMessage(h.state)?.id).toBe("folder-open-failed");
+    send(h, { type: "revealFolder" });
+    respond(h, { kind: "extension-folder", intent: "revealExtensionFolder", result: "done" });
+    expect(wizardMessage(h.state)).toBeNull();
+
+    // A response of the wrong intent is not taken as success.
+    send(h, { type: "copyPath" });
+    respond(h, { kind: "extension-folder", intent: "revealExtensionFolder", result: "done" });
+    expect(wizardMessage(h.state)?.id).toBe("request-failed");
+  });
+
+  it("with no usable browser (continued without one) only the manual steps are offered", () => {
+    const h = atStepA({ browsers: { recommended: null, recommendationReason: "none-installed", entries: [entry("chrome", { installed: "not-found" })] } });
+    send(h, { type: "continueWithoutBrowser" });
+    send(h, { type: "register" });
+    respond(h, applyResponse());
+    send(h, { type: "next" });
+    send(h, { type: "confirmDestination" });
+    send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "configured", writesEnabled: true } });
+    send(h, { type: "next" });
+    respond(h, statusResponse({ state: "ready", browsers: { recommended: null, recommendationReason: "none-installed", entries: [entry("chrome", { installed: "not-found" })] } }));
+    expect(h.state.placement).toBe("placed");
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "パスをコピー", "フォルダーを開く", "読み込みました"]);
+    expect(isWizardEventAllowed(h.state, { type: "openBrowserExtensions" })).toBe(false);
+    expect(isWizardEventAllowed(h.state, { type: "copyAddress" })).toBe(false);
+    expect(wizardCopy(h.state).stepD.title).toBe("ブラウザー に Collector を読み込む");
+  });
+
+  it("the extension-load policy flag is available to the panel from the entry", () => {
+    const h = atStepD();
+    expect(h.state.status?.browsers.entries.find((candidate) => candidate.id === "chrome")?.extensionLoadMayBeBlocked).toBe(false);
+  });
+
+  it("back and forward keep each step's earlier result", () => {
+    const h = atStepD();
+    send(h, { type: "back" });
+    expect(h.state.step).toBe("C");
+    expect(wizardMessage(h.state)?.id).toBe("destination-configured");
+    send(h, { type: "back" });
+    expect(h.state.step).toBe("B");
+    expect(wizardMessage(h.state)?.id).toBe("registered-verified");
+    send(h, { type: "back" });
+    expect(h.state.step).toBe("A");
+    expect(send(h, { type: "back" })).toEqual([]);
+  });
+});
+
+describe("wizard model: step E connection check (design 4.6)", () => {
+  it("entering E starts the ticker and the first poll, and moves focus to the heading", () => {
+    const h = atStepD();
+    const effects = send(h, { type: "loaded" }, T0 + 5_000);
+    expect(effects.map((effect) => effect.type)).toEqual(["focusHeading", "ticker", "request"]);
+    expect(effects[1]).toMatchObject({ type: "ticker", active: true });
+    expect(requestsOf(effects)).toEqual([{ intent: "checkConnection" }]);
+    expect(h.state.connection).toMatchObject({ phase: "waiting", startedAt: T0 + 5_000, lastPollAt: T0 + 5_000 });
+    expect(wizardProgress(h.state)).toBe("手順 5 / 5");
+    expect(wizardIsBusy(h.state)).toBe(false);
+  });
+
+  it("polls every 2 s, never while a poll is in flight, and never moves focus", () => {
+    const h = atStepD();
+    const start0 = T0;
+    send(h, { type: "loaded" }, start0);
+    respond(h, connection({ state: "waiting" }));
+    expect(send(h, { type: "tick" }, start0 + WIZARD_POLL_INTERVAL_MS - 1)).toEqual([]);
+    const effects = send(h, { type: "tick" }, start0 + WIZARD_POLL_INTERVAL_MS);
+    expect(requestsOf(effects)).toEqual([{ intent: "checkConnection" }]);
+    expect(effects.some((effect) => effect.type === "focusHeading")).toBe(false);
+    // The poll is still in flight: no second request however many ticks come, even past the interval.
+    expect(send(h, { type: "tick" }, start0 + 3 * WIZARD_POLL_INTERVAL_MS)).toEqual([]);
+    respond(h, connection({ state: "waiting" }));
+    // The interval counts from the last request (start0 + 2 s), not from the answer.
+    expect(requestsOf(send(h, { type: "tick" }, start0 + 3 * WIZARD_POLL_INTERVAL_MS))).toEqual([{ intent: "checkConnection" }]);
+    respond(h, connection({ state: "waiting" }));
+    expect(send(h, { type: "tick" }, start0 + 4 * WIZARD_POLL_INTERVAL_MS - 1)).toEqual([]);
+    expect(requestsOf(send(h, { type: "tick" }, start0 + 5 * WIZARD_POLL_INTERVAL_MS))).toEqual([{ intent: "checkConnection" }]);
+  });
+
+  it("times out at exactly 3 minutes and stops the ticker", () => {
+    const h = atStepD();
+    send(h, { type: "loaded" }, T0);
+    respond(h, connection({ state: "waiting" }));
+    const justBefore = send(h, { type: "tick" }, T0 + WIZARD_CONNECTION_TIMEOUT_MS - 1);
+    expect(h.state.connection?.phase).toBe("waiting");
+    expect(justBefore.every((effect) => effect.type === "request")).toBe(true);
+    if (h.state.inFlight !== null) respond(h, connection({ state: "waiting" }));
+    const atTimeout = send(h, { type: "tick" }, T0 + WIZARD_CONNECTION_TIMEOUT_MS);
+    expect(h.state.connection?.phase).toBe("timed-out");
+    expect(atTimeout).toEqual([{ type: "ticker", active: false, intervalMs: expect.any(Number) }]);
+    expect(h.state.inFlight).toBeNull();
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "Collector の「はじめに」画面に「準備ができました」と表示されている", "もう一度待つ"]);
+    // No more requests after the timeout.
+    expect(send(h, { type: "tick" }, T0 + WIZARD_CONNECTION_TIMEOUT_MS + 10_000)).toEqual([]);
+  });
+
+  it("a poll in flight at the timeout is dropped and its late answer ignored", () => {
+    const h = atStepD();
+    send(h, { type: "loaded" }, T0);
+    const requestId = h.state.inFlight!.requestId;
+    send(h, { type: "tick" }, T0 + WIZARD_CONNECTION_TIMEOUT_MS);
+    expect(h.state.connection?.phase).toBe("timed-out");
+    send(h, { type: "response", requestId, response: connection({ state: "connected", extensionVersion: "0.3.0", hostVersion: "0.2.0", contactedAt: "x" }) });
+    expect(h.state.connection?.phase).toBe("timed-out");
+  });
+
+  it("もう一度待つ starts a fresh 3-minute round", () => {
+    const h = atStepD();
+    send(h, { type: "loaded" }, T0);
+    send(h, { type: "tick" }, T0 + WIZARD_CONNECTION_TIMEOUT_MS);
+    const effects = send(h, { type: "waitAgain" }, T0 + WIZARD_CONNECTION_TIMEOUT_MS + 500);
+    expect(effects.map((effect) => effect.type)).toEqual(["ticker", "request"]);
+    expect(h.state.connection).toMatchObject({ phase: "waiting", startedAt: T0 + WIZARD_CONNECTION_TIMEOUT_MS + 500 });
+    send(h, { type: "response", requestId: h.state.inFlight!.requestId, response: connection({ state: "waiting" }) });
+    send(h, { type: "tick" }, T0 + WIZARD_CONNECTION_TIMEOUT_MS + 500 + WIZARD_CONNECTION_TIMEOUT_MS - 1);
+    expect(h.state.connection?.phase).toBe("waiting");
+  });
+
+  it("connected: stops polling, finishes through 完了, shows the done screen and closes as finished", () => {
+    const h = atStepE();
+    const effects = respond(h, connection({ state: "connected", extensionVersion: "0.3.0", hostVersion: "0.2.0", contactedAt: "2026-11-20T00:00:00.000Z" }));
+    expect(effects).toEqual([{ type: "ticker", active: false, intervalMs: expect.any(Number) }]);
+    expect(h.state.connection?.phase).toBe("connected");
+    expect(h.state.verification).toBe("connected");
+    expect(actionLabels(h)).toEqual(["戻る", "完了"]);
+    expect(send(h, { type: "tick" }, T0 + 60_000)).toEqual([]);
+    const finish = send(h, { type: "finish" });
+    expect(finish.map((effect) => effect.type)).toEqual(["focusHeading"]);
+    expect(h.state.step).toBe("done");
+    expect(wizardProgress(h.state)).toBeNull();
+    expect(actionLabels(h)).toEqual(["閉じる"]);
+    expect(send(h, { type: "close" })).toEqual([{ type: "close", outcome: "finished" }]);
+    expect(h.state.closed).toBe("finished");
+  });
+
+  it("extension-version-differs carries both versions, offers re-check, and polling stops until asked", () => {
+    const h = atStepE();
+    respond(h, connection({ state: "extension-version-differs", loadedVersion: "0.3.0", placedVersion: "0.4.0" }));
+    expect(h.state.connection).toMatchObject({ phase: "extension-version-differs", loadedVersion: "0.3.0", placedVersion: "0.4.0" });
+    expect(wizardCopy(h.state).stepE.versionDiffers.headline).toContain("（0.3.0）");
+    expect(wizardCopy(h.state).stepE.versionDiffers.headline).toContain("（0.4.0）");
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "Google Chrome で拡張機能の画面を開く", "もう一度確認"]);
+    expect(send(h, { type: "tick" }, T0 + 30_000)).toEqual([]);
+    const effects = send(h, { type: "recheckConnection" }, T0 + 31_000);
+    expect(effects.map((effect) => effect.type)).toEqual(["ticker", "request"]);
+    expect(h.state.connection?.phase).toBe("waiting");
+  });
+
+  it("protocol-differs ends in 閉じる; unavailable falls back to the explicit user confirmation", () => {
+    const protocol = atStepE();
+    respond(protocol, connection({ state: "protocol-differs" }));
+    expect(actionLabels(protocol)).toEqual(["閉じる"]);
+    expect(send(protocol, { type: "later" })).toEqual([{ type: "close", outcome: "later" }]);
+
+    for (const response of [connection({ state: "unavailable" }), { kind: "unavailable", reason: "startup-failed" } as const]) {
+      const h = atStepE();
+      respond(h, response);
+      expect(h.state.connection?.phase).toBe("unavailable");
+      expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "Collector の「はじめに」画面に「準備ができました」と表示されている"]);
+      send(h, { type: "userConfirmed" });
+      expect(h.state.connection?.phase).toBe("user-confirmed");
+      expect(h.state.verification).toBe("user-confirmed");
+      send(h, { type: "finish" });
+      expect(h.state.verification).toBe("user-confirmed");
+      expect(h.state.step).toBe("done");
+    }
+  });
+
+  it("the user-confirmed fallback is available after a timeout and is never recorded as connected", () => {
+    const h = atStepE();
+    send(h, { type: "tick" }, T0 + 10_000 + WIZARD_CONNECTION_TIMEOUT_MS);
+    expect(h.state.connection?.phase).toBe("timed-out");
+    send(h, { type: "userConfirmed" });
+    expect(h.state.verification).toBe("user-confirmed");
+    expect(wizardCopy(h.state).stepE.userConfirmed.headline).toBe("ご確認ありがとうございます。");
+  });
+
+  it("a status taken while an apply ran is discarded and polled again at the next tick", () => {
+    const h = atStepE();
+    const connected = { state: "connected", extensionVersion: "0.3.0", hostVersion: "0.2.0", contactedAt: "x" } as const;
+    respond(h, connection(connected, true));
+    expect(h.state.connection?.phase).toBe("waiting");
+    expect(h.state.connection?.lastPollAt).toBe(T0 + 10_000);
+    expect(h.state.verification).toBeNull();
+    // Not on the very next tick: the normal interval applies.
+    expect(send(h, { type: "tick" }, T0 + 10_000 + 1_000)).toEqual([]);
+    expect(requestsOf(send(h, { type: "tick" }, T0 + 10_000 + WIZARD_POLL_INTERVAL_MS))).toEqual([{ intent: "checkConnection" }]);
+    respond(h, connection(connected));
+    expect(h.state.connection?.phase).toBe("connected");
+  });
+
+  it("busy, error and a rejected call are transient: keep waiting", () => {
+    const h = atStepE();
+    respond(h, { kind: "busy" });
+    expect(h.state.connection?.phase).toBe("waiting");
+    send(h, { type: "tick" }, T0 + 10_000 + WIZARD_POLL_INTERVAL_MS);
+    send(h, { type: "requestFailed", requestId: h.state.inFlight!.requestId });
+    expect(h.state.connection?.phase).toBe("waiting");
+    expect(h.state.inFlight).toBeNull();
+  });
+
+  it("leaving E (back, later) cancels polling and ignores a late answer", () => {
+    const back = atStepE();
+    const requestId = back.state.inFlight!.requestId;
+    const effects = send(back, { type: "back" });
+    expect(effects).toEqual([{ type: "ticker", active: false, intervalMs: expect.any(Number) }, { type: "focusHeading" }]);
+    expect(back.state.step).toBe("D");
+    expect(back.state.inFlight).toBeNull();
+    send(back, { type: "response", requestId, response: connection({ state: "connected", extensionVersion: "0.3.0", hostVersion: "0.2.0", contactedAt: "x" }) });
+    expect(back.state.connection?.phase).toBe("waiting");
+    expect(send(back, { type: "tick" }, T0 + 99_000)).toEqual([]);
+
+    const later = atStepE();
+    expect(send(later, { type: "later" })).toEqual([{ type: "ticker", active: false, intervalMs: expect.any(Number) }, { type: "close", outcome: "later" }]);
+    expect(send(later, { type: "tick" }, T0 + 99_000)).toEqual([]);
+  });
+
+  it("a user event during a poll in flight is not blocked by the poll", () => {
+    const h = atStepE();
+    expect(h.state.inFlight?.operation).toBe("poll");
+    expect(action(h, "back").enabled).toBe(true);
+    expect(action(h, "later").enabled).toBe(true);
+  });
+
+  it("tolerates a clock that goes backwards", () => {
+    const h = atStepE();
+    respond(h, connection({ state: "waiting" }));
+    expect(send(h, { type: "tick" }, T0)).toEqual([]);
+    expect(h.state.connection?.phase).toBe("waiting");
+  });
+});
+
+describe("wizard model: Esc, close and progress", () => {
+  it("Esc equals あとで設定 on every step A to E and writes nothing", () => {
+    const builders = [atStepA, atStepB, atStepC, atStepD, atStepE];
+    for (const build of builders) {
+      const h = build();
+      const requestsBefore = requestsOf(h.log).length;
+      const effects = send(h, { type: "escape" });
+      expect(effects.at(-1)).toEqual({ type: "close", outcome: "later" });
+      expect(h.state.closed).toBe("later");
+      expect(requestsOf(h.log).length).toBe(requestsBefore);
+      expect(send(h, { type: "register" })).toEqual([]);
+    }
+  });
+
+  it("Esc on the last screen closes as finished", () => {
+    const h = atStepE();
+    respond(h, connection({ state: "connected", extensionVersion: "0.3.0", hostVersion: "0.2.0", contactedAt: "x" }));
+    send(h, { type: "finish" });
+    expect(send(h, { type: "escape" })).toEqual([{ type: "close", outcome: "finished" }]);
+    expect(isWizardEventAllowed(atStepE().state, { type: "close" })).toBe(false);
+  });
+
+  it("progress reads 手順 n / 5 for every step", () => {
+    const labels = [atStepA(), atStepB(), atStepC(), atStepD(), atStepE()].map((h) => wizardProgress(h.state));
+    expect(labels).toEqual(["手順 1 / 5", "手順 2 / 5", "手順 3 / 5", "手順 4 / 5", "手順 5 / 5"]);
+  });
+
+  it("emits focusHeading on each step change", () => {
+    const h = atStepA();
+    expect(send(h, { type: "next" }).map((effect) => effect.type)).toEqual(["focusHeading"]);
+    send(h, { type: "register" });
+    respond(h, applyResponse());
+    expect(send(h, { type: "next" }).map((effect) => effect.type)).toEqual(["focusHeading"]);
+  });
+
+  it("every message id the model can produce has copy and a role", () => {
+    const h = atStepB();
+    for (const id of WIZARD_MESSAGE_IDS) {
+      const state: WizardState = { ...h.state, results: { B: id } };
+      expect(wizardMessage(state)?.copy.headline.length, id).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("wizard model: purity and safety", () => {
+  it("does not mutate its input, and equal input gives equal output", () => {
+    const h = atStepB();
+    const frozen = JSON.parse(JSON.stringify(h.state)) as WizardState;
+    const event = { type: "register", now: T0 } as const;
+    const first = reduceWizard(h.state, event);
+    const second = reduceWizard(h.state, event);
+    expect(first).toEqual(second);
+    expect(JSON.parse(JSON.stringify(h.state))).toEqual(frozen);
+  });
+
+  it("is a pure module: no DOM, Electron, timer or clock", () => {
+    for (const file of ["collector-wizard-model.ts", "collector-wizard-copy.ts"]) {
+      const source = readFileSync(new URL(`./${file}`, import.meta.url), "utf8")
+        .replace(/\/\*[\s\S]*?\*\//gu, "")
+        .replace(/^\s*\/\/.*$/gmu, "");
+      expect(source, file).not.toMatch(/\bDate\b|performance\.now|\bsetTimeout\b|\bsetInterval\b|\bwindow\b|\bdocument\b|navigator|from "electron"|node:fs|require\(/u);
+    }
+  });
+
+  it("holds no path: the state and every effect serialize without a drive path or UNC path", () => {
+    const h = atStepE();
+    respond(h, connection({ state: "connected", extensionVersion: "0.3.0", hostVersion: "0.2.0", contactedAt: "x" }));
+    const dump = JSON.stringify([h.state, h.log]);
+    expect(dump).not.toMatch(/[A-Za-z]:\\\\|\\\\\\\\/u);
+  });
+
+  it("never sends a flag the user did not explicitly choose", () => {
+    const h = atStepE();
+    for (const request of requestsOf(h.log)) {
+      expect(request).not.toHaveProperty("confirmReplaceForeign");
+      expect(request).not.toHaveProperty("proceedWithoutSupportedBrowser");
+    }
+  });
+
+  it("covers every recommendation reason in the selectable/unselectable split", () => {
+    const reasons: readonly CollectorRecommendationReason[] = ["default-supported", "default-unsupported", "default-not-chromium", "default-unverified", "default-not-installed", "default-unknown", "none-installed", "detection-failed"];
+    for (const reason of reasons) {
+      const h = atStepA({ browsers: { recommendationReason: reason } });
+      expect(wizardActions(h.state).length, reason).toBeGreaterThan(0);
+    }
+  });
+});
+
+// ----- review follow-up ---------------------------------------------------------------------------
+
+describe("wizard model: outdated installation while a remove is requested (B-3)", () => {
+  it("does not promise an update at the next start, points to the cancel command, and still lets the user go on", () => {
+    const h = atStepB({ state: "outdated", removeRequested: true });
+    const effects = send(h, { type: "register" });
+    expect(requestsOf(effects)).toEqual([]);
+    expect(wizardMessage(h.state)).toMatchObject({ id: "outdated-remove-paused", role: "status" });
+    const detail = wizardMessage(h.state)?.copy.detail ?? "";
+    expect(detail).not.toContain("次回起動時に自動で更新されます");
+    expect(detail).toContain("「解除を取りやめる」");
+    // 戻る, あとで, the other action, then the primary one (right end).
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "解除を取りやめる", "次へ"]);
+    expect(action(h, "cancelRemove")).toMatchObject({ primary: false, enabled: true, event: { type: "cancelRemove" } });
+    expect(action(h, "next").primary).toBe(true);
+    send(h, { type: "next" });
+    expect(h.state.step).toBe("C");
+  });
+});
+
+describe("wizard model: cancelling an unfinished remove from step B", () => {
+  it("sends exactly the cancelRemove intent (a valid IPC request), keeps the paused screen and blocks everything while it runs", () => {
+    const h = atStepBPaused();
+    const effects = send(h, { type: "cancelRemove" });
+    expect(requestsOf(effects)).toEqual([{ intent: "cancelRemove" }]);
+    expect(h.state.inFlight?.operation).toBe("cancel-remove");
+    // The message and the buttons stay (so the focused button is not replaced); every action is disabled while the request runs.
+    expect(wizardMessage(h.state)?.id).toBe("outdated-remove-paused");
+    expect(wizardIsBusy(h.state)).toBe(true);
+    expect(wizardActions(h.state).every((candidate) => !candidate.enabled)).toBe(true);
+    // The answer must not be lost: leaving is not offered while the cancel runs.
+    const before = h.state;
+    expect(send(h, { type: "cancelRemove" })).toEqual([]);
+    expect(send(h, { type: "next" })).toEqual([]);
+    expect(send(h, { type: "later" })).toEqual([]);
+    expect(send(h, { type: "escape" })).toEqual([]);
+    expect(h.state).toBe(before);
+  });
+
+  it("cleared: says so, states that the update runs at the next start, forgets the request and lets the user go on", () => {
+    const h = atStepBPaused();
+    send(h, { type: "cancelRemove" });
+    const effects = respond(h, { kind: "cancel-remove", result: "cleared" });
+    expect(requestsOf(effects)).toEqual([]);
+    expect(h.state.inFlight).toBeNull();
+    expect(wizardMessage(h.state)).toMatchObject({ id: "remove-cancelled", role: "status" });
+    expect(wizardMessage(h.state)?.copy.headline).toBe("解除を取りやめました。");
+    expect(wizardMessage(h.state)?.copy.detail).toContain("次回起動時に自動で更新されます");
+    expect(h.state.status?.removeRequested).toBe(false);
+    // The button is gone (nothing left to cancel) and 次へ is the primary action.
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "次へ"]);
+    expect(isWizardEventAllowed(h.state, { type: "cancelRemove" })).toBe(false);
+    send(h, { type: "next" });
+    expect(h.state.step).toBe("C");
+    // Back on step B the answer is still the cleared one, not the paused text.
+    send(h, { type: "back" });
+    expect(wizardMessage(h.state)?.id).toBe("remove-cancelled");
+  });
+
+  it("not-requested: nothing was pending any more; still no false claim, and the user may go on", () => {
+    const h = atStepBPaused();
+    send(h, { type: "cancelRemove" });
+    respond(h, { kind: "cancel-remove", result: "not-requested" });
+    expect(wizardMessage(h.state)).toMatchObject({ id: "remove-not-requested", role: "status" });
+    expect(h.state.status?.removeRequested).toBe(false);
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "次へ"]);
+  });
+
+  it("nothing-to-cancel: the integration is already removed, so the screen offers the ordinary registration again", () => {
+    const h = atStepBPaused();
+    send(h, { type: "cancelRemove" });
+    respond(h, { kind: "cancel-remove", result: "nothing-to-cancel" });
+    expect(wizardMessage(h.state)).toMatchObject({ id: "remove-already-done", role: "status" });
+    expect(h.state.status).toMatchObject({ state: "not-set-up", removeRequested: false });
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "連携プログラムを登録する"]);
+    expect(action(h, "register").primary).toBe(true);
+    // Registering now sends a real setup request instead of the "paused" answer.
+    const effects = send(h, { type: "register" });
+    expect(requestsOf(effects)).toMatchObject([{ intent: "setup" }]);
+  });
+
+  it("unchanged: an alert, the request stays, and the same action is offered again as the primary one", () => {
+    const h = atStepBPaused();
+    send(h, { type: "cancelRemove" });
+    respond(h, { kind: "cancel-remove", result: "unchanged" });
+    expect(wizardMessage(h.state)).toMatchObject({ id: "remove-cancel-failed", role: "alert" });
+    expect(h.state.status?.removeRequested).toBe(true);
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "もう一度試す"]);
+    expect(action(h, "cancelRemove")).toMatchObject({ primary: true, enabled: true });
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
+    const effects = send(h, { type: "cancelRemove" });
+    expect(requestsOf(effects)).toEqual([{ intent: "cancelRemove" }]);
+    respond(h, { kind: "cancel-remove", result: "cleared" });
+    expect(wizardMessage(h.state)?.id).toBe("remove-cancelled");
+  });
+
+  it("busy, an error answer and a lost answer are alerts that offer the same cancel again", () => {
+    const answers: ReadonlyArray<readonly [string, (h: Harness) => void, WizardMessageId]> = [
+      ["busy", (h) => { respond(h, { kind: "busy" }); }, "busy"],
+      ["error", (h) => { respond(h, { kind: "error" }); }, "request-failed"],
+      ["lost", (h) => { send(h, { type: "requestFailed", requestId: h.state.inFlight!.requestId }); }, "request-failed"],
+    ];
+    for (const [name, answer, id] of answers) {
+      const h = atStepBPaused();
+      send(h, { type: "cancelRemove" });
+      answer(h);
+      expect(wizardMessage(h.state), name).toMatchObject({ id, role: "alert" });
+      expect(h.state.status?.removeRequested, name).toBe(true);
+      expect(actionLabels(h), name).toEqual(["戻る", "あとで設定", "もう一度試す"]);
+      expect(requestsOf(send(h, { type: "cancelRemove" })), name).toEqual([{ intent: "cancelRemove" }]);
+    }
+  });
+
+  it("an answer of another kind is a failed request, and an unavailable integration ends step B", () => {
+    const h = atStepBPaused();
+    send(h, { type: "cancelRemove" });
+    respond(h, statusResponse());
+    expect(wizardMessage(h.state)?.id).toBe("request-failed");
+    send(h, { type: "cancelRemove" });
+    respond(h, { kind: "unavailable", reason: "e2e-isolation" });
+    expect(wizardMessage(h.state)?.id).toBe("unavailable-e2e-isolation");
+    expect(isWizardEventAllowed(h.state, { type: "cancelRemove" })).toBe(false);
+  });
+
+  it("is not offered anywhere else: other steps, an installation without a remove request, and an unregistered step B", () => {
+    expect(isWizardEventAllowed(atStepA({ state: "outdated", removeRequested: true }).state, { type: "cancelRemove" })).toBe(false);
+    const plain = atStepB({ state: "outdated" });
+    send(plain, { type: "register" });
+    expect(wizardActions(plain.state).map((candidate) => candidate.id)).not.toContain("cancelRemove");
+    expect(isWizardEventAllowed(plain.state, { type: "cancelRemove" })).toBe(false);
+    // Before the register button is pressed nothing says a remove is in the way.
+    const before = atStepB({ state: "outdated", removeRequested: true });
+    expect(isWizardEventAllowed(before.state, { type: "cancelRemove" })).toBe(false);
+    expect(send(before, { type: "cancelRemove" })).toEqual([]);
+    const c = atStepC();
+    expect(isWizardEventAllowed(c.state, { type: "cancelRemove" })).toBe(false);
+  });
+
+  it("the watchdog offers a way out and forgets only the request; the remove request stays", () => {
+    const h = atStepBPaused();
+    send(h, { type: "cancelRemove" }, T0);
+    send(h, { type: "tick" }, T0 + WIZARD_INFLIGHT_CANCEL_MS);
+    expect(action(h, "cancelInFlight").enabled).toBe(true);
+    send(h, { type: "cancelInFlight" });
+    expect(h.state.inFlight).toBeNull();
+    expect(wizardMessage(h.state)?.id).toBe("outdated-remove-paused");
+    expect(h.state.status?.removeRequested).toBe(true);
+  });
+});
+
+describe("wizard model: outdated installation (no refresh intent for the renderer)", () => {
+  it("sends no request on register, shows outdated-pending and lets the user go on", () => {
+    const h = atStepB({ state: "outdated" });
+    const requestsBefore = requestsOf(h.log).length;
+    const effects = send(h, { type: "register" });
+    expect(requestsOf(effects)).toEqual([]);
+    expect(h.state.inFlight).toBeNull();
+    expect(requestsOf(h.log).length).toBe(requestsBefore);
+    expect(wizardMessage(h.state)).toMatchObject({ id: "outdated-pending", role: "status" });
+    expect(wizardMessage(h.state)?.copy.detail).toContain("次回起動時に自動で更新されます");
+    expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(false);
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "次へ"]);
+    send(h, { type: "next" });
+    expect(h.state.step).toBe("C");
+  });
+});
+
+describe("wizard model: failed self-check has no self-check-only retry", () => {
+  function afterSelfCheckFailure(): Harness {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, applyResponse({ outcome: "failed", reason: "self-check-failed", selfCheck: "failed", status: status({ state: "damaged" }) }));
+    return h;
+  }
+
+  it("tells the user to close and re-open the wizard, and offers only 戻る and 閉じる", () => {
+    const h = afterSelfCheckFailure();
+    expect(wizardMessage(h.state)?.id).toBe("self-check-failed");
+    expect(wizardMessage(h.state)?.copy.detail).toContain("ウィザードをいったん閉じて開き直してください");
+    expect(actionLabels(h)).toEqual(["戻る", "閉じる"]);
+    expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(false);
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
+  });
+
+  it("an unsafe program folder is terminal: only 戻る and あとで設定", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, applyResponse({ outcome: "refused", reason: "program-folder-unsafe" }));
+    expect(wizardMessage(h.state)?.id).toBe("folder-unsafe");
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定"]);
+    expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(false);
+  });
+});
+
+describe("wizard model: step C failure screens and the in-flight watchdog", () => {
+  const MS = WIZARD_INFLIGHT_CANCEL_MS;
+
+  it("destination-error / destination-busy: exactly retry, re-pick and cancel; cancel closes without a request", () => {
+    for (const kind of ["error", "busy"] as const) {
+      const h = atStepC();
+      send(h, { type: "confirmDestination" });
+      send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind } });
+      expect(wizardActions(h.state).map((a) => [a.id, a.label, a.enabled])).toEqual([
+        ["chooseDestinationAgain", "保存先を選び直す", true],
+        ["cancelSetup", "Collector のセットアップをキャンセル", true],
+        ["confirmDestination", "もう一度試す", true],
+      ]);
+      const again = send(h, { type: "chooseDestinationAgain" });
+      expect(again[0]).toEqual({ type: "configureSaveDestination", requestId: h.state.inFlight!.requestId });
+      send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind } });
+      const cancel = send(h, { type: "later" });
+      expect(cancel.map((e) => e.type)).toEqual(["close"]);
+      expect(h.state.closed).toBe("later");
+    }
+  });
+
+  it("chooseDestinationAgain is not allowed outside the two failure results", () => {
+    const h = atStepC();
+    expect(isWizardEventAllowed(h.state, { type: "chooseDestinationAgain" })).toBe(false);
+  });
+
+  it("the watchdog is not offered before 180 s and is offered from 180 s (timestamps)", () => {
+    const h = atStepB();
+    send(h, { type: "register" }, T0);
+    expect(send(h, { type: "tick" }, T0 + MS - 1)).toEqual([]);
+    expect(wizardActions(h.state).some((a) => a.id === "cancelInFlight")).toBe(false);
+    expect(wizardInFlightNotice(h.state)).toBeNull();
+    expect(isWizardEventAllowed(h.state, { type: "cancelInFlight" })).toBe(false);
+    send(h, { type: "tick" }, T0 + MS);
+    const cancel = wizardActions(h.state).find((a) => a.id === "cancelInFlight");
+    expect(cancel).toMatchObject({ label: "キャンセル", enabled: true, event: { type: "cancelInFlight" } });
+    expect(wizardInFlightNotice(h.state)).toMatchObject({ id: "inflight-slow", role: "alert" });
+  });
+
+  it("the ticker runs while a blocking request is in flight and stops afterwards", () => {
+    const h = atStepB();
+    const issued = send(h, { type: "register" }, T0);
+    expect(issued.map((e) => e.type)).toEqual(["request", "ticker"]);
+    expect(issued[1]).toMatchObject({ active: true });
+    const answered = respond(h, applyResponse());
+    expect(answered.at(-1)).toMatchObject({ type: "ticker", active: false });
+  });
+
+  it("a clock jump counts as elapsed wall time", () => {
+    const h = atStepB();
+    send(h, { type: "register" }, T0);
+    send(h, { type: "tick" }, T0 + 5_000);
+    expect(isWizardEventAllowed(h.state, { type: "cancelInFlight" })).toBe(false);
+    send(h, { type: "tick" }, T0 + 60 * 60_000); // sleep or minimise: the next tick comes an hour later
+    expect(isWizardEventAllowed(h.state, { type: "cancelInFlight" })).toBe(true);
+    send(h, { type: "tick" }, T0); // clock moved back: still offered
+    expect(isWizardEventAllowed(h.state, { type: "cancelInFlight" })).toBe(true);
+  });
+
+  it("cancel clears the request and a late response is discarded without changing state", () => {
+    const h = atStepB();
+    send(h, { type: "register" }, T0);
+    const requestId = h.state.inFlight!.requestId;
+    send(h, { type: "tick" }, T0 + MS);
+    const effects = send(h, { type: "cancelInFlight" });
+    expect(effects).toEqual([{ type: "ticker", active: false, intervalMs: expect.any(Number) }]);
+    expect(h.state.inFlight).toBeNull();
+    expect(h.state.results.B).toBeUndefined();
+    const after = h.state;
+    expect(send(h, { type: "response", requestId, response: applyResponse() })).toEqual([]);
+    expect(send(h, { type: "requestFailed", requestId })).toEqual([]);
+    expect(h.state).toBe(after);
+    expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(true);
+  });
+
+  it("cancel of the destination picker discards a late destinationResult and requestFailed", () => {
+    const h = atStepC();
+    send(h, { type: "confirmDestination" }, T0);
+    const requestId = h.state.inFlight!.requestId;
+    send(h, { type: "tick" }, T0 + MS);
+    send(h, { type: "cancelInFlight" });
+    const after = h.state;
+    expect(send(h, { type: "destinationResult", requestId, result: { kind: "configured", writesEnabled: true } })).toEqual([]);
+    expect(send(h, { type: "requestFailed", requestId })).toEqual([]);
+    expect(h.state).toBe(after);
+    expect(h.state.results.C).toBeUndefined();
+  });
+
+  it("cancel of a placement check leaves a retryable step D", () => {
+    const h = atStepC();
+    send(h, { type: "confirmDestination" });
+    send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "cancelled" } });
+    send(h, { type: "next" }, T0);
+    send(h, { type: "tick" }, T0 + MS);
+    send(h, { type: "cancelInFlight" });
+    expect(h.state.placement).toBe("unknown");
+    expect(wizardActions(h.state).some((a) => a.id === "retryPlacement" && a.enabled)).toBe(true);
+  });
+
+  it("the connection-check poll has no watchdog", () => {
+    const h = atStepD();
+    send(h, { type: "loaded" }, T0);
+    expect(h.state.inFlight?.operation).toBe("poll");
+    send(h, { type: "tick" }, T0 + WIZARD_CONNECTION_TIMEOUT_MS - 1);
+    expect(h.state.inFlight?.cancelOffered ?? false).toBe(false);
+    expect(wizardInFlightNotice(h.state)).toBeNull();
+    expect(wizardActions(h.state).some((a) => a.id === "cancelInFlight")).toBe(false);
+    expect(isWizardEventAllowed(h.state, { type: "cancelInFlight" })).toBe(false);
+  });
+});
+
+describe("wizard model: step A when browsers are blocked by policy", () => {
+  const chromeBlocked = { browsers: { recommended: null, recommendationReason: "none-installed" as const, entries: [entry("edge"), entry("chrome", { policyBlocked: true }), entry("vivaldi")] } };
+
+  it("Chrome found but blocked: a dedicated message, only もう一度確認 and あとで設定", () => {
+    const h = atStepA(chromeBlocked);
+    const view = wizardAView(h.state);
+    expect(view.allBlocked).toBe(true);
+    expect(view.notice?.copy.headline).toBe("組織の管理設定により、Google Chrome はこの種類の連携プログラムを使えないようになっています。");
+    expect(view.notice?.role).toBe("alert");
+    expect(view.reasonCopy).toBeNull();
+    expect(actionLabels(h)).toEqual(["あとで設定", "もう一度確認"]);
+    for (const event of [{ type: "next" }, { type: "continueWithoutBrowser" }, { type: "openDownloadPage", browser: "chrome" }] as const) {
+      expect(isWizardEventAllowed(h.state, event), event.type).toBe(false);
+    }
+    expect(view.options).toEqual([expect.objectContaining({ id: "chrome", selectable: false, noteText: "組織の管理設定により使えません" })]);
+  });
+
+  it("the aggregate policy-blocked state alone is enough (browsers not found)", () => {
+    const h = atStepA({ state: "policy-blocked", browsers: { recommended: null, recommendationReason: "none-installed", entries: [entry("chrome", { installed: "not-found" })] } });
+    expect(wizardAView(h.state).allBlocked).toBe(true);
+    expect(wizardAView(h.state).notice?.copy.headline).toContain("ブラウザー はこの種類");
+    expect(actionLabels(h)).toEqual(["あとで設定", "もう一度確認"]);
+  });
+
+  it("an unverified browser that is blocked does not block the usable one", () => {
+    const h = atStepA({ browsers: { entries: [entry("edge", { policyBlocked: true }), entry("chrome"), entry("vivaldi")] } });
+    expect(wizardAView(h.state).allBlocked).toBe(false);
+    expect(actionLabels(h)).toEqual(["あとで設定", "次へ"]);
+  });
+
+  it("not blocked and nothing installed keeps the download and continue buttons", () => {
+    const h = atStepA({ browsers: { recommended: null, recommendationReason: "none-installed", entries: [entry("chrome", { installed: "not-found" })] } });
+    expect(wizardAView(h.state).allBlocked).toBe(false);
+    expect(actionLabels(h)).toContain("ブラウザーは入っています（このまま続ける）");
+  });
+});
+
+describe("wizard model: the first inspection keeps its specific failure", () => {
+  it("unavailable reasons are terminal: shown as such, no recheck button", () => {
+    for (const [reason, id] of [["e2e-isolation", "unavailable-e2e-isolation"], ["payload-unavailable", "unavailable-payload-unavailable"], ["startup-failed", "unavailable-startup-failed"]] as const) {
+      const h = start();
+      send(h, { type: "opened" });
+      respond(h, { kind: "unavailable", reason });
+      expect(h.state.statusLoad).toBe("failed");
+      expect(wizardMessage(h.state)?.id).toBe(id);
+      expect(actionLabels(h)).toEqual(["あとで設定"]);
+      expect(isWizardEventAllowed(h.state, { type: "recheckBrowsers" })).toBe(false);
+    }
+  });
+
+  it("busy keeps the busy wording and a retry; a generic failure reads inspect-failed", () => {
+    const h = start();
+    send(h, { type: "opened" });
+    respond(h, { kind: "busy" });
+    expect(wizardMessage(h.state)?.id).toBe("busy");
+    expect(actionLabels(h)).toEqual(["あとで設定", "もう一度確認"]);
+    send(h, { type: "recheckBrowsers" });
+    respond(h, { kind: "error" });
+    expect(wizardMessage(h.state)?.id).toBe("inspect-failed");
+  });
+});
+
+describe("wizard model: step E shows the result of opening the browser", () => {
+  it("a failed launch on a version mismatch is visible in the message and the connection view", () => {
+    const h = atStepE();
+    respond(h, connection({ state: "extension-version-differs", loadedVersion: "0.3.0", placedVersion: "0.4.0" }));
+    send(h, { type: "openBrowserExtensions" });
+    respond(h, { kind: "browser-extensions", browser: "chrome", result: "failed" });
+    expect(wizardMessage(h.state)).toMatchObject({ id: "browser-not-opened", role: "alert" });
+    expect(wizardMessage(h.state)?.copy.detail).toContain("chrome://extensions");
+    expect(wizardConnectionView(h.state)?.launchMessage?.id).toBe("browser-not-opened");
+  });
+
+  it("a stale step D result is not carried into step E", () => {
+    const h = atStepD();
+    send(h, { type: "copyPath" });
+    respond(h, { kind: "extension-folder", intent: "copyExtensionPath", result: "done" });
+    expect(wizardMessage(h.state)?.id).toBe("path-copied");
+    send(h, { type: "loaded" }, T0 + 1);
+    expect(wizardMessage(h.state)).toBeNull();
+  });
+});
+
+describe("wizard model: unknown values degrade instead of sticking", () => {
+  const cast = (value: unknown) => value as CollectorIntegrationResponse;
+
+  it("an unknown response kind clears the request and shows a retryable error", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, cast({ kind: "from-the-future" }));
+    expect(h.state.inFlight).toBeNull();
+    expect(wizardMessage(h.state)?.id).toBe("request-failed");
+    expect(isWizardEventAllowed(h.state, { type: "register" })).toBe(true);
+    expect(isWizardEventAllowed(h.state, { type: "later" })).toBe(true);
+  });
+
+  it("an unknown unavailable reason never puts undefined into the results", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, cast({ kind: "unavailable", reason: "new-reason" }));
+    expect(h.state.results.B).toBe("request-failed");
+    expect(h.state.inFlight).toBeNull();
+  });
+
+  it("an unknown apply reason reads as a generic failure", () => {
+    const h = atStepB();
+    send(h, { type: "register" });
+    respond(h, cast({ ...(applyResponse({ outcome: "refused" }) as object), reason: "brand-new" }));
+    expect(wizardMessage(h.state)?.id).toBe("register-failed");
+  });
+
+  it("an unknown destination result reads as an error", () => {
+    const h = atStepC();
+    send(h, { type: "confirmDestination" });
+    send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "mystery" } as unknown as CollectorSaveDestinationIpcResult });
+    expect(wizardMessage(h.state)?.id).toBe("destination-error");
+    expect(h.state.inFlight).toBeNull();
+  });
+
+  it("an unknown connection state is treated as transient and an unknown kind on the first inspect is retryable", () => {
+    const h = atStepE();
+    respond(h, cast({ kind: "connection", state: "ready", applyInProgress: false, connection: { state: "novel" } }));
+    expect(h.state.connection?.phase).toBe("waiting");
+    expect(h.state.inFlight).toBeNull();
+    const first = start();
+    send(first, { type: "opened" });
+    respond(first, cast({ kind: "novel" }));
+    expect(wizardMessage(first.state)?.id).toBe("inspect-failed");
+    expect(send(first, { type: "later" })).toEqual([{ type: "close", outcome: "later" }]);
+  });
+});
+
+describe("wizard model: completion, clock and address safety", () => {
+  it("after the connection is confirmed, later and Esc are refused; the way out is 完了 then 閉じる", () => {
+    for (const how of ["connected", "user-confirmed"] as const) {
+      const h = atStepE();
+      if (how === "connected") respond(h, connection({ state: "connected", extensionVersion: "0.3.0", hostVersion: "0.2.0", contactedAt: "x" }));
+      else { send(h, { type: "tick" }, T0 + 10_000 + WIZARD_CONNECTION_TIMEOUT_MS); send(h, { type: "userConfirmed" }); }
+      expect(send(h, { type: "later" })).toEqual([]);
+      expect(send(h, { type: "escape" })).toEqual([]);
+      expect(h.state.closed).toBeNull();
+      send(h, { type: "finish" });
+      expect(send(h, { type: "close" })).toEqual([{ type: "close", outcome: "finished" }]);
+    }
+  });
+
+  it("ignores a non-finite clock value instead of polling on every tick", () => {
+    const h = atStepE();
+    respond(h, connection({ state: "waiting" }));
+    const before = h.state;
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, undefined as unknown as number]) {
+      const reduction = reduceWizard(h.state, { type: "tick", now: bad });
+      expect(reduction.effects).toEqual([]);
+      expect(reduction.state).toBe(before);
+    }
+    expect(reduceWizard(initialWizardState(), { type: "opened", now: Number.NaN }).effects).toEqual([]);
+  });
+
+  it("the copied address is the table constant, not the IPC value", () => {
+    const h = atStepA({ browsers: { entries: [entry("edge"), entry("chrome", { extensionsAddress: "https://evil.example/" }), entry("vivaldi")] } });
+    send(h, { type: "next" });
+    send(h, { type: "register" });
+    respond(h, applyResponse());
+    send(h, { type: "next" });
+    send(h, { type: "confirmDestination" });
+    send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "configured", writesEnabled: true } });
+    send(h, { type: "next" });
+    respond(h, statusResponse({ state: "ready", browsers: { entries: [entry("edge"), entry("chrome", { extensionsAddress: "https://evil.example/" }), entry("vivaldi")] } }));
+    expect(send(h, { type: "copyAddress" })).toEqual([{ type: "copyText", purpose: "address", text: "chrome://extensions" }]);
+  });
+
+  it("an incomplete folder check is not reported as 'not placed'", () => {
+    const h = atStepC();
+    send(h, { type: "confirmDestination" });
+    send(h, { type: "destinationResult", requestId: h.state.inFlight!.requestId, result: { kind: "cancelled" } });
+    send(h, { type: "next" });
+    respond(h, statusResponse({ inspectionComplete: false, extensionFolderPlaced: false }));
+    expect(wizardMessage(h.state)).toMatchObject({ id: "check-incomplete", role: "alert" });
+    expect(h.state.placement).toBe("unknown");
+    expect(actionLabels(h)).toEqual(["戻る", "あとで設定", "もう一度試す"]);
+  });
+
+  it("the not-placed message explains that 戻る goes one step at a time", () => {
+    const h = atStepD(false);
+    expect(wizardMessage(h.state)?.copy.detail).toContain("1 つずつ");
+  });
+});
+
+describe("wizard model: views for the panel", () => {
+  it("step A view: names, recommended suffix, previously-chosen only when it differs", () => {
+    const h = atStepA();
+    const view = wizardAView(h.state);
+    expect(view.options).toEqual([expect.objectContaining({ id: "chrome", displayName: "Google Chrome", label: "Chrome で登録 — おすすめ", selected: true, selectable: true })]);
+    expect(view.reason).toBe("default-supported");
+    expect(view.reasonCopy?.lead).toBe("ふだんお使いのブラウザー（Google Chrome）で使えます。");
+    expect(view.previouslyChosen).toBeNull();
+    const verifiedEdge = { entries: [entry("edge", { verification: "verified" }), entry("chrome"), entry("vivaldi")] };
+    const differs = atStepA({ browsers: { ...verifiedEdge, preferred: "edge" } });
+    expect(wizardAView(differs.state).previouslyChosen).toBe("前回は Microsoft Edge を選びました。");
+    expect(wizardAView(atStepA({ browsers: { preferred: "chrome" } }).state).previouslyChosen).toBeNull();
+    expect(wizardAView(start().state)).toMatchObject({ loading: true, reasonCopy: null, options: [] });
+  });
+
+  it("step D view: policy warning flag, address note position, drag text", () => {
+    const h = atStepD();
+    const view = wizardStepDView(h.state);
+    expect(view.addressNoteAfterStep).toBe(1);
+    expect(view.showPolicyWarning).toBe(false);
+    expect(view.alternative).toContain("ドラッグ");
+    expect(view.steps).toHaveLength(5);
+    const blocked = atStepA({ browsers: { entries: [entry("edge"), entry("chrome", { extensionLoadMayBeBlocked: true }), entry("vivaldi")] } });
+    expect(wizardStepDView(blocked.state).showPolicyWarning).toBe(true);
+  });
+
+  it("step E view: role per phase, destination line, checklist, how-to-open only while waiting", () => {
+    const h = atStepE();
+    expect(wizardConnectionView(h.state)).toMatchObject({ phase: "waiting", role: "status", howToOpen: expect.objectContaining({ summary: expect.any(String) }) });
+    respond(h, connection({ state: "connected", extensionVersion: "0.3.0", hostVersion: "0.2.0", contactedAt: "x" }));
+    expect(wizardConnectionView(h.state)).toMatchObject({ phase: "connected", role: "status", destinationLine: "保存先：設定済み", howToOpen: null });
+    expect(wizardDoneViewOf(h)).toMatchObject({ verified: true, title: "MAGINALIA Collector の準備ができました。" });
+
+    const timeout = atStepE();
+    send(timeout, { type: "tick" }, T0 + 10_000 + WIZARD_CONNECTION_TIMEOUT_MS);
+    const timedOut = wizardConnectionView(timeout.state);
+    expect(timedOut).toMatchObject({ phase: "timed-out", role: "alert" });
+    expect(timedOut?.checklist).toHaveLength(3);
+    send(timeout, { type: "userConfirmed" });
+    send(timeout, { type: "finish" });
+    expect(wizardDoneViewOf(timeout)).toMatchObject({ verified: false, title: "Collector の設定を終了しました。" });
+
+    for (const [summary, phase] of [[{ state: "protocol-differs" }, "protocol-differs"], [{ state: "unavailable" }, "unavailable"], [{ state: "extension-version-differs", loadedVersion: "0.3.0", placedVersion: null }, "extension-version-differs"]] as const) {
+      const other = atStepE();
+      respond(other, connection(summary));
+      expect(wizardConnectionView(other.state)).toMatchObject({ phase, role: "alert" });
+    }
+    expect(wizardConnectionView(atStepB().state)).toBeNull();
+  });
+});
+
+function wizardDoneViewOf(h: Harness) {
+  return wizardDoneView(h.state);
+}
+
+// ----- step A choices (owner decision 2026-11-23): the real table, Vivaldi verified ---------------------
+
+type DefaultKind = CollectorIntegrationStatus["browsers"]["defaultBrowser"];
+type Installed = "found" | "not-found" | "unknown";
+
+/**
+ * A status as the main process would build it from the product table: every row verified, the
+ * recommendation computed by the real `recommendCollectorBrowser` from the default browser and what
+ * was found. `installed` lists the rows that exist; the rest are `not-found`.
+ */
+function realStatus(defaultBrowser: DefaultKind, installed: Partial<Record<CollectorBrowserId, Installed>>, blocked: readonly CollectorBrowserId[] = []): StatusOverrides {
+  const detections = Object.fromEntries(COLLECTOR_BROWSER_IDS.map((id) => [id, { installed: installed[id] ?? "not-found", policyBlocked: blocked.includes(id) }]));
+  const recommendation = recommendCollectorBrowser({ defaultBrowser, detections });
+  return {
+    browsers: {
+      defaultBrowser,
+      recommended: recommendation.recommended,
+      recommendationReason: recommendation.reason,
+      preferred: null,
+      entries: COLLECTOR_BROWSER_IDS.map((id) => entry(id, { verification: "verified", installed: installed[id] ?? "not-found", policyBlocked: blocked.includes(id) })),
+    },
+  };
+}
+
+const ALL_FOUND = { edge: "found", chrome: "found", vivaldi: "found" } as const;
+
+describe("wizard model: step A choices (通常のブラウザー / Chrome / Edge)", () => {
+  /** [name, default browser, installed, option labels in order, recommended option, reason] */
+  const cases: ReadonlyArray<readonly [string, DefaultKind, Partial<Record<CollectorBrowserId, Installed>>, readonly string[], CollectorBrowserId | null, CollectorRecommendationReason]> = [
+    ["default Chrome: no 通常 choice (it would repeat Chrome), Chrome recommended", "chrome", ALL_FOUND, ["Chrome で登録 — おすすめ", "Edge で登録"], "chrome", "default-supported"],
+    ["default Edge: no 通常 choice, Edge recommended", "edge", ALL_FOUND, ["Chrome で登録", "Edge で登録 — おすすめ"], "edge", "default-supported"],
+    ["default Vivaldi: 通常 first, named Vivaldi, recommended", "vivaldi", ALL_FOUND, ["通常のブラウザーで登録（Vivaldi） — おすすめ", "Chrome で登録", "Edge で登録"], "vivaldi", "default-supported"],
+    ["default Vivaldi, only Vivaldi installed", "vivaldi", { vivaldi: "found" }, ["通常のブラウザーで登録（Vivaldi） — おすすめ"], "vivaldi", "default-supported"],
+    ["default Vivaldi that is not installed: no 通常 choice, nothing recommended", "vivaldi", { edge: "found", chrome: "found" }, ["Chrome で登録", "Edge で登録"], null, "default-not-installed"],
+    ["default Brave (unverified Chromium): Chrome and Edge only, nothing recommended", "other-chromium", ALL_FOUND, ["Chrome で登録", "Edge で登録"], null, "default-unverified"],
+    ["default Firefox (not Chromium): Chrome and Edge only, nothing recommended", "other", ALL_FOUND, ["Chrome で登録", "Edge で登録"], null, "default-not-chromium"],
+    ["default unknown: Chrome and Edge only, nothing recommended", "unknown", ALL_FOUND, ["Chrome で登録", "Edge で登録"], null, "default-unknown"],
+    ["default Chrome that is not installed, Edge is: Edge listed, not recommended", "chrome", { edge: "found" }, ["Edge で登録"], null, "default-not-installed"],
+    ["default Edge, Chrome missing: only Edge, recommended", "edge", { edge: "found" }, ["Edge で登録 — おすすめ"], "edge", "default-supported"],
+    ["default Firefox, only Chrome installed: Chrome, not recommended", "other", { chrome: "found" }, ["Chrome で登録"], null, "default-not-chromium"],
+  ];
+
+  for (const [name, defaultBrowser, installed, labels, recommended, reason] of cases) {
+    it(name, () => {
+      const h = atStepA(realStatus(defaultBrowser, installed));
+      const view = wizardAView(h.state);
+      expect(view.options.map((option) => option.label)).toEqual(labels);
+      expect(view.options.filter((option) => option.recommended).map((option) => option.id)).toEqual(recommended === null ? [] : [recommended]);
+      expect(view.reason).toBe(reason);
+      // Only the recommended (the default) browser is selected up front; otherwise nothing is.
+      expect(h.state.selectedBrowser).toBe(recommended);
+      expect(view.options.filter((option) => option.selected).map((option) => option.id)).toEqual(recommended === null ? [] : [recommended]);
+      // 次へ needs a selection.
+      expect(action(h, "next").enabled).toBe(recommended !== null);
+    });
+  }
+
+  it("a browser is never listed twice (the 通常 choice exists only for a verified default that is neither Chrome nor Edge)", () => {
+    for (const defaultBrowser of ["chrome", "edge", "vivaldi", "other", "other-chromium", "unknown"] as const) {
+      const ids = wizardBrowserOptions(status(realStatus(defaultBrowser, ALL_FOUND))).map((option) => option.id);
+      expect(new Set(ids).size, defaultBrowser).toBe(ids.length);
+    }
+    expect(wizardBrowserOptions(status(realStatus("chrome", ALL_FOUND))).map((option) => option.id)).toEqual(["chrome", "edge"]);
+    expect(wizardBrowserOptions(status(realStatus("vivaldi", ALL_FOUND))).map((option) => option.id)).toEqual(["vivaldi", "chrome", "edge"]);
+  });
+
+  it("the order is 通常, Chrome, Edge, not the table order (edge, chrome, vivaldi)", () => {
+    expect(wizardBrowserOptions(status(realStatus("vivaldi", ALL_FOUND))).map((option) => option.id)).toEqual(["vivaldi", "chrome", "edge"]);
+    expect(wizardBrowserOptions(status(realStatus("other", ALL_FOUND))).map((option) => option.id)).toEqual(["chrome", "edge"]);
+  });
+
+  it("an unselected recommendation-free screen can pick any listed browser and then go on with exactly that browser", () => {
+    const h = atStepA(realStatus("other", ALL_FOUND));
+    expect(h.state.selectedBrowser).toBeNull();
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
+    send(h, { type: "selectBrowser", browser: "edge" });
+    expect(h.state.selectedBrowser).toBe("edge");
+    send(h, { type: "next" });
+    expect(requestsOf(send(h, { type: "register" }))).toEqual([{ intent: "setup", browser: "edge" }]);
+  });
+
+  it("Vivaldi is selectable only while it is the 通常 choice (a non-default Vivaldi is not offered)", () => {
+    const h = atStepA(realStatus("other", ALL_FOUND));
+    expect(isWizardEventAllowed(h.state, { type: "selectBrowser", browser: "vivaldi" })).toBe(false);
+    expect(send(h, { type: "selectBrowser", browser: "vivaldi" })).toEqual([]);
+    const asDefault = atStepA(realStatus("vivaldi", ALL_FOUND));
+    expect(isWizardEventAllowed(asDefault.state, { type: "selectBrowser", browser: "vivaldi" })).toBe(true);
+  });
+
+  it("the previous choice does not preselect anything; it is only mentioned when it differs from the recommendation", () => {
+    const base = realStatus("other", ALL_FOUND);
+    const remembered = atStepA({ browsers: { ...base.browsers, preferred: "edge" } });
+    expect(remembered.state.selectedBrowser).toBeNull();
+    expect(wizardAView(remembered.state).previouslyChosen).toBe("前回は Microsoft Edge を選びました。");
+    const same = atStepA({ browsers: { ...realStatus("edge", ALL_FOUND).browsers, preferred: "edge" } });
+    expect(same.state.selectedBrowser).toBe("edge");
+    expect(wizardAView(same.state).previouslyChosen).toBeNull();
+  });
+
+  it("arrow keys walk 通常, Chrome, Edge and wrap", () => {
+    const h = atStepA(realStatus("vivaldi", ALL_FOUND));
+    expect(h.state.selectedBrowser).toBe("vivaldi");
+    expect(send(h, { type: "radioKey", key: "ArrowDown" })).toEqual([{ type: "focusRadio", browser: "chrome" }]);
+    expect(send(h, { type: "radioKey", key: "ArrowDown" })).toEqual([{ type: "focusRadio", browser: "edge" }]);
+    expect(send(h, { type: "radioKey", key: "ArrowDown" })).toEqual([{ type: "focusRadio", browser: "vivaldi" }]);
+  });
+
+  it("organization policy and unreadable detection keep their notes on Chrome and Edge", () => {
+    // Chrome blocked: Vivaldi reads the Chrome key, which setup then does not write, so it is not offered as usable.
+    const blocked = atStepA(realStatus("vivaldi", ALL_FOUND, ["chrome"]));
+    const view = wizardAView(blocked.state);
+    expect(view.options.map((option) => [option.label, option.selectable, option.noteText])).toEqual([
+      ["通常のブラウザーで登録（Vivaldi）", false, "このブラウザーが使う登録先が、組織の管理設定により使えません"],
+      ["Chrome で登録", false, "組織の管理設定により使えません"],
+      ["Edge で登録", true, null],
+    ]);
+    expect(view.options.some((option) => option.recommended)).toBe(false);
+    expect(view.reason).toBe("default-unsupported");
+    expect(blocked.state.selectedBrowser).toBeNull();
+    const failed = atStepA(realStatus("vivaldi", { edge: "unknown", chrome: "unknown", vivaldi: "unknown" }));
+    expect(wizardAView(failed.state).reason).toBe("detection-failed");
+    expect(wizardAView(failed.state).options.map((option) => [option.label, option.noteText])).toEqual([
+      ["通常のブラウザーで登録（Vivaldi）", "確認できませんでした"],
+      ["Chrome で登録", "確認できませんでした"],
+      ["Edge で登録", "確認できませんでした"],
+    ]);
+    expect(failed.state.selectedBrowser).toBeNull();
+  });
+
+  it("nothing installed: no choices, downloads for Edge and Chrome only (Vivaldi has no download page)", () => {
+    const h = atStepA(realStatus("vivaldi", {}));
+    expect(wizardAView(h.state)).toMatchObject({ reason: "none-installed", options: [] });
+    expect(actionLabels(h)).toEqual(["あとで設定", "Google Chrome のダウンロードページを開く", "Microsoft Edge のダウンロードページを開く", "もう一度確認", "ブラウザーは入っています（このまま続ける）"]);
+    expect(isWizardEventAllowed(h.state, { type: "openDownloadPage", browser: "vivaldi" })).toBe(false);
+    expect(wizardAView(h.state).reasonCopy?.lead).toBe("対応しているブラウザー（Google Chrome、Microsoft Edge、Vivaldi）が見つかりませんでした。");
+  });
+
+  it("a Vivaldi that is installed but not the default, with no Chrome or Edge: Vivaldi is offered by name (no dead end, no false none-installed)", () => {
+    const state = status(realStatus("other", { vivaldi: "found" }));
+    expect(state.browsers.recommendationReason).toBe("default-not-chromium");
+    expect(wizardRecommendationReason(state)).toBe("default-not-chromium");
+    const h = atStepA(realStatus("other", { vivaldi: "found" }));
+    const view = wizardAView(h.state);
+    expect(view.reason).toBe("default-not-chromium");
+    expect(view.options.map((option) => [option.id, option.label, option.selectable, option.recommended])).toEqual([["vivaldi", "Vivaldi で登録", true, false]]);
+    expect(wizardAllBrowsersBlocked(state)).toBe(false);
+    send(h, { type: "selectBrowser", browser: "vivaldi" });
+    expect(h.state.selectedBrowser).toBe("vivaldi");
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(true);
+  });
+
+  it("Firefox default, Chrome blocked, Edge missing, Vivaldi installed: Vivaldi is not offered as usable either (Chrome blocked), all-blocked names both", () => {
+    const h = atStepA(realStatus("other", { chrome: "found", vivaldi: "found" }, ["chrome"]));
+    const view = wizardAView(h.state);
+    expect(view.options.map((option) => [option.id, option.selectable, option.note])).toEqual([["chrome", false, "policy-blocked"], ["vivaldi", false, "borrowed-blocked"]]);
+    expect(view.allBlocked).toBe(true);
+    expect(view.notice?.copy.headline).toContain("Google Chrome、Vivaldi");
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
+  });
+
+  it("D074: Chrome blocked by policy, Edge not installed, Vivaldi installed: nothing can be chosen and 次へ is disabled (default Vivaldi or not)", () => {
+    const installed = { chrome: "found", vivaldi: "found" } as const;
+    for (const defaultBrowser of ["vivaldi", "other"] as const) {
+      const h = atStepA(realStatus(defaultBrowser, installed, ["chrome"]));
+      const view = wizardAView(h.state);
+      expect(view.options.some((option) => option.selectable), defaultBrowser).toBe(false);
+      expect(view.options.map((option) => [option.id, option.selectable, option.note]).sort(), defaultBrowser).toEqual([["chrome", false, "policy-blocked"], ["vivaldi", false, "borrowed-blocked"]]);
+      expect(view.allBlocked, defaultBrowser).toBe(true);
+      expect(h.state.selectedBrowser, defaultBrowser).toBeNull();
+      expect(isWizardEventAllowed(h.state, { type: "selectBrowser", browser: "vivaldi" }), defaultBrowser).toBe(false);
+      expect(isWizardEventAllowed(h.state, { type: "selectBrowser", browser: "chrome" }), defaultBrowser).toBe(false);
+      expect(isWizardEventAllowed(h.state, { type: "next" }), defaultBrowser).toBe(false);
+      // The all-blocked screen offers no 次へ button at all.
+      expect(wizardActions(h.state).find((candidate) => candidate.id === "next")?.enabled ?? false, defaultBrowser).toBe(false);
+    }
+  });
+
+  it("2b: Firefox default, Edge blocked, Chrome missing, Vivaldi installed: Vivaldi works through the Chrome key, so it is offered and the wizard is not all-blocked", () => {
+    const h = atStepA(realStatus("other", { edge: "found", vivaldi: "found" }, ["edge"]));
+    const view = wizardAView(h.state);
+    expect(view.options.map((option) => [option.id, option.label, option.selectable, option.note])).toEqual([
+      ["edge", "Edge で登録", false, "policy-blocked"],
+      ["vivaldi", "Vivaldi で登録", true, null],
+    ]);
+    expect(view.allBlocked).toBe(false);
+    send(h, { type: "selectBrowser", browser: "vivaldi" });
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(true);
+  });
+
+  it("something selectable among Chrome and Edge: Vivaldi (not the default) is not added", () => {
+    const h = atStepA(realStatus("other", { edge: "found", vivaldi: "found" }));
+    expect(wizardBrowserOptions(h.state.status).map((option) => option.id)).toEqual(["edge"]);
+  });
+
+  it("Chrome and Edge both blocked, default Vivaldi: all-blocked, Vivaldi named as unusable, not selectable and not recommended", () => {
+    const h = atStepA(realStatus("vivaldi", ALL_FOUND, ["chrome", "edge"]));
+    h.state = { ...h.state, status: { ...h.state.status!, state: "policy-blocked" } };
+    const view = wizardAView(h.state);
+    expect(view.allBlocked).toBe(true);
+    expect(view.notice?.copy.headline).toContain("Google Chrome、Microsoft Edge、Vivaldi");
+    expect(view.options.map((option) => [option.id, option.selectable, option.recommended])).toEqual([["vivaldi", false, false], ["chrome", false, false], ["edge", false, false]]);
+    expect(isWizardEventAllowed(h.state, { type: "selectBrowser", browser: "vivaldi" })).toBe(false);
+    expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(false);
+  });
+
+  it("a remembered browser that is not among the choices shown is not mentioned", () => {
+    // Vivaldi was chosen last time, but the default is now Chrome: no Vivaldi radio is shown.
+    const gone = atStepA({ ...realStatus("chrome", ALL_FOUND), browsers: { ...realStatus("chrome", ALL_FOUND).browsers, preferred: "vivaldi" } });
+    expect(wizardAView(gone.state).options.map((option) => option.id)).toEqual(["chrome", "edge"]);
+    expect(wizardAView(gone.state).previouslyChosen).toBeNull();
+    // Edge was chosen last time and is shown: the note stays.
+    const shown = atStepA({ ...realStatus("chrome", ALL_FOUND), browsers: { ...realStatus("chrome", ALL_FOUND).browsers, preferred: "edge" } });
+    expect(wizardAView(shown.state).previouslyChosen).toBe("前回は Microsoft Edge を選びました。");
+  });
+
+  it("browser lists and download buttons put Chrome first (Chrome, Edge, Vivaldi)", () => {
+    expect(wizardSupportedBrowserList()).toBe("Google Chrome、Microsoft Edge、Vivaldi");
+  });
+
+  describe("a Vivaldi whose effective registration is not ours gets a warning before success is shown", () => {
+    function registerVivaldi(registration: "ours" | "foreign" | "absent", over: Partial<Extract<CollectorIntegrationResponse, { kind: "apply" }>> = {}) {
+      const base = realStatus("vivaldi", ALL_FOUND);
+      const h = atStepA(base);
+      send(h, { type: "selectBrowser", browser: "vivaldi" });
+      send(h, { type: "next" });
+      send(h, { type: "register" });
+      const after = status({
+        state: "ready",
+        browsers: { ...base.browsers, entries: base.browsers!.entries!.map((e) => (e.id === "vivaldi" ? { ...e, registration, registrationVia: registration === "absent" ? null : "chromium" } : e)) },
+      });
+      respond(h, { ...applyResponse(over), status: after } as CollectorIntegrationResponse);
+      return h;
+    }
+
+    it("foreign registration (another Chromium key outranks the Chrome key): registered-not-effective, still able to go on", () => {
+      const h = registerVivaldi("foreign");
+      expect(wizardMessage(h.state)?.id).toBe("registered-not-effective");
+      expect(wizardMessage(h.state)?.role).toBe("alert");
+      expect(wizardMessage(h.state)?.copy.headline).toContain("Vivaldi");
+      expect(isWizardEventAllowed(h.state, { type: "next" })).toBe(true);
+    });
+
+    it("absent registration: the same warning; an already-ready noop is not reported as ready either", () => {
+      expect(wizardMessage(registerVivaldi("absent").state)?.id).toBe("registered-not-effective");
+      expect(wizardMessage(registerVivaldi("absent", { outcome: "noop" }).state)?.id).toBe("registered-not-effective");
+    });
+
+    it("our own registration: the normal success message", () => {
+      expect(wizardMessage(registerVivaldi("ours").state)?.id).toBe("registered-verified");
+    });
+
+    it("Chrome and Edge keep the normal success message (they own their registration)", () => {
+      const h = atStepB();
+      send(h, { type: "register" });
+      respond(h, applyResponse());
+      expect(wizardMessage(h.state)?.id).toBe("registered-verified");
+    });
+  });
+
+  it("wizardRecommendationReason is the inspection's reason whenever something is offered", () => {
+    expect(wizardRecommendationReason(null)).toBeNull();
+    for (const [defaultBrowser, installed] of [["chrome", ALL_FOUND], ["other", ALL_FOUND], ["unknown", { chrome: "found" }], ["vivaldi", { vivaldi: "found" }]] as const) {
+      const s = status(realStatus(defaultBrowser, installed));
+      expect(wizardRecommendationReason(s)).toBe(s.browsers.recommendationReason);
+    }
+  });
+
+  it("choosing the 通常 browser (Vivaldi) sends exactly that browser and shows Vivaldi on the extensions step", () => {
+    const real = realStatus("vivaldi", ALL_FOUND);
+    const h = atStepA(real);
+    expect(h.state.selectedBrowser).toBe("vivaldi");
+    send(h, { type: "next" });
+    expect(requestsOf(send(h, { type: "register" }))).toEqual([{ intent: "setup", browser: "vivaldi" }]);
+    respond(h, applyResponse({ status: status({ ...real, state: "ready" }) }));
+    expect(h.state.selectedBrowser).toBe("vivaldi");
+    // Step D reads names, labels and the address from the table, never from the status.
+    const d = wizardCopy(h.state).stepD;
+    expect(d.title).toBe("Vivaldi に Collector を読み込む");
+    expect(d.openExtensions).toBe("Vivaldi で拡張機能の画面を開く");
+    expect(d.addressNote).toContain("vivaldi://extensions");
+    expect(d.steps[1]).toBe("画面の右上にある「デベロッパー モード」をオンにします。");
+    for (const [path, text] of Object.entries({ title: d.title, addressNote: d.addressNote, ...Object.fromEntries(d.steps.map((step, index) => [`step${index}`, step])) })) {
+      expect(text.trim(), path).not.toBe("");
+    }
+  });
+});

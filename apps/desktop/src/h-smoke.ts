@@ -63,6 +63,73 @@ async function runOverflowAction(window: BrowserWindow, actionId: string, descri
   })()`, description);
 }
 
+async function openPaletteShortcut(window: BrowserWindow, kind: "commands" | "files"): Promise<void> {
+  const commandMode = kind === "commands";
+  const modifier = process.platform === "darwin" ? "metaKey" : "ctrlKey";
+  await runRendererAction(window, `(() => {
+    window.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "p",
+      ${modifier}: true,
+      shiftKey: ${commandMode},
+      bubbles: true,
+      cancelable: true
+    }));
+    return true;
+  })()`, `opening the ${kind === "commands" ? "Command Palette" : "Quick Open"} by shortcut`);
+  await waitForRenderer(window,
+    `document.querySelector(".command-palette > input") === document.activeElement`,
+    `${kind === "commands" ? "Command Palette" : "Quick Open"} shortcut focus`);
+  const initialValue = await window.webContents.executeJavaScript(
+    `document.querySelector(".command-palette > input")?.value ?? null`, true
+  ) as string | null;
+  const expectedPrefix = commandMode ? ">" : "file:";
+  if (initialValue === null || !initialValue.startsWith(expectedPrefix)) {
+    throw new Error(`${kind} shortcut opened with an unexpected initial query: ${JSON.stringify(initialValue)}.`);
+  }
+}
+
+async function searchPalette(window: BrowserWindow, query: string): Promise<{
+  readonly rows: number;
+  readonly title: string | null;
+  readonly commandId: string | null;
+  readonly providerId: string | null;
+  readonly category: string | null;
+}> {
+  const result = await window.webContents.executeJavaScript(`(() => {
+    const input = document.querySelector(".command-palette > input");
+    if (!(input instanceof HTMLInputElement)) return null;
+    input.value = ${JSON.stringify(query)};
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    const selected = document.querySelector(".command-palette-item[aria-selected='true']");
+    return {
+      rows: document.querySelectorAll(".command-palette-item").length,
+      title: selected?.querySelector(".command-palette-command-title")?.textContent?.trim() ?? null,
+      commandId: selected?.dataset.commandId ?? null,
+      providerId: selected?.dataset.providerId ?? null,
+      category: selected?.querySelector(".command-palette-category")?.textContent?.trim() ?? null
+    };
+  })()`, true) as {
+    readonly rows: number;
+    readonly title: string | null;
+    readonly commandId: string | null;
+    readonly providerId: string | null;
+    readonly category: string | null;
+  } | null;
+  return result ?? { rows: 0, title: null, commandId: null, providerId: null, category: null };
+}
+
+async function activatePaletteSelection(window: BrowserWindow, description: string): Promise<void> {
+  await runRendererAction(window, `(() => {
+    const input = document.querySelector(".command-palette > input");
+    if (!(input instanceof HTMLInputElement)) return false;
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    return true;
+  })()`, description);
+  await waitForRenderer(window,
+    `document.querySelector(".command-palette")?.hidden === true`,
+    `${description} closing the Quick Pick`);
+}
+
 export async function runHSmoke(options: {
   readonly window: BrowserWindow;
   readonly fixtureRoot: string;
@@ -403,9 +470,16 @@ export async function runHSmoke(options: {
     `document.querySelector("#editor")?.dataset.smokeText === ${JSON.stringify(dirtyParentText)}`,
     "the dirty Workdesk document text");
 
-  await runRendererAction(options.window,
-    `(() => { const button = [...document.querySelectorAll("[data-workdesk-project-shortcut]")].find((item) => item.textContent?.includes("H Smoke Project B")); if (!(button instanceof HTMLButtonElement)) return false; button.click(); return true; })()`,
-    "opening Project B from the Workdesk");
+  await openPaletteShortcut(options.window, "commands");
+  const projectQuickPick = await searchPalette(options.window, "project: H Smoke Project B");
+  if (projectQuickPick?.rows !== 1
+    || projectQuickPick.title !== "「H Smoke Project B」を開く"
+    || projectQuickPick.commandId !== "maginalia.workdesk.openProject"
+    || projectQuickPick.providerId !== "project"
+    || projectQuickPick.category !== "Workdesk Project") {
+    throw new Error(`Quick Open did not expose the available registered Project by display name: ${JSON.stringify(projectQuickPick)}.`);
+  }
+  await activatePaletteSelection(options.window, "opening Project B from the Project name picker");
   try {
     await waitForRenderer(options.window,
       `document.querySelector("#workspace-label")?.textContent === "Project" && document.querySelector("#workdesk-home")?.disabled === false`,
@@ -426,6 +500,97 @@ export async function runHSmoke(options: {
     }))()`, true);
     throw new Error(`${error instanceof Error ? error.message : String(error)} State: ${JSON.stringify(diagnostic)}.`);
   }
+  const projectBRegistration = (await options.workdesks.listRegisteredProjects(workdesk))
+    .find((project) => project.title === "H Smoke Project B");
+  if (!projectBRegistration?.available) throw new Error("The Quick Open target Project is no longer registered and available.");
+  const projectBRoot = (await options.workdesks.resolveRegisteredProject(workdesk, projectBRegistration.projectIdentityId)).canonicalRoot;
+  const memoPath = path.join(projectBRoot, "memo.md");
+  const memoBytesBeforeQuickOpen = await readFile(memoPath);
+  await openPaletteShortcut(options.window, "files");
+  const fileQuickPick = await searchPalette(options.window, "file: memo.md");
+  if (fileQuickPick?.rows !== 1
+    || fileQuickPick.title !== "memo.md"
+    || fileQuickPick.commandId !== "maginalia.project.openFile"
+    || fileQuickPick.providerId !== "file"
+    || fileQuickPick.category !== "Project document") {
+    throw new Error(`Quick Open did not expose the active Project document by display name: ${JSON.stringify(fileQuickPick)}.`);
+  }
+  await activatePaletteSelection(options.window, "opening memo.md from Project Quick Open");
+  await waitForRenderer(options.window,
+    `document.querySelector("#explorer-tree button[aria-current=page]")?.dataset.explorerFileName === "memo.md"`,
+    "the Quick Open manuscript in the active Project");
+  const tabsAfterFirstQuickOpen = await options.window.webContents.executeJavaScript(
+    `document.querySelectorAll("#document-tabs .document-tab").length`, true
+  ) as number;
+  await openPaletteShortcut(options.window, "files");
+  await searchPalette(options.window, "file: memo.md");
+  await activatePaletteSelection(options.window, "reopening memo.md from Project Quick Open");
+  await waitForRenderer(options.window,
+    `document.querySelector("#explorer-tree button[aria-current=page]")?.dataset.explorerFileName === "memo.md"`,
+    "the already-open Quick Open manuscript");
+  const tabsAfterRepeatedQuickOpen = await options.window.webContents.executeJavaScript(
+    `document.querySelectorAll("#document-tabs .document-tab").length`, true
+  ) as number;
+  if (tabsAfterRepeatedQuickOpen !== tabsAfterFirstQuickOpen
+    || !(await readFile(memoPath)).equals(memoBytesBeforeQuickOpen)) {
+    throw new Error("Opening a Project document by name duplicated its tab or changed source bytes.");
+  }
+
+  const sourceTextBeforeFind = await options.window.webContents.executeJavaScript(
+    `document.querySelector("#editor")?.dataset.smokeText ?? null`, true
+  ) as string | null;
+  if (sourceTextBeforeFind === null) throw new Error("The active Project source was unavailable for Find smoke.");
+  await openPaletteShortcut(options.window, "commands");
+  const findCommand = await searchPalette(options.window, "> 本文内を検索");
+  if (findCommand?.commandId !== "maginalia.editor.findInDocument") {
+    throw new Error(`The native Find command was missing from the action palette: ${JSON.stringify(findCommand)}.`);
+  }
+  await activatePaletteSelection(options.window, "running the registered native Find command");
+  await waitForRenderer(options.window,
+    `document.querySelector(".monaco-editor .find-widget")?.classList.contains("visible") === true`,
+    "Monaco's native Find widget");
+  await openPaletteShortcut(options.window, "commands");
+  const replaceCommand = await searchPalette(options.window, "> 本文内を置換");
+  if (replaceCommand?.commandId !== "maginalia.editor.replaceInDocument") {
+    throw new Error(`The native Replace command was missing from the action palette: ${JSON.stringify(replaceCommand)}.`);
+  }
+  await activatePaletteSelection(options.window, "running the registered native Replace command");
+  await waitForRenderer(options.window,
+    `document.querySelector(".monaco-editor .find-widget")?.classList.contains("replaceToggled") === true`,
+    "Monaco's native Find and Replace widget");
+  const sourceTextAfterFind = await options.window.webContents.executeJavaScript(
+    `document.querySelector("#editor")?.dataset.smokeText ?? null`, true
+  ) as string | null;
+  if (sourceTextAfterFind !== sourceTextBeforeFind || !(await readFile(memoPath)).equals(memoBytesBeforeQuickOpen)) {
+    throw new Error("Opening native Find and Replace modified the manuscript source.");
+  }
+  await runRendererAction(options.window,
+    `(() => { const button = document.querySelector("#document-preview-mode"); if (!(button instanceof HTMLButtonElement)) return false; button.click(); return true; })()`,
+    "showing Preview after native Find and Replace");
+  await waitForRenderer(options.window,
+    `document.querySelector("#document-preview-mode")?.getAttribute("aria-pressed") === "true"`,
+    "Preview mode after native Find and Replace");
+  await openPaletteShortcut(options.window, "commands");
+  const previewFindCommand = await searchPalette(options.window, "> 本文内を検索");
+  if (previewFindCommand?.rows !== 0) {
+    throw new Error(`Native source Find remained available in Preview mode: ${JSON.stringify(previewFindCommand)}.`);
+  }
+  await runRendererAction(options.window, `(() => {
+    const input = document.querySelector(".command-palette > input");
+    if (!(input instanceof HTMLInputElement)) return false;
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    return true;
+  })()`, "closing the Preview-mode command palette");
+  await waitForRenderer(options.window,
+    `document.querySelector(".command-palette")?.hidden === true`,
+    "Preview-mode Command Palette Escape");
+  await runRendererAction(options.window,
+    `(() => { const button = document.querySelector("#document-edit-mode"); if (!(button instanceof HTMLButtonElement)) return false; button.click(); return true; })()`,
+    "returning to source editing after Find and Replace smoke");
+  await waitForRenderer(options.window,
+    `document.querySelector("#document-edit-mode")?.getAttribute("aria-pressed") === "true"`,
+    "source editing after Find and Replace smoke");
+
   const projectBDisplayName = await options.window.webContents.executeJavaScript(
     `document.querySelector("#workspace-document-name")?.textContent ?? ""`, true
   ) as string;

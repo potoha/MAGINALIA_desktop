@@ -2,6 +2,11 @@ import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { stageShelfMutexAddon } from "./shelf-mutex-addon.mjs";
+import { stageWindowsIntegrationAddon } from "./windows-integration-addon.mjs";
+import { parseCollectorZipFlag } from "./collector-payload.mjs";
+import { stageCollectorPayload } from "./stage-collector-payload.mjs";
+import { embedCollectorPayload } from "./embed-collector-payload.mjs";
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const desktopRoot = path.resolve(scriptDirectory, "..");
@@ -16,6 +21,17 @@ const lock = JSON.parse(await readFile(path.join(repositoryRoot, "package-lock.j
 if (!process.env.npm_execpath) throw new Error("Run this script through the repository npm script so its pinned npm runtime is available.");
 await access(path.join(desktopRoot, "dist", "main", "main.js"));
 await access(path.join(runtimeRoot, "reviewer", "marginalia-reviewer.exe"));
+// α2: the installed Reviewer writer requires the native Shelf mutex; fail
+// before staging anything if it is missing or not the expected /MT N-API build.
+const shelfMutex = await stageShelfMutexAddon({ desktopRoot, repositoryRoot, runtimeRoot });
+process.stdout.write(`Shelf mutex addon staged: sha256=${shelfMutex.sha256} bytes=${shelfMutex.bytes}\n`);
+// Collector wizard integration (WP-3): same fail-closed rule for the Windows integration addon.
+const windowsIntegration = await stageWindowsIntegrationAddon({ desktopRoot, repositoryRoot, runtimeRoot });
+process.stdout.write(`Windows integration addon staged: sha256=${windowsIntegration.sha256} bytes=${windowsIntegration.bytes}\n`);
+// Collector wizard integration (WP-4): Host payload + pinned Collector extension + descriptor, verified before staging.
+// `--collector-zip <absolute path>` is a build-time flag for a release that is not published yet; it is still checked against the pinned SHA-256.
+const collector = await stageCollectorPayload({ desktopRoot, runtimeRoot, localZip: parseCollectorZipFlag(process.argv.slice(2)), shelfMutexSha256: shelfMutex.sha256 });
+process.stdout.write(`Collector payload staged: ${collector.descriptor.payloadId} extension ${collector.descriptor.extension.version} (${collector.descriptor.extension.id}) zip=${collector.source} sha256=${collector.descriptor.extension.zipSha256}\n`);
 await rm(stageRoot, { recursive: true, force: true });
 await mkdir(vendorRoot, { recursive: true });
 
@@ -49,6 +65,8 @@ const stagedManifest = {
 };
 await writeFile(path.join(stageRoot, "package.json"), `${JSON.stringify(stagedManifest, null, 2)}\n`, "utf8");
 await cp(path.join(desktopRoot, "dist"), path.join(stageRoot, "dist"), { recursive: true });
+// WP-5c: the descriptor is a compiled constant of the STAGED main bundle (design 2.1); fails the stage when it cannot be embedded.
+await embedCollectorPayload({ distMainDirectory: path.join(stageRoot, "dist", "main"), descriptor: collector.descriptor });
 await runCaptured(process.execPath, [process.env.npm_execpath, "install", "--omit=dev", "--no-audit", "--no-fund", "--ignore-scripts"], stageRoot);
 await writeThirdPartyNotices();
 process.stdout.write(`Allowlisted app staged in ${stageRoot}\n`);
@@ -61,6 +79,11 @@ async function writeThirdPartyNotices() {
     const source = path.join(repositoryRoot, filename);
     try { await cp(source, path.join(noticesRoot, `MAGINALIA-${filename}`)); } catch { /* NOTICE is optional in the current repository. */ }
   }
+  // NOTICE points readers at the 0.1.x MIT text by this file name.
+  await cp(path.join(repositoryRoot, "LICENSE-MIT-0.1.txt"), path.join(noticesRoot, "LICENSE-MIT-0.1.txt"));
+  await cp(path.join(desktopRoot, "assets", "fonts", "jost", "OFL.txt"), path.join(noticesRoot, "Jost-OFL.txt"));
+  try { await cp(path.join(runtimeRoot, "collector-host", "NODE-LICENSE.txt"), path.join(noticesRoot, "Collector-Host-NODE-LICENSE.txt")); } catch { throw new Error("The staged Collector Host payload has no NODE-LICENSE.txt."); }
+  try { await cp(path.join(runtimeRoot, "collector-host", "NOTICE.txt"), path.join(noticesRoot, "Collector-Host-NOTICE.txt")); } catch { throw new Error("The staged Collector Host payload has no NOTICE.txt."); }
   await collectNpmNotices(path.join(stageRoot, "node_modules"), path.join(noticesRoot, "node"));
   await collectPythonNotices(path.join(repositoryRoot, "sidecars", "reviewer", ".venv", "Lib", "site-packages"), path.join(noticesRoot, "python"));
   await collectPythonNotices(path.join(repositoryRoot, "sidecars", "reviewer", "ndlocr-runtime", ".venv", "Lib", "site-packages"), path.join(noticesRoot, "python-ndlocr"));

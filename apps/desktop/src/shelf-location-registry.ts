@@ -80,6 +80,16 @@ function parseConfig(value: unknown): ShelfLocationRegistryConfig | undefined {
   return Object.freeze({ version: 1, privateShelf, publicShelf });
 }
 
+/** Parse an already-read registry with the same rules as the Desktop loader. */
+export function parseShelfLocationSource(source: string): ShelfLocationRegistryConfig | undefined {
+  try {
+    const document = parseDocument(source, { prettyErrors: false });
+    return document.errors.length ? undefined : parseConfig(document.toJS());
+  } catch {
+    return undefined;
+  }
+}
+
 function copyUrls(urls: ShelfUrls): ShelfUrls {
   return Object.freeze({
     github: urls.github,
@@ -186,11 +196,7 @@ export class ShelfLocationRegistry {
     }
 
     try {
-      const document = parseDocument(source, { prettyErrors: false });
-      if (document.errors.length > 0) {
-        return Object.freeze({ kind: "error", message: `Private Shelf configuration is invalid:\n${this.resolvedFilePath}` });
-      }
-      const config = parseConfig(document.toJS());
+      const config = parseShelfLocationSource(source);
       if (config === undefined) {
         return Object.freeze({ kind: "error", message: `Private Shelf configuration is invalid:\n${this.resolvedFilePath}` });
       }

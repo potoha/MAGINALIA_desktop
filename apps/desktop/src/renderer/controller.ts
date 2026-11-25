@@ -40,6 +40,8 @@ export interface WritingSurface {
   /** Optional editor command capability; the controller never exposes Monaco. */
   undo?(): void;
   redo?(): void;
+  find?(): void;
+  findReplace?(): void;
 }
 
 export type WritingTextLineEnding = "\n" | "\r\n" | "\r";
@@ -382,6 +384,20 @@ export class WritingController {
   public redo(): boolean {
     if (this.getActiveSession() === null || this.surface.redo === undefined) return false;
     this.surface.redo();
+    return true;
+  }
+
+  /** Open Monaco's native Find widget for the active source document. */
+  public find(): boolean {
+    if (this.getActiveSession() === null || this.surface.find === undefined) return false;
+    this.surface.find();
+    return true;
+  }
+
+  /** Open Monaco's native Find and Replace widget for the active source document. */
+  public findReplace(): boolean {
+    if (this.getActiveSession() === null || this.surface.findReplace === undefined) return false;
+    this.surface.findReplace();
     return true;
   }
 

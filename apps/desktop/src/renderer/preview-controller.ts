@@ -81,11 +81,27 @@ export class PreviewController {
     this.refresh();
   }
 
-  public setDirection(direction: WritingDirection): void {
-    if (this.direction === direction) return;
+  public setDirection(direction: WritingDirection, requirePersistence = false): void {
+    if (this.direction === direction && !requirePersistence) return;
+
+    if (requirePersistence) {
+      const current = this.options.preferences.load();
+      const persisted = this.options.preferences.save({ ...current, defaultWritingDirection: direction });
+      if (persisted === false) throw new Error("Renderer preferences could not be persisted.");
+      if (this.direction === direction) return;
+      this.direction = direction;
+      this.refresh();
+      return;
+    }
+
+    // Presentation remains responsive for ordinary authoring even when preference storage fails.
     this.direction = direction;
-    const current = this.options.preferences.load();
-    this.options.preferences.save({ ...current, defaultWritingDirection: direction });
+    try {
+      const current = this.options.preferences.load();
+      this.options.preferences.save({ ...current, defaultWritingDirection: direction });
+    } catch {
+      // Renderer preferences are advisory and must not block editing or preview.
+    }
     this.refresh();
   }
 

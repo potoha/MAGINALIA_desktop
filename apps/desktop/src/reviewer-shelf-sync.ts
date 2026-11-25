@@ -18,6 +18,7 @@ import type {
   ReviewerSourceFile,
   ReviewerReconciliationPending
 } from "./reviewer-shelf-reconciliation";
+import type { ReviewerShelfWriteCoordination } from "./reviewer-shelf-write-binding";
 
 export const REVIEWER_SHELF_SYNC_PAGE_LIMIT = 100;
 export const MAX_REVIEWER_SHELF_SYNC_PAGES = 1_001;
@@ -58,6 +59,8 @@ export interface ReviewerShelfSyncAdapterOptions {
   readonly lookupMetadata?: ReviewerShelfMetadataLookup;
   /** Override the durable boundary for focused tests. */
   readonly materialize?: typeof materializeReviewerRecords;
+  /** Product main process supplies the stable D071 binding for this Shelf. */
+  readonly getWriteCoordination?: (shelfRoot: string) => Promise<ReviewerShelfWriteCoordination>;
   /** Must not exceed the Reviewer sidecar's limit of 100. */
   readonly pageLimit?: number;
 }
@@ -455,7 +458,18 @@ export function createReviewerShelfSyncAdapter(
       return lookup;
     };
 
-    const summary = await materialize(shelfRoot, Object.freeze(records), cachedLookup);
+    let coordination: ReviewerShelfWriteCoordination | undefined;
+    if (records.length > 0 && options.getWriteCoordination !== undefined) {
+      try {
+        coordination = await options.getWriteCoordination(shelfRoot);
+      } catch (error: unknown) {
+        const message = error instanceof Error && error.message.length > 0
+          ? error.message
+          : "Private Shelf write coordination is unavailable.";
+        return reviewerError("reviewer-error", message);
+      }
+    }
+    const summary = await materialize(shelfRoot, Object.freeze(records), cachedLookup, coordination);
     return mapMaterializationResult(summary, failedAnnotationIds.size);
   };
 }

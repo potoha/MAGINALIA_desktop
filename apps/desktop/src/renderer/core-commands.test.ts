@@ -65,7 +65,7 @@ describe("Core command adapters", () => {
     const exportDocx = vi.fn(async () => undefined);
     const refreshReferences = vi.fn(async () => undefined);
     const commands = register({ saveDocument, exportMarkdown, exportPdf, exportDocx, refreshReferences });
-    const context = { "editor.hasDocument": true };
+    const context = { "editor.hasDocument": true, "export.available": true };
 
     await expect(commands.execute("maginalia.document.save", context)).resolves.toEqual({ kind: "executed" });
     await expect(commands.execute("maginalia.document.export", context)).resolves.toEqual({ kind: "executed" });
@@ -79,11 +79,23 @@ describe("Core command adapters", () => {
     expect(refreshReferences).toHaveBeenCalledOnce();
   });
 
+  it("hides Export from discovery until the export runtime is available", async () => {
+    const exportMarkdown = vi.fn();
+    const commands = register({ exportMarkdown });
+    const withoutRuntime = { "editor.hasDocument": true };
+    for (const id of ["maginalia.document.export", "maginalia.document.exportPdf", "maginalia.document.exportDocx"]) {
+      expect(commands.list(withoutRuntime).some((command) => command.id === id)).toBe(false);
+      await expect(commands.execute(id, withoutRuntime)).resolves.toEqual({ kind: "disabled" });
+      expect(commands.list({ ...withoutRuntime, "export.available": true }).some((command) => command.id === id)).toBe(true);
+    }
+    expect(exportMarkdown).not.toHaveBeenCalled();
+  });
+
   it("awaits a failed Core action without breaking another registered action", async () => {
     const commands = register({ exportMarkdown: async () => { throw new Error("export failed"); } });
     const save = vi.fn();
     commands.register({ id: "maginalia.test.saveAfterFailure", title: "Save after failure" }, save);
-    const context = { "editor.hasDocument": true };
+    const context = { "editor.hasDocument": true, "export.available": true };
 
     await expect(commands.execute("maginalia.document.export", context)).resolves.toMatchObject({
       kind: "failed",

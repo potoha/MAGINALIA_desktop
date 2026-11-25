@@ -16,12 +16,12 @@ describe("brand asset resolution", () => {
     expect(findBrandAssetPath("marker-stroke.png", [path.join("missing")], () => false)).toBeNull();
   });
 
-  it("requires the generated v2 ICO for Windows instead of falling back to old PNG icons", () => {
+  it("requires the generated generated ICO for Windows instead of falling back to old PNG icons", () => {
     const root = path.join("packaged", "branding");
     const existing = new Set([
       path.join(root, "icon.png"),
       path.join(root, "iconnottran.png"),
-      path.join(root, "icon.v2.png"),
+      path.join(root, "logo.png"),
     ]);
 
     expect(findApplicationIconPath("win32", [root], (candidate) => existing.has(candidate))).toBeNull();
@@ -31,19 +31,19 @@ describe("brand asset resolution", () => {
     expect(findApplicationIconPath("win32", [root], (candidate) => existing.has(candidate))).toBe(generatedIco);
   });
 
-  it("uses icon.v2.png on non-Windows app surfaces and ignores old icon PNGs", () => {
+  it("uses logo.png on non-Windows app surfaces and ignores old icon PNGs", () => {
     const root = path.join("packaged", "branding");
     const existing = new Set([
       path.join(root, "icon.png"),
       path.join(root, "iconnottran.png"),
-      path.join(root, "icon.v2.png"),
+      path.join(root, "logo.png"),
     ]);
 
     expect(findApplicationIconPath("darwin", [root], (candidate) => existing.has(candidate)))
-      .toBe(path.join(root, "icon.v2.png"));
+      .toBe(path.join(root, "logo.png"));
   });
 
-  it("does not fall back to an old PNG when the v2 application icon is missing", () => {
+  it("does not fall back to an old PNG when the application logo is missing", () => {
     const root = path.join("packaged", "branding");
     const existing = new Set([
       path.join(root, "icon.png"),

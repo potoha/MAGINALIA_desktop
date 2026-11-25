@@ -80,4 +80,36 @@ describe("ContextKeyService", () => {
     expect(await registry.execute("maginalia.workdesk.return", childContext)).toEqual({ kind: "executed" });
     expect(returnToWorkdesk).toHaveBeenCalledOnce();
   });
+
+  it("keeps Repository and History actions disabled until their live context is ready", () => {
+    const registry = new CommandRegistry();
+    for (const [id, when] of [
+      ["maginalia.repository.open", "repository.available && repository.idle"],
+      ["maginalia.repository.activate", "repository.activationAvailable"],
+      ["maginalia.repository.history.refresh", "repository.historyAvailable"],
+      ["maginalia.repository.history.openCopy", "repository.historySelected"]
+    ] as const) {
+      registry.register({ id, title: id, when }, vi.fn());
+    }
+
+    expect(registry.discover("repository", {}).map((command) => command.id)).toEqual([]);
+    expect(registry.discover("repository", {
+      "repository.available": true,
+      "repository.idle": false
+    }).map((command) => command.id)).toEqual([]);
+    expect(registry.discover("repository", {
+      "repository.available": true,
+      "repository.idle": true
+    }).map((command) => command.id)).toEqual(["maginalia.repository.open"]);
+    expect(registry.discover("history", {
+      "repository.available": true,
+      "repository.idle": true,
+      "repository.activationAvailable": true,
+      "repository.historyAvailable": true,
+      "repository.historySelected": true
+    }).map((command) => command.id)).toEqual([
+      "maginalia.repository.history.refresh",
+      "maginalia.repository.history.openCopy"
+    ]);
+  });
 });

@@ -5,6 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "marginalia-pc-reviewer"
 version = "0.1.0"
+license = "AGPL-3.0-or-later"
 description = "Loopback-only reviewer for Digital Marginalia DB export bundles"
 requires-python = ">=3.11"
 dependencies = [

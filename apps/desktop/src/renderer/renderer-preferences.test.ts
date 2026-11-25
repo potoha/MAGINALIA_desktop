@@ -71,10 +71,26 @@ describe("renderer export preferences", () => {
     expect(store.load().exportPresentationSettings).toEqual(DEFAULT_EXPORT_PRESENTATION_SETTINGS);
 
     const settings = createExportPresentationSettings({ paperSize: "B4", header: { left: "見出し" } });
-    store.save({ ...store.load(), exportPresentationSettings: settings });
+    expect(store.save({ ...store.load(), exportPresentationSettings: settings })).toBe(true);
 
     expect(storage.setItem).toHaveBeenCalledWith(RENDERER_PREFERENCES_STORAGE_KEY, expect.any(String));
     expect(JSON.parse(stored!).exportPresentationSettings).toEqual(settings);
     expect(store.load().exportPresentationSettings).toEqual(settings);
+  });
+
+  it("reports unavailable or failing localStorage writes without throwing", () => {
+    const store = createLocalStorageRendererPreferenceStore();
+    vi.stubGlobal("localStorage", undefined);
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      get: () => { throw new Error("localStorage is unavailable"); }
+    });
+    expect(store.save(DEFAULT_RENDERER_PREFERENCES)).toBe(false);
+
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      setItem: () => { throw new Error("storage is unavailable"); }
+    });
+    expect(store.save(DEFAULT_RENDERER_PREFERENCES)).toBe(false);
   });
 });

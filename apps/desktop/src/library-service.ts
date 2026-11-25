@@ -76,6 +76,7 @@ export interface LibraryRecord {
   readonly title: string;
   readonly authors: readonly string[];
   readonly page?: number;
+  readonly url?: string;
 }
 
 export interface LibraryRecordsRead {
@@ -92,6 +93,7 @@ export interface LibrarySearchReference {
   readonly title: string;
   readonly authors: readonly string[];
   readonly page?: number;
+  readonly url?: string;
 }
 
 export interface LibrarySearchRead {
@@ -582,6 +584,12 @@ function authorsForBook(book: ShelfBook): readonly string[] {
   return book.authors ?? [];
 }
 
+function sourceUrlForAnnotation(annotation: ShelfAnnotation, book: ShelfBook): string | undefined {
+  const annotationUrl = annotation.version === "0.4" ? annotation.url : undefined;
+  const bookUrl = book.version === "0.4" ? book.url : undefined;
+  return annotationUrl ?? bookUrl;
+}
+
 function toSnapshotRecord(annotation: ShelfAnnotation, book: ShelfBook): LibraryRecord {
   const record: {
     annotationId: string;
@@ -591,6 +599,7 @@ function toSnapshotRecord(annotation: ShelfAnnotation, book: ShelfBook): Library
     title: string;
     authors: readonly string[];
     page?: number;
+    url?: string;
   } = {
     annotationId: annotation.id,
     sourceId: annotationSourceId(annotation),
@@ -601,6 +610,8 @@ function toSnapshotRecord(annotation: ShelfAnnotation, book: ShelfBook): Library
   if (annotation.privateMemo !== undefined) record.privateMemo = annotation.privateMemo;
   const location = annotation.location;
   if (location?.page !== undefined) record.page = location.page;
+  const url = sourceUrlForAnnotation(annotation, book);
+  if (url !== undefined) record.url = url;
   return Object.freeze(record);
 }
 
@@ -699,6 +710,7 @@ function cloneRecords(records: readonly LibraryRecord[]): readonly LibraryRecord
       title: string;
       authors: readonly string[];
       page?: number;
+      url?: string;
     } = {
       annotationId: record.annotationId,
       sourceId: record.sourceId,
@@ -708,6 +720,7 @@ function cloneRecords(records: readonly LibraryRecord[]): readonly LibraryRecord
     };
     if (record.privateMemo !== undefined) copy.privateMemo = record.privateMemo;
     if (record.page !== undefined) copy.page = record.page;
+    if (record.url !== undefined) copy.url = record.url;
     return Object.freeze(copy);
   }));
 }
@@ -724,6 +737,7 @@ function toSearchReference(record: LibraryRecord): LibrarySearchReference {
     title: string;
     authors: readonly string[];
     page?: number;
+    url?: string;
   } = {
     annotationId: record.annotationId,
     sourceId: record.sourceId,
@@ -731,6 +745,7 @@ function toSearchReference(record: LibraryRecord): LibrarySearchReference {
     authors: Object.freeze([...record.authors]),
   };
   if (record.page !== undefined) reference.page = record.page;
+  if (record.url !== undefined) reference.url = record.url;
   return Object.freeze(reference);
 }
 
@@ -977,6 +992,7 @@ export class LibraryService {
         record.sourceId,
         record.page,
         record.privateMemo,
+        record.url,
       ];
       if (needle.length > 0 && !searchableFields.some((field) => searchableText(field).includes(needle))) return [];
       return [{ record, quoteMatch, index }];

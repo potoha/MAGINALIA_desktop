@@ -46,7 +46,9 @@ export function registerCoreCommands(registry: CommandRegistry, actions: CoreCom
   register("maginalia.renderer.setHorizontal", "Set Horizontal Writing", () => actions.setPreviewDirection("horizontal"), "Renderer", ["horizontal", "orientation"]);
   register("maginalia.renderer.setVertical", "Set Vertical Writing", () => actions.setPreviewDirection("vertical"), "Renderer", ["vertical", "orientation"]);
   register("maginalia.references.refresh", "Refresh References", actions.refreshReferences, "References", ["bibliography", "quote"], "editor.hasDocument");
-  register("maginalia.document.export", "Export Markdown", actions.exportMarkdown, "Document", ["export", "markdown"], "editor.hasDocument");
-  register("maginalia.document.exportPdf", "Export PDF", actions.exportPdf, "Document", ["export", "pdf"], "editor.hasDocument");
-  register("maginalia.document.exportDocx", "Export DOCX", actions.exportDocx, "Document", ["export", "docx", "word"], "editor.hasDocument");
+  // Export needs both a document and a wired export runtime; surfaces must not
+  // offer an export that could only no-op.
+  register("maginalia.document.export", "Export Markdown", actions.exportMarkdown, "Document", ["export", "markdown"], "editor.hasDocument && export.available");
+  register("maginalia.document.exportPdf", "Export PDF", actions.exportPdf, "Document", ["export", "pdf"], "editor.hasDocument && export.available");
+  register("maginalia.document.exportDocx", "Export DOCX", actions.exportDocx, "Document", ["export", "docx", "word"], "editor.hasDocument && export.available");
 }

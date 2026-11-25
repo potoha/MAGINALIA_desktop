@@ -49,6 +49,46 @@ describe("PreviewController", () => {
     expect(controller.getDirection()).toBe("vertical");
   });
 
+  it("keeps ordinary direction changes responsive when preference storage throws", () => {
+    const writing = new FakeWriting("# draft");
+    const view: PreviewView = { setPreviewState: vi.fn() };
+    const failingPreferences: RendererPreferenceStore = {
+      ...preferences,
+      save: () => { throw new Error("storage is unavailable"); }
+    };
+    const controller = new PreviewController({ writing, api: null, view, preferences: failingPreferences });
+
+    expect(() => controller.setDirection("vertical")).not.toThrow();
+    expect(controller.getDirection()).toBe("vertical");
+    expect(vi.mocked(view.setPreviewState).mock.calls.at(-1)?.[0].direction).toBe("vertical");
+  });
+
+  it("requires persistence before Settings direction changes and retries unchanged values", () => {
+    const writing = new FakeWriting("# draft");
+    const view: PreviewView = { setPreviewState: vi.fn() };
+    let failWrites = true;
+    const save = vi.fn(() => !failWrites);
+    const controlledPreferences: RendererPreferenceStore = { ...preferences, save };
+    const controller = new PreviewController({ writing, api: null, view, preferences: controlledPreferences });
+
+    const initialViewCalls = vi.mocked(view.setPreviewState).mock.calls.length;
+    expect(() => controller.setDirection("vertical", true)).toThrow("could not be persisted");
+    expect(save).toHaveBeenCalledOnce();
+    expect(controller.getDirection()).toBe("horizontal");
+    expect(vi.mocked(view.setPreviewState)).toHaveBeenCalledTimes(initialViewCalls);
+
+    failWrites = false;
+    controller.setDirection("vertical", true);
+    expect(controller.getDirection()).toBe("vertical");
+    expect(vi.mocked(view.setPreviewState)).toHaveBeenCalledTimes(initialViewCalls + 1);
+
+    failWrites = true;
+    expect(() => controller.setDirection("vertical", true)).toThrow("could not be persisted");
+    expect(save).toHaveBeenCalledTimes(3);
+    expect(controller.getDirection()).toBe("vertical");
+    expect(vi.mocked(view.setPreviewState)).toHaveBeenCalledTimes(initialViewCalls + 1);
+  });
+
   it("propagates heading edits through the existing document-change refresh path", () => {
     const writing = new FakeWriting("# 初稿");
     const view: PreviewView = { setPreviewState: vi.fn() };

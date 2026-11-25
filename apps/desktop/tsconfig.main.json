@@ -19,6 +19,10 @@
   },
   "include": [
     "src/main.ts",
+    "src/collector-native-host.ts",
+    "src/collector-native-host-core.ts",
+    "src/collector-native-host-product.ts",
+    "src/collector-native-host-product-entry.ts",
     "src/d5-smoke.ts",
     "src/shelf-smoke.ts",
     "src/preload.ts",
@@ -50,6 +54,18 @@
     "src/reviewer-resolution.ts",
     "src/repository-filesystem.ts",
     "src/repository-local-history.ts",
-    "src/repository-service.ts"
+    "src/repository-service.ts",
+    "src/shelf-write-coordination.ts",
+    "src/shelf-write-core.ts",
+    "src/shelf-binding.ts",
+    "src/shelf-native-mutex.ts",
+    "src/shelf-native-write-lock.ts",
+    "src/collector-path-security.ts",
+    "src/collector-shelf-configuration.ts",
+    "src/collector-save-destination.ts",
+    "src/collector-save-destination-ipc.ts",
+    "src/windows-integration.ts",
+    "src/collector-registry-adapter.ts",
+    "src/collector-payload-compiled.ts"
   ]
 }

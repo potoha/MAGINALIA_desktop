@@ -164,8 +164,16 @@ async function exerciseProjectMenuKeyboard(window: BrowserWindow): Promise<void>
     if (documentTypes.join(",") !== "body,draft,memo,other"
       || !newMenu.querySelector("#explorer-new-folder")
       || newItems.length !== 5
-      || allOverflowItems.length !== 4
-      || overflowItems.length !== 3) return fail("menu-items");
+      || allOverflowItems.length !== 5
+      || overflowItems.length !== 4) {
+      return fail("menu-items:" + JSON.stringify({
+        documentTypes,
+        newItems: newItems.map((item) => ({ id: item.id, hidden: item.hidden, disabled: item.disabled })),
+        hasNewFolder: Boolean(newMenu.querySelector("#explorer-new-folder")),
+        allOverflowItems: allOverflowItems.map((item) => ({ id: item.id, hidden: item.hidden, disabled: item.disabled })),
+        overflowItems: overflowItems.map((item) => item.id)
+      }));
+    }
 
     plus.focus();
     keydown(plus, "ArrowDown");

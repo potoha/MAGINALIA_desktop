@@ -84,7 +84,10 @@ async function installPandoc() {
   }
   const extracted = path.join(stagingRoot, "pandoc");
   await mkdir(extracted, { recursive: true });
-  await run("tar.exe", ["-xf", archive, "-C", extracted], repositoryRoot);
+  // Use the Windows bsdtar explicitly: a GNU tar earlier on PATH (e.g. Git Bash)
+  // misreads drive-letter paths such as D:\ as remote hosts.
+  const windowsTar = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe");
+  await run(windowsTar, ["-xf", archive, "-C", extracted], repositoryRoot);
   const sourceDirectory = path.join(extracted, `pandoc-${versions.pandoc.version}`);
   const destination = path.join(runtimeRoot, "pandoc");
   await mkdir(destination, { recursive: true });

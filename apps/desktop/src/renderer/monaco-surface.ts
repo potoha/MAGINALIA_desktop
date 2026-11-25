@@ -1,6 +1,7 @@
 import * as monaco from "monaco-editor/esm/vs/editor/editor.api.js";
 import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker.js?worker";
 import "monaco-editor/esm/vs/basic-languages/markdown/markdown.contribution.js";
+import "monaco-editor/esm/vs/editor/contrib/find/browser/findController.js";
 import type { WritingSurface, WritingTextLineEnding, WritingTextRange } from "./controller";
 
 (globalThis as typeof globalThis & { MonacoEnvironment?: { getWorker: () => Worker } }).MonacoEnvironment = {
@@ -123,6 +124,10 @@ export class MonacoMarkdownSurface implements WritingSurface {
 
   public undo(): void { this.editor.trigger("maginalia-command", "undo", undefined); }
   public redo(): void { this.editor.trigger("maginalia-command", "redo", undefined); }
+  public find(): void { this.editor.trigger("maginalia-command", "actions.find", undefined); }
+  public findReplace(): void {
+    this.editor.trigger("maginalia-command", "editor.action.startFindReplaceAction", undefined);
+  }
 
   public dispose(): void {
     this.modelChangeSubscription?.dispose();

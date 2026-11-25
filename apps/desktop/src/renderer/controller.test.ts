@@ -32,6 +32,9 @@ class FakeSurface implements WritingSurface {
   public selection: WritingTextRange = { start: 0, end: 0 };
   public readonly appliedEdits: Array<{ range: WritingTextRange; text: string; selection: WritingTextRange }> = [];
   public focused = false;
+  public findCalls = 0;
+  public findReplaceCalls = 0;
+  public undoCalls = 0;
 
   public replaceDocument(text: string): void {
     this.text = text;
@@ -66,6 +69,18 @@ class FakeSurface implements WritingSurface {
 
   public focus(): void {
     this.focused = true;
+  }
+
+  public find(): void {
+    this.findCalls += 1;
+  }
+
+  public findReplace(): void {
+    this.findReplaceCalls += 1;
+  }
+
+  public undo(): void {
+    this.undoCalls += 1;
   }
 
   public edit(text: string): void {
@@ -180,6 +195,38 @@ describe("WritingController", () => {
       currentText: "# Draft\r\n\uFEFFbody",
       savedText: "# Draft\r\n\uFEFFbody"
     });
+  });
+
+  for (const [lineEndingName, lineEnding] of [["LF", "\n"], ["CRLF", "\r\n"]] as const) {
+    it(`forwards Find actions without editing the active document (${lineEndingName})`, async () => {
+      const source = `# Heading${lineEnding}body${lineEnding}`;
+      const { controller, surface } = makeHarness({
+        open: () => Promise.resolve(opened("find-session", "find.md", source))
+      });
+      await controller.open();
+      surface.select({ start: 2, end: 9 });
+      const selection = controller.getSelection();
+
+      expect(controller.find()).toBe(true);
+      expect(controller.findReplace()).toBe(true);
+
+      expect(surface.findCalls).toBe(1);
+      expect(surface.findReplaceCalls).toBe(1);
+      expect(controller.getDocumentState()?.currentText).toBe(source);
+      expect(surface.text).toBe(source);
+      expect(surface.selection).toEqual(selection);
+      expect(surface.appliedEdits).toEqual([]);
+      expect(surface.undoCalls).toBe(0);
+    });
+  }
+
+  it("does not dispatch Find actions without an active document", () => {
+    const { controller, surface } = makeHarness();
+
+    expect(controller.find()).toBe(false);
+    expect(controller.findReplace()).toBe(false);
+    expect(surface.findCalls).toBe(0);
+    expect(surface.findReplaceCalls).toBe(0);
   });
 
   it("applies an already opened Markdown result without calling the host", () => {

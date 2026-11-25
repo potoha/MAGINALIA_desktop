@@ -1,5 +1,15 @@
 # Data contracts
 
+[`magicap-bundle-v3.1-manifest.schema.json`](magicap-bundle-v3.1-manifest.schema.json)
+defines the separate outer Capture Bundle that groups independent, unchanged
+`.magicap` v3 ZIP packages. Bundle and standalone package files share the
+`.magicap` and `.magicap.zip` suffixes; readers identify the format from the ZIP
+root `manifest.json` `format` and `version`, not the filename. See the
+[Capture Bundle v3.1 contract](../../docs/magicap-bundle-contract-v3.1.md) for
+the PR #69 manifest shape, Capture PR #33 Draft differences, version routing,
+resource-safety, and future import-failure rules. This contract-only definition
+does not add runtime import support or alter existing v1/v2/v3 package schemas.
+
 `manifest-v1.schema.json` is the PHONE-to-PC ZIP manifest. The ZIP contains only
 that `manifest.json` member and the JPEG members referenced by `pages[].imagePath`.
 

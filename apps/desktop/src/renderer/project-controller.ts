@@ -223,6 +223,28 @@ export class ProjectNavigationController {
     });
   }
 
+  /** Defer an owner-changing Project load until the current Project can be replaced safely. */
+  public activateProjectFromLoader(load: () => Promise<ProjectOpened | null>): Promise<boolean> {
+    if (this.busy) return Promise.resolve(false);
+    this.busy = true;
+    return (async () => {
+      if (!(await this.canSwitch({ kind: "document" }))) return false;
+      let result: ProjectOpened | null;
+      try {
+        result = await load();
+      } catch (_error: unknown) {
+        this.showError(OPEN_FAILED);
+        return false;
+      }
+      return result === null ? false : this.applyProject(result);
+    })().catch(() => {
+      this.showError(OPEN_FAILED);
+      return false;
+    }).finally(() => {
+      this.busy = false;
+    });
+  }
+
   public createProject(title: string): Promise<void> {
     return this.run(async () => {
       if (!(await this.canSwitch({ kind: "document" }))) return;

@@ -1,15 +1,22 @@
 MAGINALIA_ALPHA Notice
 
-Copyright (c) 2026 beyond the Word. / MAGINALIA PROJECT
+Copyright (C) 2026 MADA 5sounds (go-on)
+Published as an activity of beyond the Word.
 
-Code in this repository that is owned by beyond the Word. / MAGINALIA PROJECT
-is licensed under the MIT License unless a file or component states otherwise.
+MAGINALIA 0.2.0 and later is licensed under the GNU Affero General Public
+License, version 3 or (at your option) any later version (AGPL-3.0-or-later).
+See LICENSE. MAGINALIA 0.1.x remains available under the MIT License; the
+text of that license is kept in LICENSE-MIT-0.1.txt.
 
 The MAGINALIA name, wordmark, logo, visual identity, and other project or
-product branding are not granted under the MIT License. Permission to use the
-source code does not imply permission to present a fork, redistribution, or
-derived product as an official MAGINALIA product or as endorsed by
-beyond the Word. / MAGINALIA PROJECT.
+product branding are not granted under the AGPL. See TRADEMARKS.md. Permission
+to use the source code does not imply permission to present a fork,
+redistribution, or derived product as an official MAGINALIA product or as
+endorsed by the copyright holder.
+
+MAGINALIA Collector (separate repository, potoha/MAGINALIA-Collector) is
+licensed under the MIT License. Copies of it that are bundled with MAGINALIA
+keep that license.
 
 Third-party components remain subject to their respective licenses and notice
 requirements.
@@ -18,3 +25,12 @@ The MAGINALIA software license does not claim ownership of user-created
 research data, manuscripts, notes, quotations, images, project repositories,
 or other user content merely because they are created, edited, stored, or
 processed with MAGINALIA.
+
+Bundled font: Jost
+Jost Bold (latin subset, woff2) is bundled with MAGINALIA Desktop for the
+startup splash text. Copyright 2020 The Jost Project Authors
+(https://github.com/indestructible-type/Jost). Licensed under the SIL Open Font
+License, Version 1.1. The full license text is shipped in
+apps/desktop/assets/fonts/jost/OFL.txt and in the installed
+THIRD-PARTY-NOTICES folder (Jost-OFL.txt). Provenance:
+apps/desktop/assets/fonts/jost/PROVENANCE.txt.

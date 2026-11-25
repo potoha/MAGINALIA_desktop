@@ -51,7 +51,8 @@ export function restoreRendererPreferences(value: unknown): RendererPreferences 
 
 export interface RendererPreferenceStore {
   load(): RendererPreferences;
-  save(preferences: RendererPreferences): void;
+  /** Returns false when durable storage is unavailable; void remains compatible with existing adapters. */
+  save(preferences: RendererPreferences): boolean | void;
 }
 
 export function createLocalStorageRendererPreferenceStore(
@@ -67,12 +68,15 @@ export function createLocalStorageRendererPreferenceStore(
         return { ...DEFAULT_RENDERER_PREFERENCES };
       }
     },
-    save(preferences: RendererPreferences): void {
+    save(preferences: RendererPreferences): boolean {
       try {
-        if (typeof globalThis.localStorage === "undefined") return;
-        globalThis.localStorage.setItem(key, JSON.stringify(restoreRendererPreferences(preferences)));
+        const storage = globalThis.localStorage;
+        if (storage === undefined || storage === null) return false;
+        storage.setItem(key, JSON.stringify(restoreRendererPreferences(preferences)));
+        return true;
       } catch {
         // A display preference must never block authoring.
+        return false;
       }
     }
   };

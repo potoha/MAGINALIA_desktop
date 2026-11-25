@@ -1,0 +1,252 @@
+/**
+ * Notice model and persisted notice state for the Collector integration (design 5 and 6, WP-5c).
+ *
+ * A notice is plain data: a stable id, a kind, the values its text needs, the actions (stable
+ * command IDs, design 5) and the condition that clears it. No renderer, no dialogs. WP-7 renders
+ * the data and dispatches the command IDs; nothing here registers a command.
+ *
+ * Persisted state (Desktop userData, one small JSON file) holds only flags, a version string and a
+ * timestamp. It never holds a path, a Shelf identifier or any Collector content.
+ */
+import { randomUUID } from "node:crypto";
+import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import * as path from "node:path";
+import { COLLECTOR_BROWSER_IDS, type CollectorBrowserId } from "./collector-browser-table.js";
+import { parseCollectorVersion } from "./collector-version.js";
+
+/** Commands already named by design 5. Registered by WP-7 together with the panel. */
+export const COLLECTOR_SETUP_COMMAND_ID = "maginalia.collector.setup";
+export const COLLECTOR_REPAIR_COMMAND_ID = "maginalia.collector.repair";
+/** New in WP-5c (not in design 5): the notice buttons of design 6.5 / 5. */
+export const COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND_ID = "maginalia.collector.openBrowserExtensions";
+export const COLLECTOR_DISMISS_NOTICE_COMMAND_ID = "maginalia.collector.dismissNotice";
+/** The remove command (design 5). The remove-failed notice's retry button dispatches it. */
+export const COLLECTOR_REMOVE_COMMAND_ID = "maginalia.collector.removeIntegration";
+/** B-2: leaves the "remove requested" state without removing anything; the integration returns to normal operation. */
+export const COLLECTOR_CANCEL_REMOVE_COMMAND_ID = "maginalia.collector.cancelRemove";
+
+export const COLLECTOR_NOTICE_IDS = Object.freeze({
+  updated: "collector.notice.updated",
+  repair: "collector.notice.repair",
+  alpha1Migration: "collector.notice.alpha1-migration",
+  removeFailed: "collector.notice.remove-failed",
+} as const);
+
+export type CollectorNoticeKind = "updated" | "repair" | "alpha1-migration" | "remove-failed";
+export type CollectorRepairNoticeState = "foreign-registration" | "registration-missing" | "damaged";
+
+export interface CollectorNoticeAction {
+  readonly commandId: string;
+  readonly label: string;
+  /** Only `maginalia.collector.dismissNotice` carries an argument: the id of the notice to close. */
+  readonly argument?: { readonly noticeId: string };
+  /** After this action runs, the caller also dispatches `maginalia.collector.dismissNotice` for this notice. */
+  readonly closesNoticeId?: string;
+}
+
+interface NoticeBase {
+  readonly id: string;
+  readonly title: string;
+  readonly detail: string | null;
+  readonly actions: readonly CollectorNoticeAction[];
+}
+
+export type CollectorNotice =
+  | (NoticeBase & {
+    readonly kind: "updated";
+    /** The Collector extension version Desktop placed. */
+    readonly extensionVersion: string;
+    /** ISO time of the refresh. A contact record counts only when it is not older than this. */
+    readonly createdAt: string;
+    /** Cleared by a contact record that reports `extensionVersion` (or newer) after `createdAt`, or by dismissal. */
+    readonly clearsWhen: "contact-reports-extension-version";
+  })
+  | (NoticeBase & {
+    readonly kind: "repair";
+    readonly state: CollectorRepairNoticeState;
+    /** Recomputed at every start; closed for the session by dismissal. */
+    readonly clearsWhen: "state-recovers-or-dismissed";
+  })
+  | (NoticeBase & {
+    readonly kind: "alpha1-migration";
+    /** Shown once; dismissal (or the setup action) is remembered. */
+    readonly clearsWhen: "dismissed";
+  })
+  | (NoticeBase & {
+    readonly kind: "remove-failed";
+    /**
+     * Not persisted. Raised in the session where a confirmed remove threw or ended `failed` (B-5), and again at startup
+     * while `removeRequested` is set and the installation is `outdated` (the state in which the automatic refresh
+     * is paused). Replaced by any later remove result (raised again if that one failed too), cleared by an applied or
+     * noop setup / repair or by `cancelRemove` (B-2), or closed for the session by dismissal.
+     */
+    readonly clearsWhen: "remove-or-setup-applied-or-dismissed";
+  });
+
+export function buildUpdatedNotice(extensionVersion: string, createdAt: string): CollectorNotice {
+  return Object.freeze({
+    id: COLLECTOR_NOTICE_IDS.updated,
+    kind: "updated" as const,
+    title: `MAGINALIA Collector を新しい版（${extensionVersion}）に更新しました。`,
+    detail: "ブラウザーの拡張機能の画面で MAGINALIA Collector の［更新］（↻）を押すか、ブラウザーを再起動すると反映されます。",
+    extensionVersion,
+    createdAt,
+    clearsWhen: "contact-reports-extension-version" as const,
+    actions: Object.freeze([
+      { commandId: COLLECTOR_OPEN_BROWSER_EXTENSIONS_COMMAND_ID, label: "ブラウザーで拡張機能の画面を開く" },
+      { commandId: COLLECTOR_DISMISS_NOTICE_COMMAND_ID, label: "閉じる", argument: { noticeId: COLLECTOR_NOTICE_IDS.updated } },
+    ]),
+  });
+}
+
+/** Repair copy is not fixed by the design; WP-7 may refine the wording. */
+export function buildRepairNotice(state: CollectorRepairNoticeState): CollectorNotice {
+  return Object.freeze({
+    id: COLLECTOR_NOTICE_IDS.repair,
+    kind: "repair" as const,
+    title: "Collector 連携の確認が必要です。",
+    detail: "ブラウザーから本棚へ引用を保存する連携が、この MAGINALIA の設定と一致していません。自動では変更していません。",
+    state,
+    clearsWhen: "state-recovers-or-dismissed" as const,
+    actions: Object.freeze([
+      { commandId: COLLECTOR_REPAIR_COMMAND_ID, label: "確認・修復…" },
+      { commandId: COLLECTOR_DISMISS_NOTICE_COMMAND_ID, label: "閉じる", argument: { noticeId: COLLECTOR_NOTICE_IDS.repair } },
+    ]),
+  });
+}
+
+export function buildAlpha1MigrationNotice(): CollectorNotice {
+  return Object.freeze({
+    id: COLLECTOR_NOTICE_IDS.alpha1Migration,
+    kind: "alpha1-migration" as const,
+    title: "ブラウザーで読んでいる Web ページの引用を、本棚に保存できるようになりました（MAGINALIA Collector）。",
+    detail: null,
+    clearsWhen: "dismissed" as const,
+    actions: Object.freeze([
+      { commandId: COLLECTOR_SETUP_COMMAND_ID, label: "設定する", closesNoticeId: COLLECTOR_NOTICE_IDS.alpha1Migration },
+      { commandId: COLLECTOR_DISMISS_NOTICE_COMMAND_ID, label: "今はしない", argument: { noticeId: COLLECTOR_NOTICE_IDS.alpha1Migration } },
+    ]),
+  });
+}
+
+/**
+ * Decision 4: a remove that did not finish leaves `removeRequested` set, and while it is set and the state is
+ * `outdated` the startup refresh does not run. The notice is also raised right after a remove that ended `failed`
+ * without throwing (B-5), when the state may still be `ready` (the flag is then cleared at the next start), so the
+ * text does not claim the update is stopped: it says the removal is unfinished, that the automatic update may be
+ * paused until it ends, and names the two ways to end that: retry the removal or cancel it (B-2,
+ * `maginalia.collector.cancelRemove`). An applied or noop setup / repair also clears the flag.
+ */
+export function buildRemoveFailedNotice(): CollectorNotice {
+  return Object.freeze({
+    id: COLLECTOR_NOTICE_IDS.removeFailed,
+    kind: "remove-failed" as const,
+    title: "Collector 連携の解除に失敗しました",
+    detail: "解除を完了できませんでした。解除をやり直して完了するか、解除を取りやめてください。解除が終わるまで、Collector の自動更新が止まることがあります。本棚・引用データは削除されていません。",
+    clearsWhen: "remove-or-setup-applied-or-dismissed" as const,
+    actions: Object.freeze([
+      { commandId: COLLECTOR_REMOVE_COMMAND_ID, label: "解除をやり直す…" },
+      { commandId: COLLECTOR_CANCEL_REMOVE_COMMAND_ID, label: "解除を取りやめる", closesNoticeId: COLLECTOR_NOTICE_IDS.removeFailed },
+      { commandId: COLLECTOR_DISMISS_NOTICE_COMMAND_ID, label: "閉じる", argument: { noticeId: COLLECTOR_NOTICE_IDS.removeFailed } },
+    ]),
+  });
+}
+
+// ----- Persisted state ----------------------------------------------------------------------
+
+export type CollectorAlpha1NoticeState = "unseen" | "shown" | "dismissed";
+
+export interface CollectorNoticeState {
+  /** 2 since the multi-browser design (7.4). Version 1 files are still read (`browser` = null); every write is version 2. */
+  readonly version: 2;
+  /** The user asked for `remove`: no repair notice and no automatic refresh until a setup/repair is applied. */
+  readonly removeRequested: boolean;
+  readonly alpha1: CollectorAlpha1NoticeState;
+  /** The pending "updated" notice (until a matching contact or dismissal). */
+  readonly updated: { readonly extensionVersion: string; readonly createdAt: string } | null;
+  /** The browser the user last chose (a UI preference, never an installation fact), or `null`. */
+  readonly browser: CollectorBrowserId | null;
+}
+
+export const DEFAULT_COLLECTOR_NOTICE_STATE: CollectorNoticeState = Object.freeze({
+  version: 2 as const,
+  removeRequested: false,
+  alpha1: "unseen" as const,
+  updated: null,
+  browser: null,
+});
+
+const STATE_FIELDS_V1 = ["version", "removeRequested", "alpha1", "updated"] as const;
+const STATE_FIELDS_V2 = [...STATE_FIELDS_V1, "browser"] as const;
+const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u;
+const MAX_STATE_BYTES = 2048;
+
+/** `undefined` for anything that is not exactly the persisted shape. */
+export function parseCollectorNoticeState(text: string): CollectorNoticeState | undefined {
+  if (text.length > MAX_STATE_BYTES) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const fields = record.version === 1 ? STATE_FIELDS_V1 : record.version === 2 ? STATE_FIELDS_V2 : undefined;
+  if (fields === undefined) return undefined;
+  if (Object.keys(record).length !== fields.length || !fields.every((field) => Object.hasOwn(record, field))) return undefined;
+  if (typeof record.removeRequested !== "boolean") return undefined;
+  if (record.alpha1 !== "unseen" && record.alpha1 !== "shown" && record.alpha1 !== "dismissed") return undefined;
+  let updated: CollectorNoticeState["updated"] = null;
+  if (record.updated !== null) {
+    const pending = record.updated;
+    if (pending === undefined || typeof pending !== "object" || Array.isArray(pending)) return undefined;
+    const pendingFields = pending as Record<string, unknown>;
+    if (Object.keys(pendingFields).length !== 2 || typeof pendingFields.extensionVersion !== "string" || typeof pendingFields.createdAt !== "string") return undefined;
+    if (parseCollectorVersion(pendingFields.extensionVersion) === undefined || !TIMESTAMP_PATTERN.test(pendingFields.createdAt)) return undefined;
+    updated = Object.freeze({ extensionVersion: pendingFields.extensionVersion, createdAt: pendingFields.createdAt });
+  }
+  // A damaged or unknown saved browser is only a lost preference: ignore it, keep the rest of the state.
+  const browser: CollectorBrowserId | null = typeof record.browser === "string" && (COLLECTOR_BROWSER_IDS as readonly string[]).includes(record.browser)
+    ? (record.browser as CollectorBrowserId)
+    : null;
+  return Object.freeze({ version: 2 as const, removeRequested: record.removeRequested, alpha1: record.alpha1, updated, browser });
+}
+
+export interface CollectorNoticeStore {
+  /** Never throws: a missing or damaged file reads as the defaults. */
+  read(): Promise<CollectorNoticeState>;
+  /** Throws when the state cannot be written; callers treat that as "not persisted". */
+  write(state: CollectorNoticeState): Promise<void>;
+}
+
+/** Atomic (private temp + rename) JSON file in Desktop userData. */
+export function createFileCollectorNoticeStore(filePath: string): CollectorNoticeStore {
+  return {
+    async read(): Promise<CollectorNoticeState> {
+      try {
+        const text = await readFile(filePath, "utf8");
+        return parseCollectorNoticeState(text) ?? DEFAULT_COLLECTOR_NOTICE_STATE;
+      } catch {
+        return DEFAULT_COLLECTOR_NOTICE_STATE;
+      }
+    },
+    async write(state: CollectorNoticeState): Promise<void> {
+      await mkdir(path.dirname(filePath), { recursive: true });
+      const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        const handle = await open(temporary, "wx", 0o600);
+        try {
+          await handle.writeFile(`${JSON.stringify(state, null, 2)}\n`, "utf8");
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        await rename(temporary, filePath);
+      } catch (error: unknown) {
+        await unlink(temporary).catch(() => {});
+        throw error;
+      }
+    },
+  };
+}

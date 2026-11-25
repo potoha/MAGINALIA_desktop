@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -95,6 +95,107 @@ async function reload(window) {
   window.webContents.reload();
   await loaded;
   await waitFor(window, "Boolean(document.querySelector('#workbench'))", "the reloaded workbench");
+}
+
+async function sendRealPrimaryShortcut(window, selector, key) {
+  const setup = await window.webContents.executeJavaScript(`(() => {
+    const target = document.querySelector(${JSON.stringify(selector)});
+    if (!(target instanceof HTMLElement)) return false;
+    target.focus();
+    window.__maginaliaSmokeExpectedKey = ${JSON.stringify(key.toLowerCase())};
+    window.__maginaliaSmokeKeyEvents = [];
+    if (!window.__maginaliaSmokeKeyProbeInstalled) {
+      const originalPreventDefault = Event.prototype.preventDefault;
+      Event.prototype.preventDefault = function(...args) {
+        const result = originalPreventDefault.apply(this, args);
+        if (this instanceof KeyboardEvent
+          && this.key.toLowerCase() === window.__maginaliaSmokeExpectedKey
+          && (this.ctrlKey || this.metaKey)) {
+          window.__maginaliaSmokeKeyEvents.push({
+            key: this.key,
+            defaultPrevented: this.defaultPrevented,
+            targetId: this.target instanceof HTMLElement
+              ? (this.target.id || this.target.getAttribute('data-secondary-view-tab'))
+              : null,
+            via: 'preventDefault'
+          });
+        }
+        return result;
+      };
+      window.addEventListener('keydown', (event) => {
+        if (event instanceof KeyboardEvent
+          && event.key.toLowerCase() === window.__maginaliaSmokeExpectedKey
+          && (event.ctrlKey || event.metaKey)) {
+          window.__maginaliaSmokeKeyEvents.push({
+            key: event.key,
+            defaultPrevented: event.defaultPrevented,
+            targetId: event.target instanceof HTMLElement
+              ? (event.target.id || event.target.getAttribute('data-secondary-view-tab'))
+              : null,
+            via: 'window-capture'
+          });
+        }
+      }, true);
+      window.__maginaliaSmokeKeyProbeInstalled = true;
+    }
+    return document.activeElement === target;
+  })()`, true);
+  assertTrue(setup, `Could not focus ${selector} for a real Electron keyboard event.`);
+
+  window.show();
+  window.focus();
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  const retainedFocus = await window.webContents.executeJavaScript(
+    `(() => {
+      const target = document.querySelector(${JSON.stringify(selector)});
+      target?.focus();
+      return document.activeElement === target;
+    })()`, true);
+  assertTrue(retainedFocus, `Electron focus left ${selector} before the real keyboard event.`);
+  const modifiers = process.platform === "darwin" ? ["meta"] : ["control"];
+  window.webContents.sendInputEvent({ type: "keyDown", keyCode: key.toUpperCase(), modifiers });
+  window.webContents.sendInputEvent({ type: "keyUp", keyCode: key.toUpperCase(), modifiers });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  return await window.webContents.executeJavaScript("window.__maginaliaSmokeKeyEvents ?? []", true);
+}
+
+async function checkQuickOpenNativeFallback(window) {
+  const disabledQuickOpen = await sendRealPrimaryShortcut(window, "#library-query", "p");
+  assertTrue(disabledQuickOpen.some((event) => event.targetId === "library-query" && event.defaultPrevented),
+    `No-Project Quick Open from the Shelf search input must consume Ctrl/Cmd+P: ${JSON.stringify(disabledQuickOpen)}.`);
+  const textEditing = await sendRealPrimaryShortcut(window, "#library-query", "a");
+  assertTrue(textEditing.some((event) => event.targetId === "library-query" && !event.defaultPrevented),
+    `Ctrl/Cmd+A must remain native in the Shelf search input: ${JSON.stringify(textEditing)}.`);
+
+  await window.webContents.executeJavaScript(`localStorage.setItem('maginalia.keybindings.v1', JSON.stringify({
+    version: 1,
+    overrides: { 'maginalia.workbench.showQuickOpen': 'Mod+Alt+P' }
+  }))`, true);
+  await reload(window);
+  await waitFor(window, "Boolean(document.querySelector('#library-query'))", "the remapped Quick Open search field");
+  const remappedDefault = await sendRealPrimaryShortcut(window, "#secondary-view-tabs [data-secondary-view-tab='menu']", "p");
+  assertTrue(remappedDefault.some((event) => event.targetId === "secondary-tab-menu" && event.defaultPrevented),
+    `Remapped Quick Open must consume its old Ctrl/Cmd+P default on a non-editor surface: ${JSON.stringify(remappedDefault)}.`);
+  const remappedUnavailable = await sendRealPrimaryShortcut(window, "#library-query", "p");
+  assertTrue(remappedUnavailable.some((event) => event.targetId === "library-query" && event.defaultPrevented),
+    `Unavailable remapped Quick Open must not leak its active shortcut from a search field: ${JSON.stringify(remappedUnavailable)}.`);
+
+  await window.webContents.executeJavaScript(`localStorage.setItem('maginalia.keybindings.v1', JSON.stringify({
+    version: 1,
+    overrides: { 'maginalia.workbench.showQuickOpen': null }
+  }))`, true);
+  await reload(window);
+  await waitFor(window, "Boolean(document.querySelector('#library-query'))", "the unbound Quick Open search field");
+  const unboundDefault = await sendRealPrimaryShortcut(window, "#library-query", "p");
+  assertTrue(unboundDefault.some((event) => event.targetId === "library-query" && event.defaultPrevented),
+    `Unbound Quick Open must consume its old Ctrl/Cmd+P default from a search field: ${JSON.stringify(unboundDefault)}.`);
+  const paletteStayedClosed = await window.webContents.executeJavaScript(
+    "document.querySelector('.command-palette')?.hidden === true", true);
+  assertTrue(paletteStayedClosed, "Quick Open's disabled or shadowed shortcut must not open the Command Palette.");
+
+  await window.webContents.executeJavaScript("localStorage.removeItem('maginalia.keybindings.v1')", true);
+  await reload(window);
+  await waitFor(window, "Boolean(document.querySelector('#library-query'))", "default Quick Open bindings after the regression test");
 }
 
 async function readState(window) {
@@ -246,6 +347,185 @@ async function checkExplorerActionLayout(window) {
   assertTrue(result.compactActions, 'Explorer row action typography must remain compact.');
 }
 
+async function checkCommandPalette(window) {
+  const opened = await window.webContents.executeJavaScript(`(() => {
+    const focusTarget = document.querySelector('#secondary-view-tabs [data-secondary-view-tab="library"]');
+    focusTarget?.focus();
+    window.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'p', bubbles: true, cancelable: true,
+      ctrlKey: ${process.platform !== "darwin"}, metaKey: ${process.platform === "darwin"}, shiftKey: true
+    }));
+    return { active: focusTarget === document.activeElement, hasPalette: Boolean(document.querySelector('.command-palette')) };
+  })()`, true);
+  assertTrue(opened.hasPalette, 'Command Palette must be mounted in Electron.');
+  await waitFor(window, `document.querySelector('.command-palette')?.hidden === false`, 'Ctrl+Shift+P opening the command palette');
+  await waitFor(window, `document.querySelector('.command-palette > input') === document.activeElement`, 'Command Palette input focus');
+
+  const paletteState = await window.webContents.executeJavaScript(`(() => {
+    const palette = document.querySelector('.command-palette');
+    const input = palette?.querySelector('input');
+    if (!(palette instanceof HTMLElement) || !(input instanceof HTMLInputElement)) return null;
+    input.value = '> palette';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    const option = palette.querySelector('.command-palette-item[aria-selected="true"]');
+    if (!(option instanceof HTMLElement)) return null;
+    const category = option.querySelector('.command-palette-category');
+    const description = option.querySelector('.command-palette-description');
+    const shortcut = option.querySelector('kbd');
+    const match = option.querySelector('mark.command-palette-match');
+    const rgb = (value) => {
+      const parts = value.match(/[\\d.]+/g)?.map(Number) ?? [];
+      return parts.length >= 3 ? parts.slice(0, 3).map((part) => part / 255) : null;
+    };
+    const luminance = (color) => color?.map((channel) => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4)
+      .reduce((sum, channel, index) => sum + channel * [0.2126, 0.7152, 0.0722][index], 0) ?? null;
+    const contrast = (foreground, background) => {
+      const left = luminance(rgb(foreground));
+      const right = luminance(rgb(background));
+      return left === null || right === null ? null : (Math.max(left, right) + 0.05) / (Math.min(left, right) + 0.05);
+    };
+    const style = (element) => element ? getComputedStyle(element) : null;
+    const paletteStyle = style(palette);
+    const inputStyle = style(input);
+    const optionStyle = style(option);
+    const categoryStyle = style(category);
+    const descriptionStyle = style(description);
+    const shortcutStyle = style(shortcut);
+    const matchStyle = style(match);
+    const ratios = {
+      palette: contrast(paletteStyle.color, paletteStyle.backgroundColor),
+      input: contrast(inputStyle.color, inputStyle.backgroundColor),
+      message: contrast(style(palette.querySelector('.command-palette-message')).color, paletteStyle.backgroundColor),
+      title: contrast(style(option.querySelector('.command-palette-command-title')).color, optionStyle.backgroundColor),
+      category: contrast(categoryStyle.color, categoryStyle.backgroundColor),
+      description: contrast(descriptionStyle.color, optionStyle.backgroundColor),
+      shortcut: contrast(shortcutStyle.color, shortcutStyle.backgroundColor),
+      match: contrast(matchStyle.color, matchStyle.backgroundColor),
+      focus: contrast(inputStyle.outlineColor, paletteStyle.backgroundColor)
+    };
+    return {
+      rows: [...palette.querySelectorAll('.command-palette-item')].length,
+      selected: option.getAttribute('aria-selected'),
+      title: option.querySelector('.command-palette-command-title')?.textContent?.trim() ?? '',
+      category: category?.textContent?.trim() ?? '',
+      description: description?.textContent?.trim() ?? '',
+      shortcut: shortcut?.textContent?.trim() ?? '',
+      hasHighlight: match !== null,
+      ratios,
+      activeDescendant: input.getAttribute('aria-activedescendant')
+    };
+  })()`, true);
+  assertTrue(paletteState && paletteState.rows > 0, 'Command Palette must show command results.');
+  assertEqual(paletteState.selected, 'true', 'Initial result must be visibly selected.');
+  assertTrue(paletteState.title.includes('Command Palette'), 'Command title must be readable.');
+  assertTrue(paletteState.category.length > 0, 'Command category must be visible.');
+  assertTrue(paletteState.description.length > 0, 'Command description must be visible.');
+  assertTrue(paletteState.shortcut.length > 0, 'Effective keyboard shortcut must be visible.');
+  assertTrue(paletteState.hasHighlight, 'Matched text must be visibly highlighted.');
+  process.stdout.write(`Command Palette contrast ratios: ${JSON.stringify(paletteState.ratios)}\n`);
+  for (const [surface, ratio] of Object.entries(paletteState.ratios)) {
+    assertTrue(ratio !== null && ratio >= (surface === 'focus' ? 3 : 4.5), `${surface} contrast ${ratio} is below its accessibility target.`);
+  }
+  const imeKeyConsumed = await window.webContents.executeJavaScript(`(() => {
+    const input = document.querySelector('.command-palette > input');
+    const event = new KeyboardEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true, cancelable: true });
+    input.dispatchEvent(event);
+    return event.defaultPrevented;
+  })()`, true);
+  assertEqual(imeKeyConsumed, false, 'IME composition Enter must not activate the selected palette result.');
+
+  const screenshotDirectory = process.env.MAGINALIA_COMMAND_PALETTE_EVIDENCE_DIR;
+  if (screenshotDirectory) {
+    await mkdir(screenshotDirectory, { recursive: true });
+    window.show();
+    await window.webContents.executeJavaScript('new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))', true);
+    await writeFile(path.join(screenshotDirectory, 'command-palette-selected.png'), (await window.capturePage()).toPNG());
+  }
+
+  const navigationState = await window.webContents.executeJavaScript(`(() => {
+    const input = document.querySelector('.command-palette > input');
+    input.value = '> ';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    const items = [...document.querySelectorAll('.command-palette-item')];
+    if (items.length < 2) return { moved: false, rows: items.length, scrolledToSelection: false };
+    const list = document.querySelector('.command-palette-results');
+    const firstId = document.querySelector('.command-palette-item[aria-selected="true"]')?.id;
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+    const nextId = document.querySelector('.command-palette-item[aria-selected="true"]')?.id;
+    for (let index = 1; index < items.length; index += 1) {
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+    }
+    const active = document.querySelector('.command-palette-item[aria-selected="true"]');
+    const listRect = list.getBoundingClientRect();
+    const activeRect = active.getBoundingClientRect();
+    return {
+      moved: Boolean(firstId && nextId && firstId !== nextId),
+      rows: items.length,
+      activeIsLast: active === items.at(-1),
+      scrollTop: list.scrollTop,
+      scrollHeight: list.scrollHeight,
+      clientHeight: list.clientHeight,
+      activeTop: activeRect.top,
+      activeBottom: activeRect.bottom,
+      listTop: listRect.top,
+      listBottom: listRect.bottom,
+      scrolledToSelection: activeRect.top >= listRect.top - 1 && activeRect.bottom <= listRect.bottom + 1
+    };
+  })()`, true);
+  assertTrue(navigationState.moved && navigationState.rows > 1, 'Arrow keys must move the selected result.');
+  assertTrue(navigationState.activeIsLast && navigationState.scrolledToSelection, `The selected result must scroll into view: ${JSON.stringify(navigationState)}.`);
+  await window.webContents.executeJavaScript(`(() => {
+    const input = document.querySelector('.command-palette > input');
+    input.value = 'file: no-such-document';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`, true);
+  const emptyState = await window.webContents.executeJavaScript(`({
+    rows: document.querySelectorAll('.command-palette-item').length,
+    message: document.querySelector('.command-palette-message')?.textContent ?? '',
+    visible: document.querySelector('.command-palette-message')?.hidden === false
+  })`, true);
+  assertEqual(emptyState.rows, 0, 'Unavailable document picker must not return command or file rows.');
+  assertTrue(emptyState.visible && emptyState.message.includes('active Project'), 'Empty file mode must explain its active-Project scope.');
+  if (screenshotDirectory) {
+    await window.webContents.executeJavaScript('new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))', true);
+    await writeFile(path.join(screenshotDirectory, 'command-palette-empty.png'), (await window.capturePage()).toPNG());
+  }
+
+  await window.webContents.executeJavaScript(`(() => {
+    const input = document.querySelector('.command-palette > input');
+    input.value = '?';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`, true);
+  const help = await window.webContents.executeJavaScript(`document.querySelector('.command-palette-message')?.textContent ?? ''`, true);
+  assertTrue(help.includes('project:') && help.includes('file:'), 'Quick Pick help must explain both name modes.');
+  await window.webContents.executeJavaScript(`document.querySelector('.command-palette > input')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))`, true);
+  await waitFor(window, `document.querySelector('.command-palette')?.hidden === true`, 'Escape cancelling the command palette');
+  const restoredFocus = await window.webContents.executeJavaScript(`document.activeElement === document.querySelector('#secondary-view-tabs [data-secondary-view-tab="library"]')`, true);
+  assertTrue(restoredFocus, 'Escape must restore focus to the control that opened the palette.');
+
+  await window.webContents.executeJavaScript(`window.dispatchEvent(new KeyboardEvent('keydown', {
+    key: 'p', bubbles: true, cancelable: true,
+    ctrlKey: ${process.platform !== "darwin"}, metaKey: ${process.platform === "darwin"}, shiftKey: true
+  }))`, true);
+  await waitFor(window, `document.querySelector('.command-palette')?.hidden === false`, 'reopening the command palette');
+  await waitFor(window, `document.querySelector('.command-palette > input') === document.activeElement`, 'reopened Command Palette input focus');
+  await window.webContents.executeJavaScript(`(() => {
+    const input = document.querySelector('.command-palette > input');
+    input.value = '> settings';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    const target = document.querySelector('.command-palette-item[data-command-id="maginalia.settings.open"]');
+    const options = [...document.querySelectorAll('.command-palette-item')];
+    const targetIndex = options.indexOf(target);
+    for (let index = 0; index < targetIndex; index += 1) {
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+    }
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+  })()`, true);
+  await waitFor(window, `document.querySelector('#settings-center')?.open === true`, 'Enter executing a registered Settings command');
+  await window.webContents.executeJavaScript(`document.querySelector('#settings-center')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))`, true);
+  await waitFor(window, `document.querySelector('#settings-center')?.open === false`, 'Settings Escape cancellation');
+}
+
 async function resize(window, region, startX, endX) {
   const resized = await window.webContents.executeJavaScript(`(() => {
     const handle = document.querySelector('[data-workbench-resize=${JSON.stringify(region)}]');
@@ -266,9 +546,10 @@ async function press(window, key, options = {}) {
 }
 
 async function runChild(userDataPath) {
-  const { app, BrowserWindow } = await import("electron");
+  const { app, BrowserWindow, ipcMain } = await import("electron");
   app.setPath("userData", userDataPath);
   await app.whenReady();
+  ipcMain.handle("maginalia:update-application-menu", () => undefined);
 
   const createWindow = () => new BrowserWindow({
     show: false,
@@ -287,6 +568,8 @@ async function runChild(userDataPath) {
     });
     await waitFor(window, "Boolean(document.querySelector('#workbench'))", "the workbench");
     await waitFor(window, "Boolean(document.querySelector('.command-palette'))", "Workbench command registration");
+    await checkCommandPalette(window);
+    await checkQuickOpenNativeFallback(window);
 
     let state = await readState(window);
     assertTrue(state?.preloadBridge, "Workbench did not receive the existing preload bridge.");

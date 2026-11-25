@@ -60,6 +60,38 @@ async function writeRecord(
   });
 }
 
+async function writeV04WebRecord(
+  root: string,
+  index: number,
+  quote: string,
+  bookUrl: string,
+  annotationUrl?: string,
+): Promise<void> {
+  const ulid = `01ARZ3NDEKTSV4RRFFQ69G${index.toString(16).toUpperCase().padStart(4, "0")}`;
+  const bookId = `book:${ulid}`;
+  const book: Record<string, unknown> = {
+    type: "book",
+    version: "0.4",
+    id: bookId,
+    source: { kind: "website" },
+    get: { date: "202611031200" },
+    url: bookUrl,
+    title: `Website ${index}`,
+    authors: [`Web Author ${index}`],
+  };
+  const annotation: Record<string, unknown> = {
+    type: "annotation",
+    version: "0.4",
+    id: annotationId(index),
+    source: { id: bookId, kind: "website" },
+    get: { date: "202611031200" },
+    quote,
+    ...(annotationUrl === undefined ? { isbn13: "9780306406157" } : { url: annotationUrl }),
+  };
+  await writeJson(path.join(root, "books", `book-${index.toString().padStart(3, "0")}.json`), book);
+  await writeJson(path.join(root, "annotations", `annotation-${index.toString().padStart(3, "0")}.json`), annotation);
+}
+
 function opened(result: LibraryOpenResult) {
   expect(result.kind).toBe("opened");
   if (result.kind !== "opened") throw new Error("Expected the Library to open");
@@ -158,6 +190,35 @@ describe("LibraryService search and quotation resolution", () => {
         kind: "error",
         code: "invalid-query",
       });
+    });
+  });
+
+  it("searches v0.4 Annotation URLs first, falls back to the Book URL, and leaves legacy records URL-free", async () => {
+    await withTempDirectory(async (directory) => {
+      const root = await createSearchFixture(directory);
+      const annotationUrl = "https://example.test/annotation-specific-source";
+      const bookUrl = "https://example.test/book-level-source";
+      const fallbackUrl = "https://example.test/book-only-source";
+      await writeV04WebRecord(root, 3, "The Collector example quotation", bookUrl, annotationUrl);
+      await writeV04WebRecord(root, 4, "A quote with only Book provenance", fallbackUrl);
+
+      const owner = {};
+      const service = new LibraryService();
+      const openedResult = opened(await service.openForOwner(owner, root));
+
+      expect(searchResults(service.searchForOwner(owner, openedResult.library.libraryId, "annotation-specific-source")).results)
+        .toEqual([expect.objectContaining({ annotationId: annotationId(3), url: annotationUrl })]);
+      expect(searchResults(service.searchForOwner(owner, openedResult.library.libraryId, "book-level-source")).results)
+        .toEqual([]);
+      expect(searchResults(service.searchForOwner(owner, openedResult.library.libraryId, "book-only-source")).results)
+        .toEqual([expect.objectContaining({ annotationId: annotationId(4), url: fallbackUrl })]);
+      expect(searchResults(service.searchForOwner(owner, openedResult.library.libraryId, "Collector example quotation")).results)
+        .toEqual([expect.objectContaining({ annotationId: annotationId(3), url: annotationUrl })]);
+
+      const legacy = searchResults(service.searchForOwner(owner, openedResult.library.libraryId, "通常の引用"))
+        .results.find((result) => result.annotationId === annotationId(0));
+      expect(legacy).toBeDefined();
+      expect(legacy).not.toHaveProperty("url");
     });
   });
 

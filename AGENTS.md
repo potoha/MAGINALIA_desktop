@@ -211,57 +211,30 @@ D059 removes the frozen remote Git/GitHub product path during pre-installer main
 
 Local development Git operations required to implement and commit work are allowed.
 
-## Model routing and orchestration
+## Agent roles and model routing
 
-Use the smallest capable model for the job.
+Product Owner defaults (updated 2026-10-31):
 
-### GPT-6 Luna Max — default worker
+| Agent | Default model |
+| --- | --- |
+| Orchestrator | GPT-6.1 Terra High |
+| Oracle | GPT-6.1 Sol High |
+| Explorer | GPT-6 Luna Max |
+| Designer | GPT-6.1 Terra High |
+| Fixer | GPT-6 Luna Max |
 
-Use GPT-6 Luna Max for concrete, directly executable work, including:
+These names are **routing preferences / role labels**, not proof that a particular provider exposes the same executable model ID. Before launching a role, verify its configured provider and model identifier in the current harness. If unavailable, report the missing route and request an explicit decision; do not silently substitute a different model while claiming to have used the specified one.
 
-- implementation;
-- bounded bug fixing;
-- focused repository inspection;
-- ordinary code review;
-- test execution and smoke verification;
-- small or medium documentation changes;
-- narrow investigation whose result can be acted on directly.
+Role responsibilities:
+- **Orchestrator (Terra High):** establish the task boundary; load the smallest relevant canonical context; delegate/sequence bounded work; aggregate evidence, blocker reports, and handoffs. Do not let delegation authorize extra scope.
+- **Oracle (Sol High):** architecture, cross-module ownership, unresolved contracts and high-risk choices. Return a decision, invariants, evidence, and small executable slices; avoid broad speculative implementation.
+- **Explorer (Luna Max):** targeted repository exploration, reproductions, relevant tests and evidence collection. Treat source/CI/real-machine findings separately.
+- **Designer (Terra High):** UI/UX states, information architecture and workflow design; use Figma and ui-ux-pro-max when warranted, without overriding accepted plans.
+- **Fixer (Luna Max):** bounded implementation, bug fixes, regression tests and verification according to an approved work packet.
 
-Luna Max is the default worker for actual implementation and ordinary investigation.
+Prefer the smallest scoped agent operation that can meet acceptance. Escalate to Oracle when product decisions, unclear ownership, data safety or a large decomposition genuinely require it. Explorer and Fixer must not invent product architecture merely to finish a task. Respect quota safe-stop, task bootstrap, data contracts and the no-merge/no-release gate regardless of model.
 
-A task does not require Sol merely because it touches many lines. Escalate when the hard part is judgment, ambiguity, architecture, cross-module ownership, or decomposition.
-
-### GPT-6.1 Sol Mid — decision and decomposition model
-
-Use GPT-6.1 Sol Mid for abstract or high-complexity work, including:
-
-- investigations spanning multiple modules where the root cause or ownership is unclear;
-- architecture or source-of-truth decisions;
-- large product/state-lifecycle decisions;
-- ambiguous failures where several subsystems could be responsible;
-- deciding whether existing systems should be unified or kept separate;
-- splitting a large task into small independent executable slices;
-- work that would otherwise require Luna to invent architecture.
-
-Sol Mid should normally return decisions and bounded executable slices rather than perform a broad implementation itself.
-
-Expected Sol output:
-
-```text
-Decision
-Root cause
-Invariants
-Slice 1
-Slice 2
-...
-Verification
-```
-
-Each slice must be simple enough for Luna Max to execute without further architectural invention.
-
-If Luna becomes uncertain during a slice, ask Sol. Do not guess.
-
-Older model-routing notes in repository memory are subordinate to this section and the latest explicit Product Owner instruction.
+These settings supersede the previous “Luna Max default worker / Sol Mid decision model” routing guidance. Historical routing in repository memory is subordinate to the latest explicit Product Owner direction.
 
 ## Scope boundary
 
@@ -380,6 +353,12 @@ Source code merely existing is not completion.
 Mock tests merely passing is not completion.
 
 A local implementation commit without the required canonical-plan write-back is not completion.
+
+## GitHub discussion and review record
+
+Record **specifications and refinements** in their governing GitHub Issue discussion; record **code review and requested changes** on the relevant PR. Preserve the rationale, acceptance criteria, PASS/FAIL/NOT VERIFIED evidence, and source-of-truth links there so decisions are inspectable without replaying chat. Chat handoffs should be concise pointers to the Issue/PR, not the sole durable record.
+
+Use MAGINALIA_IDE for accepted cross-product architecture and plans; Issue/PR comments alone do not silently override an accepted ADR. For significant changes, propose the smallest canonical write-back in the authorized repo. If that repo is out of the work order's scope, report the blocked write-back and link the proposed text rather than changing it unilaterally.
 
 ## Commit discipline
 
