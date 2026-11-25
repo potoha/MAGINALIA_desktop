@@ -33,7 +33,7 @@
 - 関連コード：packaging/electron-builder.json（署名の設定なし）；scripts/build-collector-host.mjs:341（`signing: unsigned (SmartScreen warning is a known limitation)`）
 - テスト：テストなし
 - 状態：実装済み
-- 備考：「署名なし」は設定が無いことで成り立つ。引継ぎ v4 §9-5 はコード署名を「PO の承認が要る」未了項目に置く。リリースの案内に SmartScreen の警告を書いた文書は、この調査では見つからない（要確認 #3）。
+- 備考：「署名なし」は設定が無いことで成り立つ。引継ぎ v4 §9-5 はコード署名を「PO の承認が要る」未了項目に置く。利用者向けの未署名・SmartScreen の注意書きは `README.md:43` にある（要確認 #3 は、導入ガイドにも手順を書くかの判断だけが残る）。
 
 ### INS-03 Desktop ショートカット（任意）
 - 受け入れ条件：
@@ -84,7 +84,7 @@
 ## 要確認（コードと文書の食い違い・文書にない点。仕様には書いていない）
 1. 設計 2.4 は、アンインストールが固定名の拡張機能ファイル（`collector-extension-files.json` の和集合）を削除するとし、状態ファイルの有無には触れない。実装の NSIS は有効な状態ファイルを所有の証拠にしている（collector-uninstall.nsh:14-17）。設計書が古いと見られる。`packaging/collector-extension-files.json` はこの worktree に見つからない（`git ls-files` で `collector-payload.example.json`、`collector-payload.schema.json` のみ）。
 2. α1 → α2 でデータが残ること、初回セットアップが再表示されないこと（設計 2.3）を、実機または自動テストで確認した記録がない。
-3. 未署名であること、SmartScreen の警告が出ることを、利用者向け文書に書く場所と文言が決まっていない（`docs/` を検索した範囲では記述なし。日本語マニュアルは `apps/desktop/packaging/manual` の PDF で、この調査では未読）。
+3. 未署名・SmartScreen の注意書きは `README.md:43` にある。`docs/` と日本語マニュアル（`apps/desktop/packaging/manual` の PDF、未読）に、SmartScreen を回避して実行する手順まで書くかは未決定。
 4. NSIS `==` の大文字小文字の扱い（collector-uninstall.nsh:379 とコメント :372 付近）。
 5. 全員向けインストール（`all`）のときの制限（後始末が走らない）を、リリースノートに書くことが設計 2.4 の条件。リリースノートは未確認。
 6. 設計 2.5 は旧スタンドアロン Host のインストーラ（`packaging/collector-host/installer.nsi`）の削除を定める。この worktree に当該ファイルは無く（`git ls-files` で未検出）、設計どおり。旧版を入れた試験者の HKCU 登録の移行は COL-02 の foreign 置換が担う。実機は未確認。

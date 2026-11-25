@@ -61,4 +61,4 @@
 3. ライセンスの実装は PR #112 のブランチにあり、基準ブランチは MIT のまま（license.md #1）。
 4. D073「CLA なし」と、CONTRIBUTING の著作権譲渡への同意文・PR テンプレートのチェックボックスの関係（license.md #2）。
 5. D074「進めない」と、ウィザードの Vivaldi の抜け道コードの関係（wizard.md #3）。
-6. 未署名・SmartScreen の警告を利用者に伝える文書が見つからない（installer.md #3）。
+6. 未署名・SmartScreen の注意書きは README.md:43 にある。導入ガイドに実行手順まで書くかは未決定（installer.md #3）。
