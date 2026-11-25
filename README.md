@@ -90,10 +90,22 @@ npm start
 
 **安全境界:** アプリのローカルGit履歴と、GitHub等へのリモート同期は別の機能です。認証、リモートfetch/push、復元などの製品機能は現行α1では凍結されています。開発作業のGit操作とは区別してください。
 
-## ライセンス
+## License
 
-**beyond the Word. / MAGINALIA PROJECT**が権利を持つ本リポジトリのコードには、個別の記載がない限り[MIT License](LICENSE)が適用されます。
+- MAGINALIA 0.2.0 以降: [GNU Affero General Public License v3.0 or later](LICENSE)（AGPL-3.0-or-later）
+- MAGINALIA 0.1.x 以前: MIT License（[LICENSE-MIT-0.1.txt](LICENSE-MIT-0.1.txt)）。0.1.x のライセンスは変わりません。
+- 著作権者は、AGPLの条件では利用できない組織向けに、別途商用ライセンスを提供することがあります。お問い合わせ: [GitHub Issues](https://github.com/potoha/MAGINALIA_desktop/issues)
+- 「MAGINALIA」の名称とロゴの扱いは [TRADEMARKS.md](TRADEMARKS.md) を参照してください。
+- 貢献を希望する方は [CONTRIBUTING.md](CONTRIBUTING.md) を読んでください。
 
-**MAGINALIA**の名称、ロゴ、ワードマークなどのブランド要素はMIT Licenseの許諾対象ではありません。詳しくは[NOTICE](NOTICE)を参照してください。第三者のライブラリやNDLOCR-Liteなどのコンポーネントには、それぞれのライセンスが適用されます。
+### 要点（法的な保証ではありません）
+
+- 自由に使用・改変・再配布できます。
+- 改変版を配布する場合、またはネットワーク経由でサービスとして提供する場合は、その改変版のソースコードを同じAGPLの条件で利用者に提供する必要があります。
+- フォークは歓迎します。改善はぜひ upstream に送ってください。
+
+第三者のライブラリやNDLOCR-Liteなどのコンポーネントには、それぞれのライセンスが適用されます。
 
 MAGINALIAで作成・編集した原稿、ノート、引用やその他のユーザーデータに、ソフトウェアのライセンスが自動的に適用されることはありません。
+
+Copyright (C) 2026 MADA 5sounds (go-on) / beyond the Word.

@@ -1,6 +1,7 @@
 {
   "name": "maginalia-alpha",
   "private": true,
+  "license": "AGPL-3.0-or-later",
   "workspaces": [
     "packages/format",
     "packages/repository-core",
