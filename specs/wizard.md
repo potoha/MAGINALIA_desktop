@@ -33,7 +33,7 @@
   - 実機: 未確認（完了カードの上でウィザードのダイアログが正しく出るか、初回セットアップ直後に実行できるか）
 - 関連コード：src/renderer/first-run-collector-guide.ts（案内文と結びつけ）、src/renderer/main.ts:503-507（完了カードの節）、:534-547（起動関数の再利用と表示）、src/renderer/style.css
 - テスト：src/renderer/first-run-collector-guide.test.ts（4 件。押すまで開かない／押すと 1 回開く／起動関数なしで非表示／例外時のエラー表示／本文がブラウザーに偏らない）。main.ts の DOM 組み立ては対象外。
-- 状態：実装済み
+- 状態：検証済み（2026-11-25 最終チェック。新インストーラー f5e9fa9c… の実機 3-3〜3-8 が PASS。操作できる環境でない場合に節を隠す動きは単体テストのみ）
 - 備考：PO 指示（2026-11-25）で追加。コミット 94d82f9。
 
 ### WIZ-03 手順の構成と進捗表示
@@ -55,7 +55,7 @@
   - 実機: 未確認
 - 関連コード：src/renderer/collector-wizard-model.ts:262-366（`wizardDefaultOptionId`、`wizardOptionFor`、`wizardBrowserOptions`）、:1493（`wizardAView`）；src/renderer/collector-wizard-copy.ts:462-470
 - テスト：src/renderer/collector-wizard-model.test.ts:1605-1780（step A choices の表）、:1336
-- 状態：実装済み
+- 状態：検証済み（2026-11-25 最終チェック。実機 PASS（旧インストーラー。ウィザードのコードは変更なし））
 - 備考：Vivaldi が導入済みで既定ではなく、Chrome と Edge が未導入のとき、Vivaldi を名前つきで出す抜け道がある（model.ts:301-309。コメントに「owner decision 2026-11-24」）。D074 との整合は要確認 #3。
 
 ### WIZ-05 おすすめと初期選択
@@ -67,7 +67,7 @@
   - 実機: 未確認
 - 関連コード：src/collector-browser-table.ts:359-384（`recommendCollectorBrowser`）、:386-400（`defaultReason`）；src/renderer/collector-wizard-model.ts:313、:1499-1531；src/renderer/collector-wizard-copy.ts:462
 - テスト：src/collector-browser-table.test.ts:229、:304；src/renderer/collector-wizard-model.test.ts:1605-1780
-- 状態：実装済み
+- 状態：検証済み（2026-11-25 最終チェック。実機 PASS（旧インストーラー。ウィザードのコードは変更なし））
 - 備考：引継ぎ v4 §10 の表と同じ内容。軽微な未対応：ラベルの括弧の重なり、「前回は {名前} を選びました。」が今は出していない選択肢を指す場合（引継ぎ v4 §10「軽微」）。
 
 ### WIZ-06 既定ブラウザー別の案内文（reason）
@@ -75,7 +75,7 @@
   - 理由は 8 種：`default-supported`、`default-unsupported`（組織 policy のブロック専用）、`default-not-chromium`、`default-unverified`、`default-not-installed`、`default-unknown`、`none-installed`、`detection-failed`。
   - 既定が Firefox など非 Chromium のとき `default-not-chromium`：「ふだんお使いのブラウザーは、Collector に対応していません。」と「Collector は Chromium 系のブラウザーでだけ使えます。…」を出す。
   - 既定が Brave など未検証の Chromium のとき `default-unverified`：「ふだんお使いのブラウザーでは、Collector の動作をまだ確認していません。」と「下の選択肢から、Chrome か Edge を選んでください。」を出す。
-  - 対応ブラウザーが無いとき `none-installed`：「対応しているブラウザー（Microsoft Edge、Google Chrome、Vivaldi）が見つかりませんでした。」を出す。
+  - 対応ブラウザーが無いとき `none-installed`：「対応しているブラウザー（Google Chrome、Microsoft Edge、Vivaldi）が見つかりませんでした。」を出す。
   - どの理由の文言も、特定のブラウザーをおすすめする文を含まない（`default-supported` の「…に Collector を入れることをおすすめします。」を除く）。
   - 実機: 未確認
 - 関連コード：src/collector-browser-table.ts:344-357（理由の型）；src/renderer/collector-wizard-copy.ts:208、:473-504
@@ -92,7 +92,7 @@
   - 実機: 未確認（狭い幅での折り返しは未確認）
 - 関連コード：src/renderer/collector-wizard-model.ts:1319（`wizardActions`）、:1452-1455（並べ替え）；src/renderer/collector-wizard-panel.ts（ボタン行）
 - テスト：src/renderer/collector-wizard-model.test.ts:1524；src/renderer/collector-wizard-panel.test.ts；src/renderer/collector-wizard-view.test.ts
-- 状態：実装済み
+- 状態：検証済み（2026-11-25 最終チェック。実機 PASS（旧インストーラー。ウィザードのコードは変更なし））
 - 備考：「ツール行とナビ行の統合」を直接アサートするテストの有無は未確認。
 
 ### WIZ-08 登録の結果表示（ステップ B）
@@ -165,8 +165,8 @@
 - 状態：実装済み
 
 ## 要確認（コードと文書の食い違い・文書にない点。仕様には書いていない）
-1. 設計 4.1 は「初回セットアップの完了カードに Collector の案内を加える」。実装には該当する参照が見つからない（`src/first-run-*.ts` と `src/renderer` の初回セットアップ関連に Collector 無し）。新規インストールの利用者が Collector の設定へ到達するのは、メニューまたはコマンドだけに見える。α1 からの利用者は移行通知（COL-11）で案内される。「初回ウィザード」の範囲に初回セットアップとの連携を含めるかを確認したい（WIZ-02 は未着手として残した）。
+1. 解決：完了カードの任意の案内（WIZ-02）は実装済み（94d82f9）で、新インストーラーの実機で確認済み（2026-11-25）。設計 4.1 に対応する。
 2. 設計書 §4（Chrome のみ前提）と、実装・引継ぎ v4 §5・§10（Chrome／Edge／Vivaldi、選択肢 3 つ、おすすめは既定のみ、ボタン順）が異なる。設計書・正本計画への書き戻しは引継ぎ v4 §10「未確認」で未実施。受け入れ条件は引継ぎ v4 と実装テストに合わせた。
-3. D074 は「Chrome が policy でブロック・Edge 未導入・Vivaldi 導入済みは進めない」と定める。一方、model.ts:301-309 は、選べる選択肢が無いとき Vivaldi を名前つきで並べる抜け道を持つ（コメントに「owner decision 2026-11-24」）。Vivaldi は借用先の Chrome キーがブロックされるため選択不可になり、結果は「進めない」になるはずだが、この組み合わせを直接検証するテストが見つからない（引継ぎ v4 §10「取りこぼし：Vivaldi 既定 + Chrome policy block + setup」、「要確認 2b のテスト」）。
+3. 解決（D074）：Chrome が policy でブロック・Edge 未導入・Vivaldi 導入済みは進めない。model.ts の抜け道（:330-338）は、借用先の Chrome キーがブロックされると Vivaldi が選択不可（borrowed-blocked）になるため、「進めない」を壊さない。この組み合わせのテストは `src/renderer/collector-wizard-model.test.ts:1739-1745`（:1730、:1773 も）にある。
 4. 設計 4.2 の「ステップ A」の文言（「Chrome で集めた引用を本棚へ」など）は実装で「ブラウザーで…」に変わっている。設計 4.5 の画面文言は「実際の Chrome のスクリーンショットで確認する」とされるが、その確認の記録は見つからない（引継ぎ v4 §10 でも Vivaldi の UI ラベルは未確認）。
 5. 引継ぎ v4 §10「軽微（未対応）」：ラベルの括弧の重なり、対応ブラウザー一覧と none-installed のダウンロードボタンが Edge 先頭の名残、`multiBrowserNote` の「おすすめ」の語、「前回は…」が今ない選択肢を指す場合。仕様には含めていない。

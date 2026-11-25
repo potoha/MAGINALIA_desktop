@@ -9,7 +9,7 @@
 - 根拠文書：`docs/collector-wizard-integration-design.md`（設計案）、`docs/desktop-alpha2-packaging.md`、引継ぎ `docs/handoff-collector-wizard-s8-2026-11-23-v4.md`（`D:\python\MAGINALIA_ALPHA` 側。この worktree には無い）。
 - Desktop アプリ本体（main プロセス）が、ユーザー操作の後に Host ファイルと HKCU のレジストリ値を書く。インストーラは読み取り専用のペイロードを配るだけ（設計 3.2）。
 - 描画側（renderer）は「意図（intent）」だけを送り、パスは送らない（設計 4.1）。
-- **対応ブラウザー（PO 確認 2026-11-25）：Chrome と Edge の 2 つ。** Vivaldi は Chrome のキーを借りて動く（独自のキーは書かない）。設計書の「Chrome のみ」は古く、コードと本書を正とする。
+- **対応ブラウザー（PO 確認 2026-11-25）：Chrome・Edge・Vivaldi の 3 つ。** 登録先のレジストリキーは Chrome と Edge の 2 つで、Vivaldi は Chrome のキーを借りて動く（独自のキーは書かない）。Vivaldi は実機（旧インストーラー、2026-11-25）で登録→確認まで確認済み。設計書の「Chrome のみ」は古く、コードと本書を正とする。
 - 設計書は Chrome のみ・状態ファイル v1 の記述。実装は Chrome と Edge の 2 つの書込み先・状態ファイル v2 に進んでいる。差は「要確認」に列挙した。
 - 「実機」欄：パッケージ版の実機確認（インストール、レジストリ、ブラウザー操作）は、引継ぎ v4 の時点で未実施。実機確認の記録があるのは、引継ぎ v4 §2・§4 の Edge の ProgId・拡張機能 ID・origin など（2026-11-22）だけ。
 
@@ -18,7 +18,7 @@
 ### COL-01 Host manifest と登録先の固定値
 - 受け入れ条件：
   - Host の名前が `org.maginalia.collector` のとき、生成される manifest は `name`=`org.maginalia.collector`、`type`=`stdio`、`path`=`host-<a|b>\MAGINALIA-Collector-Host.exe`（相対）、`allowed_origins`=`["chrome-extension://blgmoddncpknfnikdfnjelmdmphfgknf/"]` の 1 件だけになる。
-  - 書込み対象のレジストリは HKCU の `Software\Google\Chrome\NativeMessagingHosts\org.maginalia.collector` と `Software\Microsoft\Edge\NativeMessagingHosts\org.maginalia.collector` の既定値で、値は `%LOCALAPPDATA%\Programs\MAGINALIA Collector\org.maginalia.collector.json`。`Software\Chromium\...` と `Software\Vivaldi\...` は読むだけで書かない。
+  - 書込み対象のレジストリは HKCU の `Software\Google\Chrome\NativeMessagingHosts\org.maginalia.collector` と `Software\Microsoft\Edge\NativeMessagingHosts\org.maginalia.collector` の既定値で、値は `%LOCALAPPDATA%\Programs\MAGINALIA Collector\org.maginalia.collector.json`。`Software\Chromium\...` は読むだけで書かない。Vivaldi は専用のキーを持たず、読みも書きもしない（Chrome のキーを借りる）。
   - 実機: 未確認
 - 関連コード：
   - src/collector-payload.ts:12-16（プロトコル、拡張機能 ID、許可 origin、Host 実行ファイル名）
@@ -115,11 +115,11 @@
 
 ### COL-08 自己確認（self-check）
 - 受け入れ条件：
-  - 登録後、レジストリ → manifest → 実行ファイルを Chrome と同じ順にたどって Host を起動し、`health` と `host_info` を送る。プロトコル識別子と Host のバージョンが埋め込み値と等しいとき成功。
+  - 登録後、レジストリ → manifest → 実行ファイルを Chrome と同じ順にたどって Host を起動し、`health` を送る。プロトコル識別子が埋め込み値と等しく、かつ起動直前の実行ファイルのハッシュ照合（埋め込み値との一致）が通ったとき成功。Host のバージョン比較は、Host が `health` で版を返すまで行わない（TODO(WP-6)。PO 承認 2026-11-25）。
   - 失敗したとき、状態は `damaged` として報告され、`ready` とは扱わない。
   - 自己確認は拡張機能やブラウザーの動作は証明しない。
   - 実機: 未確認
-- 関連コード：src/collector-integration-apply-self-check.ts；src/collector-integration-service.ts:325-336
+- 関連コード：src/collector-integration-apply-self-check.ts；src/collector-integration-service.ts:325-336；src/collector-integration-apply.ts:919-925（ハッシュ照合と TODO(WP-6)）
 - テスト：src/collector-integration-apply.test.ts:1133
 - 状態：実装済み
 
@@ -177,7 +177,7 @@
   - 実機: 未確認
 - 関連コード：src/collector-integration-ipc.ts:28-89；src/collector-integration-service.ts:355-420
 - テスト：src/collector-integration-ipc.test.ts；src/windows-integration.test.ts:461（source scan）；src/collector-integration.test.ts:821
-- 状態：実装済み
+- 状態：検証済み（2026-11-25 最終チェック。静的な性質。実機は不要（collector-integration*.ts に process.env/cwd/argv が 0 件））
 - 備考：設計 4.1 は「拡張機能フォルダーのパスだけは表示・コピー用に描画側へ渡る」。実装のウィザード文言は「フォルダーの場所は画面には表示しません」（要確認 #3）。`collector-integration-apply-self-check.ts` と `main.ts` は環境を読む（子プロセス用の環境構築など）。設計の「`collector-integration*.ts` は読まない」との整合は未確認。
 
 ### COL-14 コマンドとメニュー
@@ -218,7 +218,7 @@
   - https の既定ハンドラーの ProgId が `^MSEdgeHTM$` なら Edge、`^ChromeHTML(\.[A-Za-z0-9]+)?$` なら Chrome、`^VivaldiHTM(\.[A-Za-z0-9]+)?$` なら Vivaldi と判定する。Brave などの Chromium 系は `other-chromium`、それ以外は `other`、空は `unknown`。
   - Vivaldi は専用の登録先を持たず（`ownTargets` が空）、Chromium キーと Chrome キーの順に読む。
   - リリースゲート `collectorBrowserReleaseGateViolations` は空を返す。
-  - 実機: 一部確認。Edge の ProgId（`MSEdgeHTM`）、拡張機能 ID、origin は 2026-11-22 に実機で確認（引継ぎ v4 §2）。Vivaldi の ProgId `VivaldiHTM` は spike で実測。**Vivaldi で実 Collector 0.3.0 をパッケージ版から通した確認は未確認**（引継ぎ v4 §10「未確認」）。
+  - 実機: 一部確認。Edge の ProgId（`MSEdgeHTM`）、拡張機能 ID、origin は 2026-11-22 に実機で確認（引継ぎ v4 §2）。Vivaldi の ProgId `VivaldiHTM` は spike で実測。Vivaldi は、旧インストーラー（2026-11-25）で、ウィザードによる登録→確認と実 Collector 0.3.0 の動作を実機で確認済み。Chrome・Edge のパッケージ版での通しは未確認。
 - 関連コード：src/collector-browser-table.ts:40、:126-257（3 行）、:268-280（ゲート）、:300-318（分類）
 - テスト：src/collector-browser-table.test.ts:47、:108、:179、:384、:450；src/collector-integration-browsers.test.ts
 - 状態：実装済み

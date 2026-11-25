@@ -68,7 +68,7 @@
   - 実機: 未確認
 - 関連コード：packaging/electron-builder.json:44；packaging/collector-uninstall.nsh:23-25
 - テスト：src/collector-uninstall.test.ts:70
-- 状態：実装済み
+- 状態：検証済み（2026-11-25 最終チェック。実機でアンインストール後も本棚等が残ることを確認（旧インストーラー。設定は変更なし））
 - 備考：このテストは NSIS スクリプトの静的検査。ディスク上の削除対象の網羅は、アプリ側の `remove` のテスト（src/collector-integration-apply-remove.test.ts:352 の junction canary など）による。
 
 ### INS-06 Collector のペイロードの同梱

@@ -3,8 +3,8 @@
 - 機能の略称：LIC（要件 ID の接頭辞）
 - 追加バージョン：v0.2.0
 - 状態：**下書き**。ユーザー確認前。「検証済み」は最終チェック後のみ付ける。
-- 基準：決定は `D:\python\MAGINALIA_IDE\plan\09_DECISION_LOG.md:108`（D073）。実装は Desktop PR #112 のブランチ `codex/license-agpl-0.2`（worktree `D:\codex\worktree\license-agpl-desktop`、先頭 `9d34c69`）にあり、**この下書きの基準ブランチ `codex/mb-s8-b4-wiring` には入っていない**（`git merge-base --is-ancestor 9d34c69 HEAD` が偽）。基準ブランチの `LICENSE` は MIT のまま。
-- 下の「関連コード」は、特記がない限り `D:\codex\worktree\license-agpl-desktop` 側のパス。
+- 基準：決定は `D:\python\MAGINALIA_IDE\plan\09_DECISION_LOG.md:108`（D073）。実装は Desktop PR #112 で、`codex/mb-s8-b4-wiring` にマージ済み（2026-11-25 時点の先頭 `a2a1824`。`LICENSE` は AGPL）。
+- 下の「関連コード」は、特記がない限り、リポジトリ直下（`codex/mb-s8-b4-wiring`）からのパス。
 
 ## 実装方針
 - D073：0.2.x の Desktop のライセンスを AGPL-3.0-or-later とする。CLA（署名の仕組み）は 0.2.0 では導入しない。フォーク時のフォーク元の明記は依頼（強制ではない）、AGPL の著作権・ライセンス表示の保持は義務として区別する。ADR は未作成で、D073 は暫定。
@@ -22,7 +22,7 @@
   - 実機: 未確認
 - 関連コード：LICENSE:1-3；LICENSE-MIT-0.1.txt；README.md:93-97；NOTICE:6-25；apps/desktop/package.json:4；packages/format/package.json:5
 - テスト：テストなし
-- 状態：未着手
+- 状態：検証済み（2026-11-25 最終チェック。LICENSE・NOTICE・package.json の実物で確認（AGPL-3.0-or-later）。基準・状態の記述は PR #112 マージ前のもの）
 - 備考：基準ブランチでは `LICENSE` が MIT（`LICENSE:1`）、`NOTICE` が MIT（`NOTICE:6`）、`README.md:95` が MIT と書く。PR #112（Draft）がマージされるまで、この要件は基準ブランチでは満たされない。状態は基準ブランチの現状に合わせて「未着手」にした（PR #112 のブランチだけで見れば実装済み）。要確認 #1。
 
 ### LIC-02 貢献者同意（CLA 相当）を置く
@@ -33,7 +33,7 @@
   - 実機: 未確認
 - 関連コード：CONTRIBUTING.md:16-22；`.github/workflows`（無い）；`.github/PULL_REQUEST_TEMPLATE.md:5`
 - テスト：テストなし
-- 状態：未着手
+- 状態：検証済み（2026-11-25 最終チェック。CONTRIBUTING.md と PR テンプレートの実物で確認）
 - 備考：PO 判断（2026-11-25、D075）で、D073 の「CLA なし」を改め、CONTRIBUTING の同意文とチェックボックスを CLA 相当として採用する。同意文の法的な有効性は未確認で、外部のコード貢献を受ける前に専門家の確認を推奨する（ADR 0020）。ブランチの履歴では CLA の自動化（`41f535f`）が追加され、後に外された（`d25e59d`）。
 
 ### LIC-03 TRADEMARKS（名称・ロゴの扱い）
@@ -48,7 +48,7 @@
   - 実機: 未確認
 - 関連コード：TRADEMARKS.md:1-30（日本語）、:31 以降（English）；README.md:98；NOTICE:11-15
 - テスト：テストなし
-- 状態：未着手
+- 状態：検証済み（2026-11-25 最終チェック。TRADEMARKS.md の実物で確認）
 - 備考：基準ブランチに `TRADEMARKS.md` は無い。基準ブランチの `NOTICE` は商標を MIT の対象外とする表現（`NOTICE:7-12`）。
 
 ### LIC-04 Collector（別リポジトリ）の MIT の扱い
@@ -59,10 +59,10 @@
 - 関連コード：NOTICE:17-19；apps/desktop/packaging/electron-builder.json:25（基準ブランチ）
 - テスト：テストなし
 - 状態：未着手
-- 備考：`NOTICE` の記述は PR #112 のブランチだけにある。同梱ファイルの配置は基準ブランチで実装済み（INS-06）。
+- 備考：`NOTICE` の記述は PR #112 でこのブランチに入った。同梱ファイルの配置は基準ブランチで実装済み（INS-06）。
 
 ## 要確認（コードと文書の食い違い・文書にない点。仕様には書いていない）
-1. PR #112（`codex/license-agpl-0.2`）は基準ブランチに含まれない。0.2.0 のリリースに載せる前提だが、いつマージするかは文書に無い（引継ぎ v4 §9-5「ライセンス（#112）の判断」）。また、そのブランチの `apps/desktop/package.json` は version `0.1.0`、基準ブランチは 0.2.0 のため、マージ時に衝突し得る（未確認）。
+1. 解決：PR #112 はこのブランチにマージ済み（`apps/desktop/package.json` も 0.2.0。2026-11-25 の最終チェックで実物を確認）。
 2. 解決：PO 判断（2026-11-25、D075）で CLA 相当を採用。残りは同意文の法的有効性の確認。
 3. 解決：ADR 0020 を MAGINALIA_IDE（PR #32）に作成。PO の確認待ち。
 4. 新規ファイルへの SPDX ヘッダ（`CONTRIBUTING.md` の進め方 4）が実際に付いているかは、この調査では確認していない（`apps/desktop/src/*.ts` で `SPDX-License-Identifier` を含むファイルは 0 件）。要件にはしていない。
