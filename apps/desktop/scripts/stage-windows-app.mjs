@@ -79,6 +79,8 @@ async function writeThirdPartyNotices() {
     const source = path.join(repositoryRoot, filename);
     try { await cp(source, path.join(noticesRoot, `MAGINALIA-${filename}`)); } catch { /* NOTICE is optional in the current repository. */ }
   }
+  // NOTICE points readers at the 0.1.x MIT text by this file name.
+  await cp(path.join(repositoryRoot, "LICENSE-MIT-0.1.txt"), path.join(noticesRoot, "LICENSE-MIT-0.1.txt"));
   await cp(path.join(desktopRoot, "assets", "fonts", "jost", "OFL.txt"), path.join(noticesRoot, "Jost-OFL.txt"));
   try { await cp(path.join(runtimeRoot, "collector-host", "NODE-LICENSE.txt"), path.join(noticesRoot, "Collector-Host-NODE-LICENSE.txt")); } catch { throw new Error("The staged Collector Host payload has no NODE-LICENSE.txt."); }
   try { await cp(path.join(runtimeRoot, "collector-host", "NOTICE.txt"), path.join(noticesRoot, "Collector-Host-NOTICE.txt")); } catch { throw new Error("The staged Collector Host payload has no NOTICE.txt."); }
