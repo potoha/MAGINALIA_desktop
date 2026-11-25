@@ -2756,6 +2756,38 @@ body.first-run-mode #app {
 .first-run-primary:focus-visible { outline: 3px solid #383632; outline-offset: 3px; }
 .first-run-primary:disabled { opacity: 0.6; cursor: progress; }
 
+.first-run-collector {
+  margin: 0.75rem 0;
+  padding: 0.75rem;
+  border: 1px solid #ded8cc;
+  border-radius: 0.65rem;
+}
+
+.first-run-collector h2 {
+  margin: 0 0 0.3rem;
+  font-size: 1rem;
+}
+
+.first-run-collector p {
+  margin: 0 0 0.6rem;
+  line-height: 1.6;
+}
+
+.first-run-secondary {
+  width: 100%;
+  min-height: 2.4rem;
+  border: 1px solid #a64d34;
+  border-radius: 0.55rem;
+  background: transparent;
+  color: #843a27;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.first-run-secondary:hover { background: #f8eee8; }
+.first-run-secondary:focus-visible { outline: 3px solid #383632; outline-offset: 3px; }
+
 .first-run-progress {
   position: relative;
   height: 0.72rem;

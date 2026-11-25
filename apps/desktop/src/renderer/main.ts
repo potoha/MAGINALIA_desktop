@@ -57,6 +57,12 @@ import { stripDerivedReferenceList } from "./reference-list";
 import { ContextKeyService } from "./command-context";
 import { CommandRegistry, type CommandArgs } from "./command-registry";
 import { registerDocumentTabCommands, ACTIVATE_DOCUMENT_COMMAND_ID } from "./document-tab-commands";
+import {
+  FIRST_RUN_COLLECTOR_BODY,
+  FIRST_RUN_COLLECTOR_BUTTON,
+  FIRST_RUN_COLLECTOR_HEADING,
+  bindFirstRunCollectorGuide,
+} from "./first-run-collector-guide";
 import { createCollectorWizardOpener, dispatchCollectorNoticeAction, registerCollectorIntegrationCommands } from "./collector-integration-commands";
 import { createCollectorNoticePresenter, startCollectorNotices } from "./collector-notices-surface";
 import { registerLinkCommands, OPEN_EXTERNAL_LINK_COMMAND_ID, OPEN_INTERNAL_LINK_AT_CURSOR_COMMAND_ID, OPEN_EXTERNAL_LINK_AT_CURSOR_COMMAND_ID, OPEN_INTERNAL_LINK_COMMAND_ID } from "./link-commands";
@@ -494,6 +500,11 @@ if (firstRunMode) {
         <p id="first-run-status" class="first-run-status" role="status" aria-live="polite">既定の保存先は「ドキュメント\\MAGINALIA\\Workdesk」と「ドキュメント\\MAGINALIA\\Private Shelf」です。</p>
       </div>
       <p id="first-run-error" class="first-run-error" role="alert" aria-live="assertive" hidden></p>
+      <section id="first-run-collector" class="first-run-collector" aria-labelledby="first-run-collector-title" hidden>
+        <h2 id="first-run-collector-title">${FIRST_RUN_COLLECTOR_HEADING}</h2>
+        <p>${FIRST_RUN_COLLECTOR_BODY}</p>
+        <button id="first-run-collector-open" class="first-run-secondary" type="button">${FIRST_RUN_COLLECTOR_BUTTON}</button>
+      </section>
       <button id="first-run-open" class="first-run-primary" type="button" hidden>MAGINALIAを開く</button>
       <p class="first-run-data-note">設定を中断しても、選んだ場所のデータはそのまま残ります。</p>
     </div>`;
@@ -514,11 +525,17 @@ function initializeFirstRunScreen(): void {
   const submit = requiredElement<HTMLButtonElement>("#first-run-submit");
   const open = requiredElement<HTMLButtonElement>("#first-run-open");
   const progress = requiredElement<HTMLElement>(".first-run-progress");
+  const collectorGuide = requiredElement<HTMLElement>("#first-run-collector");
   const api = window.maginalia;
   const showSetupError = (message: string) => {
     error.textContent = message;
     error.hidden = false;
   };
+  const collectorGuideAvailable = bindFirstRunCollectorGuide({
+    button: requiredElement<HTMLButtonElement>("#first-run-collector-open"),
+    openWizard: createCollectorWizardOpener(api),
+    reportError: showSetupError,
+  });
   const showComplete = (result?: Extract<FirstRunResult, { readonly kind: "completed" }>) => {
     form.hidden = true;
     submit.hidden = true;
@@ -527,6 +544,7 @@ function initializeFirstRunScreen(): void {
     status.textContent = result
       ? `${result.projectTitle}を用意しました。続けてチュートリアルを開きます。`
       : "前回の設定が完了しています。チュートリアルを開きます。";
+    collectorGuide.hidden = !collectorGuideAvailable;
     open.hidden = false;
     open.focus({ preventScroll: true });
     if (result?.shelfSeed.conflicts.length) {
