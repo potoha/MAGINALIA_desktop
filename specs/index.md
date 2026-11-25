@@ -27,7 +27,7 @@
 | COL-16 | ペイロードの固定（pin）と同梱の検証 | specs/collector.md | 実装済み |
 | COL-17 | ブラウザー表（Chrome・Edge・Vivaldi） | specs/collector.md | 実装済み |
 | WIZ-01 | ウィザードの開き方 | specs/wizard.md | 実装済み |
-| WIZ-02 | 初回セットアップ完了画面からの案内 | specs/wizard.md | 未着手 |
+| WIZ-02 | 初回セットアップ完了画面からの任意の案内 | specs/wizard.md | 実装済み |
 | WIZ-03 | 手順の構成と進捗表示 | specs/wizard.md | 実装済み |
 | WIZ-04 | ブラウザーの選択肢（通常／Chrome／Edge） | specs/wizard.md | 実装済み |
 | WIZ-05 | おすすめと初期選択（既定ブラウザーのみ） | specs/wizard.md | 実装済み |
@@ -50,14 +50,14 @@
 | LIC-03 | TRADEMARKS（名称・ロゴの扱い） | specs/license.md | 未着手 |
 | LIC-04 | Collector（別リポジトリ）の MIT の扱い | specs/license.md | 未着手 |
 
-合計 40 要件（COL 17、WIZ 13、INS 6、LIC 4）。実装済み 35、未着手 5、検証済み 0、廃止 0。
+合計 40 要件（COL 17、WIZ 13、INS 6、LIC 4）。実装済み 36、未着手 4、検証済み 0、廃止 0。
 
 ## テストが無い要件
 - INS-02（未署名）、LIC-01〜LIC-04：テストなし。
 
 ## 要確認の重点（詳細は各ファイル末尾）
 1. 解決：PO 判断（2026-11-25）で、対応ブラウザーは Chrome と Edge の 2 つ、コードを正とする（collector.md 冒頭、#1）。
-2. 初回セットアップ完了画面からの Collector 案内は実装が見つからない（wizard.md #1）。
+2. 解決：PO 指示で、完了画面に任意の案内を実装（WIZ-02、94d82f9）。
 3. ライセンスの実装は PR #112 のブランチにあり、基準ブランチは MIT のまま（license.md #1）。
 4. 解決：PO 判断（2026-11-25、D075）で CLA 相当を採用（license.md #2）。
 5. D074「進めない」と、ウィザードの Vivaldi の抜け道コードの関係（wizard.md #3）。
