@@ -44,7 +44,29 @@ const HOST_PATTERN = /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/u;
 const SEGMENT_PATTERN = /^[A-Za-z0-9._-]{1,100}$/u;
 const ACCOUNT_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/u;
 const COMMIT_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
-const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u;
+
+/**
+ * Normalize a folder root for storage: absolute, resolved, Unicode NFC (macOS
+ * hands out NFD names). Callers pass the canonical root they already use for
+ * folder identity; no filesystem access happens here. The result is a stored
+ * label and a comparison key, not proof of identity: symlinks, junctions and
+ * 8.3 short names are not resolved. Windows roots must carry a drive letter or
+ * a UNC server and share, so a drive-less "\foo" is rejected.
+ */
+export function normalizeFolderRoot(root: string): string | undefined {
+  if (typeof root !== "string" || root === "" || !path.isAbsolute(root)) return undefined;
+  if (process.platform === "win32" && !/^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/?]+[\\/]+[^\\/]+)/u.test(root)) return undefined;
+  return path.resolve(root).normalize("NFC");
+}
+
+function isRealUtcTimestamp(text: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/u.exec(text);
+  if (match === null) return false;
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number) as [number, number, number, number, number, number];
+  const date = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+    && date.getUTCHours() === hour && date.getUTCMinutes() === minute && date.getUTCSeconds() === second;
+}
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -67,7 +89,7 @@ function parseEntryFields(value: Record<string, unknown>): SyncRemoteEntry | und
   if (!isSegment(owner) || !isSegment(repo)) return undefined;
   if (typeof accountId !== "string" || !ACCOUNT_ID_PATTERN.test(accountId)) return undefined;
   if (lastSyncedCommit !== null && (typeof lastSyncedCommit !== "string" || !COMMIT_PATTERN.test(lastSyncedCommit))) return undefined;
-  if (lastSyncAt !== null && (typeof lastSyncAt !== "string" || !TIMESTAMP_PATTERN.test(lastSyncAt) || Number.isNaN(Date.parse(lastSyncAt)))) {
+  if (lastSyncAt !== null && (typeof lastSyncAt !== "string" || !isRealUtcTimestamp(lastSyncAt))) {
     return undefined;
   }
   return Object.freeze({
@@ -96,7 +118,8 @@ export function parseSyncRemotes(source: string): SyncRemotesParseResult {
   if (source.length > MAX_FILE_CHARS) return { kind: "invalid", reason: "corrupt" };
   let value: unknown;
   try {
-    value = JSON.parse(source);
+    // Notepad and similar editors may prepend a UTF-8 BOM.
+    value = JSON.parse(source.startsWith("﻿") ? source.slice(1) : source);
   } catch {
     return { kind: "invalid", reason: "corrupt" };
   }
@@ -110,7 +133,7 @@ export function parseSyncRemotes(source: string): SyncRemotesParseResult {
     if (!isPlainRecord(item) || !hasExactKeys(item, RECORD_KEYS)) return { kind: "invalid", reason: "corrupt" };
     const entry = parseEntryFields(item);
     const root = item.root;
-    if (entry === undefined || typeof root !== "string" || !path.isAbsolute(root) || seen.has(entry.folderId)) {
+    if (entry === undefined || typeof root !== "string" || normalizeFolderRoot(root) !== root || seen.has(entry.folderId)) {
       return { kind: "invalid", reason: "corrupt" };
     }
     seen.add(entry.folderId);

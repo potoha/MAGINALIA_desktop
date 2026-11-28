@@ -53,7 +53,7 @@ describe("state wording", () => {
 
 describe("wording rules", () => {
   it("no normal-UI string contains commit / push / branch / token / GitHub vocabulary", () => {
-    const forbidden = /commit|push|pull|fetch|branch|token|github|\bgit\b|コミット|プッシュ|ブランチ|トークン|ギットハブ/iu;
+    const forbidden = /commit|push|pull|fetch|branch|token|github|\bgit\b|force|コミット|プッシュ|ブランチ|トークン|ギットハブ|リモート|リポジトリ|マージ|プル|フェッチ/iu;
     const strings = allSyncMessageStrings();
     expect(strings.length).toBeGreaterThan(10);
     for (const text of strings) expect(text).not.toMatch(forbidden);

@@ -46,13 +46,19 @@ export type WritingSyncAction =
       readonly onRejected: "refetch-and-decide-again";
     }
   | { readonly kind: "initial-push"; readonly mutatesRepository: true; readonly refspec: typeof SYNC_REFSPEC; readonly force: false }
-  | { readonly kind: "fast-forward"; readonly mutatesRepository: true };
+  | { readonly kind: "fast-forward"; readonly mutatesRepository: true; readonly ffOnly: true };
 
 export type SyncAction = ReadOnlySyncAction | WritingSyncAction;
 
 export interface SyncDecision {
   readonly action: SyncAction;
-  /** State after the action succeeds (or after a read-only action). */
+  /**
+   * Outcome on the Sync axis only: what the relation to the remote becomes once
+   * the action succeeds (or after a read-only action). It ignores the local
+   * axis (unsaved or uncheckpointed edits). Never show it directly: display
+   * state must always come from `deriveSyncState`, which also weighs the
+   * local axis (for example SYNCED here but SAVED_ONLY with unsaved edits).
+   */
   readonly resultState: SyncState;
   /** State if the action fails for a transient reason; null when the action cannot fail that way. */
   readonly failureState: SyncState | null;
@@ -71,13 +77,23 @@ const PUSH = Object.freeze({
   onRejected: "refetch-and-decide-again",
 } as const);
 const INITIAL_PUSH = Object.freeze({ kind: "initial-push", mutatesRepository: true, refspec: SYNC_REFSPEC, force: false } as const);
-const FAST_FORWARD = Object.freeze({ kind: "fast-forward", mutatesRepository: true } as const);
+const FAST_FORWARD = Object.freeze({ kind: "fast-forward", mutatesRepository: true, ffOnly: true } as const);
+
+/** The diverged outcome, fixed by type: nothing is written and both histories stay. */
+export interface DivergedSyncDecision extends SyncDecision {
+  readonly action: typeof KEEP_BOTH;
+  readonly resultState: "NEEDS_REVIEW";
+  readonly failureState: null;
+  readonly reviewCause: "diverged";
+}
 
 function decision(action: SyncAction, resultState: SyncState, failureState: SyncState | null, reviewCause: NeedsReviewCause | null): SyncDecision {
   return Object.freeze({ action, resultState, failureState, reviewCause });
 }
 
 /** Pure: never mutates `input`, performs no I/O. */
+export function decideSync(input: SyncDecisionInput & { readonly relation: "diverged" }): DivergedSyncDecision;
+export function decideSync(input: SyncDecisionInput): SyncDecision;
 export function decideSync(input: SyncDecisionInput): SyncDecision {
   switch (input.relation) {
     case "equal":

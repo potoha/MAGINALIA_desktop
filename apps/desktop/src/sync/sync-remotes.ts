@@ -3,6 +3,7 @@ import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import * as path from "node:path";
 import {
   SYNC_REMOTES_FILE_NAME,
+  normalizeFolderRoot,
   parseSyncRemotes,
   serializeSyncRemotes,
   validateSyncRemoteEntry,
@@ -10,7 +11,7 @@ import {
   type SyncRemoteRecord,
 } from "./sync-remotes-schema.js";
 
-export { SYNC_REMOTES_FILE_NAME } from "./sync-remotes-schema.js";
+export { SYNC_REMOTES_FILE_NAME, normalizeFolderRoot } from "./sync-remotes-schema.js";
 export type { SyncFolderKind, SyncRemoteEntry, SyncRemoteRecord } from "./sync-remotes-schema.js";
 
 export type SyncRemotesErrorCode = "unreadable" | "corrupt" | "unsupported-version" | "write-failed";
@@ -44,16 +45,6 @@ export type SyncRemotesMutationResult =
   | { readonly kind: "invalid-input" }
   | { readonly kind: "error"; readonly code: SyncRemotesErrorCode };
 
-/**
- * Normalize a folder root for storage: absolute, resolved, Unicode NFC (macOS
- * hands out NFD names). Callers pass the canonical root they already use for
- * folder identity; no filesystem access happens here.
- */
-export function normalizeFolderRoot(root: string): string | undefined {
-  if (typeof root !== "string" || root === "" || !path.isAbsolute(root)) return undefined;
-  return path.resolve(root).normalize("NFC");
-}
-
 /** Comparison key for two normalized roots. Windows paths are case-insensitive. */
 function rootKey(normalizedRoot: string): string {
   return process.platform === "win32" ? normalizedRoot.toLowerCase() : normalizedRoot;
@@ -64,6 +55,12 @@ function errorCode(error: unknown): string | undefined {
 }
 
 /**
+ * Write queues are per file, shared by every instance in the process, so two
+ * registries pointing at the same directory still serialize read-modify-write.
+ */
+const writeQueues = new Map<string, Promise<unknown>>();
+
+/**
  * Machine-local map from a folder's `.magi` UUID to its backup location, kept
  * in `sync-remotes.json` under an application-owned directory. The directory
  * is injected so this module never depends on Electron. Nothing is ever
@@ -71,7 +68,6 @@ function errorCode(error: unknown): string | undefined {
  */
 export class SyncRemoteRegistry {
   private readonly filePath: string;
-  private queue: Promise<unknown> = Promise.resolve();
 
   public constructor(configDirectory: string) {
     if (!path.isAbsolute(configDirectory)) {
@@ -179,8 +175,14 @@ export class SyncRemoteRegistry {
       }
       return Object.freeze(result);
     };
-    const next = this.queue.then(run, run);
-    this.queue = next.catch(() => undefined);
+    const key = rootKey(this.filePath);
+    const previous = writeQueues.get(key) ?? Promise.resolve();
+    const next = previous.then(run, run);
+    const tail = next.catch(() => undefined);
+    writeQueues.set(key, tail);
+    void tail.then(() => {
+      if (writeQueues.get(key) === tail) writeQueues.delete(key);
+    });
     return next;
   }
 

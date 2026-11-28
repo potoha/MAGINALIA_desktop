@@ -117,6 +117,8 @@ describe("SyncRemoteRegistry: input validation", () => {
     ["a short commit", entry({ lastSyncedCommit: "abc123" })],
     ["a non-ISO timestamp", entry({ lastSyncAt: "yesterday" })],
     ["an impossible date", entry({ lastSyncAt: "2026-13-45T10:00:00Z" })],
+    ["February 31st", entry({ lastSyncAt: "2026-02-31T10:00:00Z" })],
+    ["hour 24", entry({ lastSyncAt: "2026-11-29T24:00:00Z" })],
     ["a non-object", "text"],
     ["null", null],
   ];
@@ -143,6 +145,7 @@ describe("SyncRemoteRegistry: damaged files", () => {
     ["an extra key in a record", JSON.stringify({ version: 1, remotes: [{ ...record, token: "x" }] }), "corrupt"],
     ["a record missing root", JSON.stringify({ version: 1, remotes: [{ ...record, root: undefined }] }), "corrupt"],
     ["a relative root", JSON.stringify({ version: 1, remotes: [{ ...record, root: "relative" }] }), "corrupt"],
+    ["a root that is not normalized", JSON.stringify({ version: 1, remotes: [{ ...record, root: `${record.root}${path.sep}sub${path.sep}..` }] }), "corrupt"],
     ["a duplicate folderId", JSON.stringify({ version: 1, remotes: [record, record] }), "corrupt"],
     ["a record with a bad host", JSON.stringify({ version: 1, remotes: [{ ...record, host: "a b" }] }), "corrupt"],
   ];
@@ -225,5 +228,35 @@ describe("SyncRemoteRegistry: same UUID in another place (copied folder)", () =>
     const root = path.join(parent, "Folder");
     await registry.register(entry(), root);
     expect(await registry.resolveFolder(FOLDER_ID, root.toUpperCase())).toMatchObject({ kind: "registered" });
+  });
+});
+
+describe("SyncRemoteRegistry: file handling details", () => {
+  it("accepts a file that starts with a UTF-8 BOM (saved by Notepad)", async () => {
+    const { registry, configDirectory } = await createRegistry();
+    const root = path.join(os.tmpdir(), "folder-a");
+    await registry.register(entry(), root);
+    const file = path.join(configDirectory, "sync-remotes.json");
+    await writeFile(file, `﻿${await readFile(file, "utf8")}`, "utf8");
+    expect(await registry.resolveFolder(FOLDER_ID, root)).toMatchObject({ kind: "registered" });
+  });
+
+  it("serializes writes across instances that point at the same directory", async () => {
+    const { configDirectory } = await createRegistry();
+    const first = new SyncRemoteRegistry(configDirectory);
+    const second = new SyncRemoteRegistry(configDirectory);
+    const ids = Array.from({ length: 20 }, (_, index) => `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`);
+    await Promise.all(ids.map((folderId, index) => (index % 2 === 0 ? first : second).register(entry({ folderId }), path.join(os.tmpdir(), `folder-${index}`))));
+    const loaded = await first.load();
+    expect(loaded.kind === "loaded" && loaded.records).toHaveLength(20);
+  });
+
+  it("round-trips a valid timestamp and rejects a root without a drive on Windows", async () => {
+    const { registry } = await createRegistry();
+    expect(await registry.register(entry({ lastSyncAt: "2028-02-29T23:59:59.999Z" }), path.join(os.tmpdir(), "leap"))).toEqual({ kind: "done" });
+    if (process.platform === "win32") {
+      expect(normalizeFolderRoot("\foo")).toBeUndefined();
+      expect(await registry.register(entry(), "\foo")).toEqual({ kind: "invalid-input" });
+    }
   });
 });

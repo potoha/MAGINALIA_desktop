@@ -2,7 +2,8 @@ import { readFile, readdir } from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { SYNC_REFSPEC, decideSync, type SyncDecisionInput } from "./sync-decision.js";
+import { SYNC_REFSPEC, decideSync, type FetchedRelation, type SyncDecisionInput } from "./sync-decision.js";
+import { deriveSyncState, type SyncState } from "./sync-state.js";
 
 const SETTLED: Omit<SyncDecisionInput, "relation"> = { hasUnsavedEdits: false, isSetup: false };
 
@@ -27,7 +28,7 @@ describe("decideSync: one test per row of the decision table", () => {
 
   it("behind with a clean working tree -> fast-forward, SYNCED", () => {
     const result = decideSync({ ...SETTLED, relation: "behind" });
-    expect(result).toMatchObject({ action: { kind: "fast-forward", mutatesRepository: true }, resultState: "SYNCED", reviewCause: null });
+    expect(result).toMatchObject({ action: { kind: "fast-forward", mutatesRepository: true, ffOnly: true }, resultState: "SYNCED", reviewCause: null });
   });
 
   it("behind with unsaved edits -> no fast-forward; wait for the save and decide again (PENDING)", () => {
@@ -37,6 +38,9 @@ describe("decideSync: one test per row of the decision table", () => {
 
   it("diverged -> keep both histories, write nothing, NEEDS_REVIEW (diverged)", () => {
     const result = decideSync({ ...SETTLED, relation: "diverged" });
+    // Fixed by the diverged overload's type, and pinned here at run time.
+    expect(result.action.kind).toBe("keep-both");
+    expect(result.resultState).toBe("NEEDS_REVIEW");
     expect(result).toMatchObject({
       action: { kind: "keep-both", mutatesRepository: false },
       resultState: "NEEDS_REVIEW",
@@ -96,5 +100,43 @@ describe("decideSync: read-only guarantees", () => {
       const source = await readFile(path.join(dir, name), "utf8");
       expect(source, name).not.toMatch(/from\s+"(node:|electron|isomorphic-git)/u);
     }
+  });
+});
+
+describe("decideSync resultState agrees with deriveSyncState", () => {
+  // Sync-axis outcome -> the derive inputs that describe the same situation.
+  function deriveFor(relation: FetchedRelation, state: SyncState, local: "clean" | "unsaved") {
+    const syncRelation = state === "SYNCED" ? "equal" : relation === "behind" ? "behind" : "unknown";
+    const reviewCause = state === "NEEDS_REVIEW" ? decideSync({ relation, hasUnsavedEdits: false, isSetup: false }).reviewCause : null;
+    return deriveSyncState({
+      connection: "authenticated",
+      relation: relation === "diverged" ? "diverged" : syncRelation,
+      local,
+      syncRunning: false,
+      reviewCause: relation === "diverged" ? null : reviewCause,
+    });
+  }
+
+  const relations = ["equal", "ahead", "behind", "diverged", "remote-empty", "remote-not-found"] as const;
+
+  it.each(relations)("%s: with a settled local axis both give the same state", (relation) => {
+    for (const isSetup of [false, true]) {
+      const { resultState, reviewCause } = decideSync({ relation, hasUnsavedEdits: false, isSetup });
+      const derived = deriveFor(relation, resultState, "clean");
+      expect(derived.state).toBe(resultState);
+      expect(derived.reviewCause).toBe(reviewCause);
+    }
+  });
+
+  it("differs only through the local axis: SYNCED with unsaved edits is displayed as SAVED_ONLY", () => {
+    const { resultState } = decideSync({ relation: "equal", hasUnsavedEdits: true, isSetup: false });
+    expect(resultState).toBe("SYNCED");
+    expect(deriveFor("equal", resultState, "unsaved").state).toBe("SAVED_ONLY");
+  });
+
+  it("a failed push is displayed as PENDING by deriveSyncState", () => {
+    const { failureState } = decideSync({ relation: "ahead", hasUnsavedEdits: false, isSetup: false });
+    expect(failureState).toBe("PENDING");
+    expect(deriveSyncState({ connection: "authenticated", relation: "ahead", local: "clean", syncRunning: false, reviewCause: null }).state).toBe("PENDING");
   });
 });
