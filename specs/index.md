@@ -49,8 +49,16 @@
 | LIC-02 | 貢献者同意（CLA 相当）を置く | specs/license.md | 検証済み |
 | LIC-03 | TRADEMARKS（名称・ロゴの扱い） | specs/license.md | 検証済み |
 | LIC-04 | Collector（別リポジトリ）の MIT の扱い | specs/license.md | 未着手 |
+| SYNC-01 | 1 フォルダ = 1 リモートの対応 | specs/git-sync.md | 未着手 |
+| SYNC-02 | .magi の UUID で対応し、対応表は machine-local に置く | specs/git-sync.md | 実装済み |
+| SYNC-03 | リモート URL を .git/config に書かない。コピーに接続先が付かない | specs/git-sync.md | 未着手 |
+| SYNC-24 | 失敗しても、ローカルの保存と編集を止めない | specs/git-sync.md | 未着手 |
+| SYNC-25 | 明示操作なしに、公開やリモートの追加を行わない | specs/git-sync.md | 未着手 |
+| SYNC-26 | 履歴の書き換え・自動マージ・conflict marker を行わない | specs/git-sync.md | 未着手 |
+| SYNC-27 | diverged では両方の履歴を保ち、何も変更しない | specs/git-sync.md | 実装済み |
+| SYNC-28 | fast-forward のみで進める | specs/git-sync.md | 実装済み |
 
-合計 40 要件（COL 17、WIZ 13、INS 6、LIC 4）。実装済み 30、未着手 1、検証済み 9、廃止 0。
+合計 48 要件（COL 17、WIZ 13、INS 6、LIC 4、SYNC 8）。実装済み 33、未着手 6、検証済み 9、廃止 0。
 
 ## テストが無い要件
 - INS-02（未署名）、LIC-01〜LIC-04：テストなし。
